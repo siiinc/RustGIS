@@ -111,13 +111,13 @@ pub fn report(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     });
     ui.horizontal(|ui| {
         let input_label = ui.label(tl!("Where"));
-        let resp = ui
-            .add(
-                egui::TextEdit::singleline(&mut app.reports.where_clause)
-                    .hint_text("pop_max > 1000000")
-                    .desired_width(ui.available_width()),
-            )
-            .labelled_by(input_label.id);
+        // Suggestions from the fields of the layer reported on (#1240).
+        let ds = rustgis_engine::cmd::report::layer_of(&app.session, i).ok().map(|l| &l.dataset);
+        let width = ui.available_width();
+        let resp = crate::exprcomplete::expr_edit(ui, egui::Id::unique(("report_where", i)), &mut app.reports.where_clause, ds, |e| {
+            e.hint_text("pop_max > 1000000").desired_width(width)
+        })
+        .labelled_by(input_label.id);
         if resp.lost_focus() {
             if app.reports.where_clause != r.where_clause {
                 let w = app.reports.where_clause.clone();
@@ -309,7 +309,7 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
     // Any change to the report, its data or the selection runs a command, which moves the
     // revision on.
     let key = format!("{i}#{}#{}", app.reports.page, app.session.revision);
-    if app.reports.preview.as_ref().is_none_or(|p| p.0 != key) {
+    if app.reports.preview.as_ref().is_none_or(|p| !crate::layoutview::preview_current(&p.0, &key)) {
         app.reports.preview = None;
         let built_for = (i, app.session.revision);
         if app.reports.built.as_ref().is_none_or(|b| b.0 != built_for) {
@@ -328,26 +328,33 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
             None => return,
         };
         let (s, page) = (&mut app.session, app.reports.page);
-        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
-            let page = page.min(pages.len().saturating_sub(1));
-            let (pm, _, _) = rustgis_engine::render::report::draw_page(doc, pages, page, 60.0, &s.project.layouts, &mut s.project.maps)
-                .ok_or("the page is too large to draw")?;
-            Ok((pm, page, pages.len()))
-        }))
-        .unwrap_or_else(|_| Err("the preview failed unexpectedly".into()));
+        let drawn_at = rustgis_engine::render::rustgis_tiles::cache::generation();
+        let (drawn, said) = rustgis_engine::render::shadows_said(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
+                let page = page.min(pages.len().saturating_sub(1));
+                let (pm, _, _) =
+                    rustgis_engine::render::report::draw_page(doc, pages, page, 60.0, &s.project.layouts, &mut s.project.maps)?;
+                Ok((pm, page, pages.len()))
+            }))
+            .unwrap_or_else(|_| Err("the preview failed unexpectedly".into()))
+        });
+        crate::layoutview::say_frame_shadows(app, &said);
         match drawn {
             Ok((pm, page, total)) => {
                 app.reports.page = page;
                 let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
                 let tex = ui.ctx().load_texture("report_preview", img, egui::TextureOptions::LINEAR);
                 let key = format!("{i}#{page}#{}", app.session.revision);
-                app.reports.preview = Some((key, tex, total));
+                app.reports.preview = Some((crate::layoutview::preview_key(&key, &said, drawn_at), tex, total));
             }
             Err(e) => {
                 ui.label(egui::RichText::new(e).small().color(Color32::from_rgb(0xC0, 0x30, 0x30)));
                 return;
             }
         }
+    }
+    if app.reports.preview.as_ref().is_some_and(|p| crate::layoutview::preview_waits(&p.0)) {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     }
     let Some((_, tex, total)) = &app.reports.preview else { return };
     let (tex, total) = (tex.clone(), *total);
@@ -366,4 +373,51 @@ fn preview(app: &mut RustGisApp, ui: &mut Ui, i: usize, t: &Tokens) {
             app.reports.page += 1;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A report's Where offers the reported layer's fields as it's typed (#1240): a field clicked
+    /// in the list is written and the box keeps the focus, so the clause typed isn't put back to
+    /// the stored one, and leaving the box sets it.
+    #[test]
+    fn the_where_box_offers_the_reported_layers_fields() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("report.new", serde_json::json!({"layer": "Cities"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(520.0, 900.0)).allow_missing_glyphs().build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let t = Tokens::get(ui.ctx());
+                report(app, ui, &t);
+            },
+            app,
+        );
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Where").click();
+        h.run();
+        h.event(egui::Event::Text("pop_m".into()));
+        h.run();
+        let at = h.get_by_role_and_label(Role::Button, "pop_max").rect().center();
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.step();
+        h.step();
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        h.run();
+        assert_eq!(h.state().reports.where_clause, "pop_max", "written, not put back");
+        h.event(egui::Event::Text(" > 1000000".into()));
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Title").click();
+        h.run();
+        assert_eq!(h.state().session.project.reports[0].where_clause, "pop_max > 1000000");
+    }
 }

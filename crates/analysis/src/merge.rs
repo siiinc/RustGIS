@@ -71,11 +71,15 @@ pub(crate) fn run(inputs: &dyn Inputs, params: &Json) -> Result<ToolResult, Stri
             out.push_next(geometry, attrs);
         }
     }
-    Ok(ToolResult { output: Output::Layer(out), messages: vec![format!("Merge: {n} features from {} layers", layers.len())] })
+    Ok(ToolResult {
+        losses: Vec::new(),
+        output: Output::Layer(out),
+        messages: vec![format!("Merge: {n} features from {} layers", layers.len())],
+    })
 }
 
 /// Fallible geometry copies, so a large merge can return an allocation error.
-fn clone_geometry(g: &Geometry) -> Result<Geometry, TryReserveError> {
+pub(crate) fn clone_geometry(g: &Geometry) -> Result<Geometry, TryReserveError> {
     fn coords(source: &[Coord]) -> Result<Vec<Coord>, TryReserveError> {
         let mut out = Vec::new();
         out.try_reserve_exact(source.len())?;

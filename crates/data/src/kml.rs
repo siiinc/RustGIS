@@ -9,7 +9,7 @@
 //! is bounded, and a malformed placemark is skipped and counted.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use roxmltree::{Node, ParsingOptions};
 use rustgis_geom::Coord;
@@ -54,8 +54,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<Layer>> {
         path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("kmz")) || bytes.starts_with(b"PK\x03\x04");
     let owned;
     let text_bytes: &[u8] = if is_kmz {
-        // Inflated within the size a file may be read at.
-        let budget = usize::try_from(crate::io::MAX_BYTES).unwrap_or(usize::MAX);
+        // Inflated within the size every computer reads (a KML or KMZ is read as it is added, on
+        // the UI thread in the desktop app, so it stays there, #2408).
+        let budget = usize::try_from(crate::io::BYTES_FLOOR).unwrap_or(usize::MAX);
         let mut entries = crate::zip::read_matching_within(bytes, |n| n.to_ascii_lowercase().ends_with(".kml"), budget)
             .map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
         // doc.kml by convention, else the shallowest .kml.
@@ -78,6 +79,8 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<Layer>> {
         maps: HashMap::new(),
         inline: HashMap::new(),
         dropped_keys: 0,
+        duplicate_entries: 0,
+        duplicate_placemarks: 0,
         rows: Vec::new(),
         keys: Vec::new(),
         skipped: 0,
@@ -100,13 +103,21 @@ pub struct GroundOverlay {
     pub rotation: f64,
 }
 
-/// The ground overlays a document lays out, and how many it has that can't be drawn (a
-/// `gx:LatLonQuad`, no picture, a bad box). A KMZ's pictures are returned with them; other
-/// documents name theirs by `href` only.
-pub fn ground_overlays(file_name: &str, bytes: &[u8]) -> Result<(Vec<(GroundOverlay, Option<Vec<u8>>)>, usize)> {
+/// A document's ground overlays: those it lays out (with a KMZ's pictures; other documents name
+/// theirs by `href` only), how many can't be drawn (a `gx:LatLonQuad`, no picture, a bad box), and
+/// how many of a KMZ's are left out because their pictures' copies would pass the archive's budget.
+pub type Overlays = (Vec<(GroundOverlay, Option<Vec<u8>>)>, usize, usize);
+
+/// The ground overlays a document lays out ([`Overlays`]).
+pub fn ground_overlays(file_name: &str, bytes: &[u8]) -> Result<Overlays> {
+    // As [`read`] inflates it: within the size every computer reads.
+    ground_overlays_within(file_name, bytes, usize::try_from(crate::io::BYTES_FLOOR).unwrap_or(usize::MAX))
+}
+
+/// [`ground_overlays`] with a KMZ expanded, and its pictures copied, within `budget` bytes.
+fn ground_overlays_within(file_name: &str, bytes: &[u8], budget: usize) -> Result<Overlays> {
     let is_kmz = std::path::Path::new(file_name).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("kmz"))
         || bytes.starts_with(b"PK\x03\x04");
-    let budget = usize::try_from(crate::io::MAX_BYTES).unwrap_or(usize::MAX);
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     let owned;
     let (doc_bytes, doc_dir): (&[u8], String) = if is_kmz {
@@ -124,6 +135,13 @@ pub fn ground_overlays(file_name: &str, bytes: &[u8]) -> Result<(Vec<(GroundOver
     let doc = crate::xml::parse(text.trim_start_matches('\u{feff}'), opts).map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
     let mut out = Vec::new();
     let mut undrawn = 0usize;
+    // The pictures handed back are copies, one for each overlay naming one: together within the
+    // budget the archive was expanded within, less the archive and the document's copy (held
+    // while they are copied), so many overlays of one large picture aren't many copies of it. Past that an
+    // overlay is left out, and counted.
+    let held: usize = entries.iter().map(|(_, b)| b.len()).sum::<usize>() + if is_kmz { doc_bytes.len() } else { 0 };
+    let mut pictures_left = budget.saturating_sub(held);
+    let mut over_budget = 0usize;
     let all = doc.descendants().filter(|n| n.is_element() && local(n) == "GroundOverlay").count();
     // Past the first 256, overlays are counted as not drawn.
     undrawn += all.saturating_sub(256);
@@ -149,17 +167,25 @@ pub fn ground_overlays(file_name: &str, bytes: &[u8]) -> Result<(Vec<(GroundOver
             continue;
         }
         // A KMZ's picture, by its path relative to the document.
-        let picture = is_kmz.then(|| {
+        let found = is_kmz.then(|| {
             let want = format!("{doc_dir}{}", href.trim_start_matches("./"));
             entries
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(&want) || n.eq_ignore_ascii_case(href.trim_start_matches("./")))
-                .map(|(_, b)| b.clone())
+                .map(|(_, b)| b)
         });
+        if let Some(Some(b)) = found {
+            let Some(left) = pictures_left.checked_sub(b.len()) else {
+                over_budget += 1;
+                continue;
+            };
+            pictures_left = left;
+        }
+        let picture = found.map(|b| b.cloned());
         let name = child_text(&g, "name").unwrap_or_else(|| "Ground overlay".into());
         out.push((GroundOverlay { name, href, bbox: [w, s, e, n], rotation }, picture.flatten()));
     }
-    Ok((out, undrawn))
+    Ok((out, undrawn, over_budget))
 }
 
 /// One placemark, before it's put in a layer.
@@ -186,6 +212,8 @@ struct Reader {
     keys: Vec<String>,
     /// Extended data entries past the column cap.
     dropped_keys: usize,
+    duplicate_entries: usize,
+    duplicate_placemarks: usize,
     skipped: usize,
 }
 
@@ -197,9 +225,18 @@ fn child<'a, 'i>(n: &Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
     n.children().find(|c| c.is_element() && local(c) == name)
 }
 
+/// The text and CDATA children joined, keeping description whitespace as data.
+fn raw_text_of(n: &Node) -> String {
+    n.children().filter(|c| c.is_text()).filter_map(|c| c.text()).collect()
+}
+
 /// The text of an element (its text and CDATA children joined), trimmed.
 fn text_of(n: &Node) -> String {
-    n.children().filter(|c| c.is_text()).filter_map(|c| c.text()).collect::<String>().trim().to_string()
+    raw_text_of(n).trim().to_string()
+}
+
+fn data_text(n: &Node, key: &str) -> String {
+    if key == "description" { raw_text_of(n) } else { text_of(n) }
 }
 
 fn child_text(n: &Node, name: &str) -> Option<String> {
@@ -427,14 +464,25 @@ impl Reader {
             geometry(&g, &mut parts, 0);
         }
         let mut data = Vec::new();
+        let mut seen = HashSet::new();
+        let mut duplicates = 0usize;
         if let Some(ext) = child(pm, "ExtendedData") {
             for d in ext.descendants().filter(|d| d.is_element()) {
                 let pair = match local(&d) {
-                    "Data" => d.attribute("name").map(|k| (k.to_string(), child_text(&d, "value").unwrap_or_default())),
-                    "SimpleData" => d.attribute("name").map(|k| (k.to_string(), text_of(&d))),
+                    "Data" => {
+                        d.attribute("name").map(|k| (k.to_string(), child(&d, "value").map(|v| data_text(&v, k)).unwrap_or_default()))
+                    }
+                    "SimpleData" => d.attribute("name").map(|k| (k.to_string(), data_text(&d, k))),
                     _ => None,
                 };
                 if let Some((k, v)) = pair.filter(|(k, _)| !k.trim().is_empty()) {
+                    // The attribute reader uses the first entry for a key. Count and discard
+                    // later entries here, including duplicates across Data and SimpleData and
+                    // names past the column cap.
+                    if !seen.insert(k.clone()) {
+                        duplicates += 1;
+                        continue;
+                    }
                     if !self.keys.contains(&k) {
                         // At most MAX_KEYS columns of extended data; the rest are dropped.
                         if self.keys.len() >= MAX_KEYS {
@@ -450,7 +498,7 @@ impl Reader {
         let style = self.style_for(pm);
         let folder = folders.iter().filter(|f| !f.is_empty()).cloned().collect::<Vec<_>>().join(" / ");
         let name = child_text(pm, "name");
-        let description = child_text(pm, "description");
+        let description = child(pm, "description").map(|n| raw_text_of(&n));
         // A placemark mixing kinds (a MultiGeometry of a point and a line) gives one feature per
         // kind, each in its layer.
         let mut any = false;
@@ -479,6 +527,9 @@ impl Reader {
         }
         if !any {
             self.skipped += 1;
+        } else if duplicates > 0 {
+            self.duplicate_entries += duplicates;
+            self.duplicate_placemarks += 1;
         }
     }
 
@@ -492,9 +543,36 @@ impl Reader {
             Field::new("folder", FieldType::Text),
             Field::new("style", FieldType::Text),
         ];
-        // Extended data keys that don't clash with those.
-        let keys: Vec<String> = self.keys.iter().filter(|k| !fields.iter().any(|f| f.name.eq_ignore_ascii_case(k))).cloned().collect();
-        fields.extend(keys.iter().map(|k| Field::new(k.clone(), FieldType::Text)));
+        // Each extended data key's column, as (key, column name). A key named like one of those,
+        // ignoring case, is left out when it only repeats that column (an exported name field
+        // does), else kept under a free name.
+        let mut taken: Vec<Field> =
+            fields.iter().cloned().chain(self.keys.iter().map(|k| Field::new(k.clone(), FieldType::Text))).collect();
+        let mut keys: Vec<(String, String)> = Vec::new();
+        let mut renamed: Vec<(String, String)> = Vec::new();
+        for k in &self.keys {
+            let Some(i) = fields.iter().position(|f| f.name.eq_ignore_ascii_case(k)) else {
+                keys.push((k.clone(), k.clone()));
+                continue;
+            };
+            let repeats = |r: &Row| {
+                let fixed = match i {
+                    0 => r.name.as_deref(),
+                    1 => r.description.as_deref(),
+                    2 => Some(r.folder.as_str()),
+                    _ => r.style.as_deref(),
+                };
+                r.data.iter().find(|(dk, _)| dk == k).is_none_or(|(_, v)| v == fixed.unwrap_or_default())
+            };
+            if (i != 1 || k == "description") && self.rows.iter().all(repeats) {
+                continue;
+            }
+            let column = crate::io::free_column_name(&taken, k);
+            taken.push(Field::new(column.clone(), FieldType::Text));
+            renamed.push((k.clone(), column.clone()));
+            keys.push((k.clone(), column));
+        }
+        fields.extend(keys.iter().map(|(_, c)| Field::new(c.clone(), FieldType::Text)));
         let mut out = Vec::new();
         for (i, (kind, label)) in present.iter().enumerate() {
             let title = if present.len() == 1 { name.to_string() } else { format!("{name} {label}") };
@@ -509,7 +587,8 @@ impl Reader {
                     r.style.clone().map(Value::Text).unwrap_or_default(),
                 ];
                 attrs.extend(
-                    keys.iter().map(|k| r.data.iter().find(|(dk, _)| dk == k).map(|(_, v)| Value::Text(v.clone())).unwrap_or_default()),
+                    keys.iter()
+                        .map(|(k, _)| r.data.iter().find(|(dk, _)| dk == k).map(|(_, v)| Value::Text(v.clone())).unwrap_or_default()),
                 );
                 if let Some(s) = &r.style
                     && !used.contains(s)
@@ -528,8 +607,31 @@ impl Reader {
                 if self.skipped > 0 {
                     report.messages.push(format!("{name}: {} placemarks without a geometry RustGIS draws were skipped", self.skipped));
                 }
+                if self.duplicate_entries > 0 {
+                    report.messages.push(format!(
+                        "{name}: {} repeated ExtendedData entries in {} placemarks were left out",
+                        self.duplicate_entries, self.duplicate_placemarks
+                    ));
+                }
                 if self.dropped_keys > 0 {
                     report.messages.push(format!("{name}: extended data past {MAX_KEYS} distinct names was left out"));
+                }
+                if !renamed.is_empty() {
+                    let listed: Vec<String> = renamed
+                        .iter()
+                        .take(5)
+                        .map(|(k, c)| format!("'{}' → '{}'", crate::io::dbf_notice_name(k), crate::io::dbf_notice_name(c)))
+                        .collect();
+                    let more = if renamed.len() > 5 { format!(" and {} more", renamed.len() - 5) } else { String::new() };
+                    let count = if renamed.len() == 1 {
+                        "1 extended data name was".to_string()
+                    } else {
+                        format!("{} extended data names were", renamed.len())
+                    };
+                    report.messages.push(format!(
+                        "{name}: {count} renamed, as RustGIS gives every placemark a name, description, folder and style column: {}{more}",
+                        listed.join(", ")
+                    ));
                 }
             }
             if zm_rows > 0 {
@@ -546,6 +648,23 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A KMZ's overlays of one picture are copied within the archive's budget; those past it are
+    /// left out and counted apart from those that can't be drawn.
+    #[test]
+    fn overlay_pictures_are_copied_within_the_budget() {
+        let overlay = r#"<GroundOverlay><Icon><href>p.png</href></Icon><LatLonBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonBox></GroundOverlay>"#;
+        let doc = format!(r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document>{}</Document></kml>"#, overlay.repeat(5));
+        let kmz = crate::zip::write(&[("doc.kml".to_string(), doc.clone().into_bytes()), ("p.png".to_string(), vec![7; 1000])]).unwrap();
+        // Room for the archive, the document's copy and two and a half copies of the picture:
+        // two are made.
+        let max = (2 * doc.len() + 1000 + 2500) as u64;
+        let (out, undrawn, over_budget) = ground_overlays_within("a.kmz", &kmz, max as usize).unwrap();
+        assert_eq!((out.len(), undrawn, over_budget), (2, 0, 3));
+        assert!(out.iter().all(|(_, p)| p.as_deref().is_some_and(|p| p.len() == 1000)));
+        let (out, _, over_budget) = ground_overlays("a.kmz", &kmz).unwrap();
+        assert_eq!((out.len(), over_budget), (5, 0));
+    }
 
     const DOC: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
@@ -570,6 +689,76 @@ mod tests {
   <Placemark><name>Nothing</name></Placemark>
   <GroundOverlay><Icon><href>map.png</href></Icon></GroundOverlay>
 </Document></kml>"##;
+
+    #[test]
+    fn duplicate_extended_data_is_counted_once_per_document() {
+        let xml = r#"<kml><Document>
+<Placemark><ExtendedData><Data name="n"><value>0</value></Data><Data name="n"><value>5</value></Data>
+<SchemaData><SimpleData name="n">9</SimpleData><SimpleData name="kind">first</SimpleData>
+<SimpleData name="kind">later</SimpleData></SchemaData></ExtendedData>
+<MultiGeometry><Point><coordinates>1,2</coordinates></Point><LineString><coordinates>1,2 2,3</coordinates></LineString></MultiGeometry></Placemark>
+<Placemark><ExtendedData><Data name="n"><value>7</value></Data><Data name="n"><value>8</value></Data></ExtendedData>
+<Point><coordinates>3,4</coordinates></Point></Placemark>
+</Document></kml>"#;
+        let layers = read("duplicates.kml", xml.as_bytes()).unwrap();
+        assert_eq!(layers.len(), 2);
+        let messages: Vec<_> = layers.iter().flat_map(|l| &l.report.messages).collect();
+        assert_eq!(messages, ["duplicates: 4 repeated ExtendedData entries in 2 placemarks were left out"]);
+        for layer in &layers {
+            let ds = &layer.dataset;
+            assert_eq!(ds.value(0, ds.field_index("n").unwrap()), &Value::Int(0));
+            assert_eq!(ds.value(0, ds.field_index("kind").unwrap()), &Value::Text("first".into()));
+        }
+        assert_eq!(layers[0].dataset.value(1, layers[0].dataset.field_index("n").unwrap()), &Value::Int(7));
+    }
+
+    #[test]
+    fn repeated_names_past_the_column_cap_are_counted() {
+        let mut first = String::from("<Placemark><ExtendedData>");
+        for i in 0..MAX_KEYS {
+            first.push_str(&format!("<Data name=\"k{i}\"><value>1</value></Data>"));
+        }
+        first.push_str("</ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>");
+        let over = |extra: &str| {
+            format!(
+                "<kml><Document>{first}<Placemark><ExtendedData>{extra}</ExtendedData>\
+                 <Point><coordinates>3,4</coordinates></Point></Placemark></Document></kml>"
+            )
+        };
+        let twice = over("<Data name=\"extra\"><value>1</value></Data><Data name=\"extra\"><value>2</value></Data>");
+        let layers = read("cap.kml", twice.as_bytes()).unwrap();
+        let messages: Vec<_> = layers.iter().flat_map(|l| &l.report.messages).collect();
+        assert!(messages.iter().any(|m| m.contains("1 repeated ExtendedData entries in 1 placemarks")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("distinct names")), "the cap is still said: {messages:?}");
+        assert_eq!(layers[0].dataset.fields.len() - layers[0].dataset.field_index("k0").unwrap(), MAX_KEYS);
+        // Once past the cap is the cap only, not a repeat.
+        let once = over("<Data name=\"extra\"><value>1</value></Data>");
+        let layers = read("cap.kml", once.as_bytes()).unwrap();
+        let messages: Vec<_> = layers.iter().flat_map(|l| &l.report.messages).collect();
+        assert!(!messages.iter().any(|m| m.contains("repeated")), "{messages:?}");
+        assert!(messages.iter().any(|m| m.contains("distinct names")), "{messages:?}");
+    }
+
+    #[test]
+    fn distinct_extended_data_keys_across_placemarks_are_clean() {
+        let xml = r#"<kml><Document><Placemark><ExtendedData><Data name="n"><value>0</value></Data>
+<SchemaData><SimpleData name="kind">cafe</SimpleData></SchemaData></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>
+<Placemark><ExtendedData><Data name="n"><value>5</value></Data></ExtendedData><Point><coordinates>3,4</coordinates></Point></Placemark>
+</Document></kml>"#;
+        let layers = read("clean.kml", xml.as_bytes()).unwrap();
+        assert!(layers.iter().all(|l| l.report.messages.is_empty()));
+        assert_eq!(layers[0].dataset.features.len(), 2);
+    }
+
+    #[test]
+    fn digits_a_number_cannot_hold_stay_text() {
+        let doc = r#"<kml><Document><Placemark><ExtendedData><Data name="id"><value>12345678901234567891</value></Data>
+            </ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></Document></kml>"#;
+        let layers = read("ids.kml", doc.as_bytes()).unwrap();
+        let ds = &layers[0].dataset;
+        let id = ds.field_index("id").unwrap();
+        assert_eq!(ds.value(0, id), &Value::Text("12345678901234567891".into()));
+    }
 
     #[test]
     fn reads_placemarks_folders_data_and_styles() {
@@ -597,8 +786,8 @@ mod tests {
         let said = format!("trip lines: {}", crate::zm_note(Some(1)));
         assert!(layers[1].report.messages.contains(&said), "{:?}", layers[1].report.messages);
         // The ground overlay has no box: it can't be laid out.
-        let (overlays, undrawn) = ground_overlays("t.kml", DOC.as_bytes()).unwrap();
-        assert_eq!((overlays.len(), undrawn), (0, 1));
+        let (overlays, undrawn, over_budget) = ground_overlays("t.kml", DOC.as_bytes()).unwrap();
+        assert_eq!((overlays.len(), undrawn, over_budget), (0, 1, 0));
 
         let lines = &layers[1].dataset;
         assert_eq!(lines.features.len(), 2, "the route and the track");
@@ -612,6 +801,167 @@ mod tests {
         let style = polys.dataset.value(0, polys.dataset.field_index("style").unwrap()).to_string();
         assert_eq!(style, "#inline-1");
         assert_eq!(polys.styles[0].1.fill, Some([0, 170, 0, 255]));
+    }
+
+    #[test]
+    fn exported_text_descriptions_keep_their_column_on_repeated_kml_and_kmz_round_trips() {
+        let descriptions = [
+            Some("<b>Café & \"river\"</b>\nSecond line"),
+            Some("]]> <plain> & text"),
+            Some("a\rb"),
+            Some("a\r\nb"),
+            Some("a\u{7f}b\u{85}c\u{9f}"),
+            Some(" padded \n"),
+            Some("\t  \r\n "),
+            Some(""),
+            None,
+        ];
+        for ext in ["kml", "kmz"] {
+            let mut ds = Dataset::new(
+                "places",
+                GeometryType::Point,
+                vec![Field::new("name", FieldType::Text), Field::new("description", FieldType::Text)],
+            );
+            for (row, description) in descriptions.iter().enumerate() {
+                ds.push(
+                    Some(Geometry::Point(Coord::new(row as f64, 2.0))),
+                    vec![Value::Text(format!("Place {row}")), description.map(|v| Value::Text(v.into())).unwrap_or_default()],
+                );
+            }
+            for _ in 0..3 {
+                let xml = crate::interop::to_kml(&ds, Some(0)).unwrap();
+                let doc = roxmltree::Document::parse(&xml).unwrap();
+                let placemarks: Vec<_> =
+                    doc.descendants().filter(|n| n.has_tag_name(("http://www.opengis.net/kml/2.2", "Placemark"))).collect();
+                for (pm, expected) in placemarks.iter().zip(descriptions) {
+                    assert_eq!(child(pm, "description").map(|n| raw_text_of(&n)).as_deref(), expected);
+                }
+                let (bytes, skipped) = crate::io::write_bytes(&ds, ext).unwrap();
+                assert_eq!(skipped, 0);
+                let layers = read(&format!("places.{ext}"), &bytes).unwrap();
+                assert_eq!(layers.len(), 1);
+                let layer = &layers[0];
+                assert!(layer.report.messages.is_empty(), "{ext}: {:?}", layer.report.messages);
+                let back = &layer.dataset;
+                assert!(back.field_index("description_1").is_none());
+                let fi = back.field_index("description").unwrap();
+                for (row, expected) in descriptions.iter().enumerate() {
+                    let expected = expected.map(|v| Value::Text(v.into())).unwrap_or_default();
+                    assert_eq!(back.value(row, fi), &expected, "{ext}, row {row}");
+                }
+                ds = back.clone();
+            }
+        }
+    }
+
+    #[test]
+    fn unrepresentable_description_characters_are_refused_with_their_count_and_location() {
+        for bad in ['\0', '\u{b}', '\u{1b}', '\u{1f}', '\u{fffe}', '\u{ffff}'] {
+            let mut ds = Dataset::new("places", GeometryType::Point, vec![Field::new("description", FieldType::Text)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text(format!("a{bad}b{bad}c"))]);
+            let error = crate::interop::to_kml(&ds, None).unwrap_err().to_string();
+            assert!(error.contains("places") && error.contains(&format!("feature id {}", ds.features[0].id)), "{error}");
+            assert!(error.contains("description: 2 character(s)") && error.contains(&format!("U+{:04X}", bad as u32)), "{error}");
+            for ext in ["kml", "kmz"] {
+                assert_eq!(crate::io::write_bytes(&ds, ext).unwrap_err().to_string(), error);
+            }
+        }
+    }
+
+    #[test]
+    fn description_copies_keep_whitespace_in_data_and_simple_data() {
+        for copy in [
+            "<Data name=\"description\"><value> padded &#13;\n</value></Data>",
+            "<SchemaData><SimpleData name=\"description\"> padded &#13;\n</SimpleData></SchemaData>",
+        ] {
+            let xml = format!(
+                "<kml><Placemark><description> padded &#13;\n</description><ExtendedData>{copy}</ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></kml>"
+            );
+            let layers = read("spaces.kml", xml.as_bytes()).unwrap();
+            let layer = &layers[0];
+            assert!(layer.report.messages.is_empty(), "{:?}", layer.report.messages);
+            let ds = &layer.dataset;
+            assert_eq!(ds.value(0, ds.field_index("description").unwrap()), &Value::Text(" padded \r\n".into()));
+            assert!(ds.field_index("description_1").is_none());
+        }
+    }
+
+    #[test]
+    fn exported_case_variant_descriptions_stay_distinct_from_the_canonical_column() {
+        for variant in ["Description", "DESCRIPTION"] {
+            for other in ["Keep case", "Another value"] {
+                for ext in ["kml", "kmz"] {
+                    let mut ds = Dataset::new(
+                        "places",
+                        GeometryType::Point,
+                        vec![
+                            Field::new("name", FieldType::Text),
+                            Field::new("description", FieldType::Text),
+                            Field::new(variant, FieldType::Text),
+                        ],
+                    );
+                    ds.push(
+                        Some(Geometry::Point(Coord::new(1.0, 2.0))),
+                        vec![Value::Text("Place".into()), Value::Text("Keep case".into()), Value::Text(other.into())],
+                    );
+                    let (bytes, _) = crate::io::write_bytes(&ds, ext).unwrap();
+                    let layers = read(&format!("places.{ext}"), &bytes).unwrap();
+                    let layer = &layers[0];
+                    let back = &layer.dataset;
+                    assert_eq!(back.value(0, back.field_index("description").unwrap()), &Value::Text("Keep case".into()));
+                    assert_eq!(back.value(0, back.field_index(&format!("{variant}_1")).unwrap()), &Value::Text(other.into()));
+                    assert_eq!(layer.report.messages.len(), 1, "{:?}", layer.report.messages);
+                    assert!(layer.report.messages[0].contains(&format!("'{variant}' → '{variant}_1'")), "{:?}", layer.report.messages);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exported_other_reserved_columns_still_report_their_collisions() {
+        for (name, ty, value) in [
+            ("description", FieldType::Double, Value::Float(2.5)),
+            ("Description", FieldType::Text, Value::Text("Keep case".into())),
+            ("folder", FieldType::Text, Value::Text("My folder".into())),
+            ("style", FieldType::Text, Value::Text("My style".into())),
+        ] {
+            let mut ds = Dataset::new("places", GeometryType::Point, vec![Field::new(name, ty)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![value.clone()]);
+            let xml = crate::interop::to_kml(&ds, None).unwrap();
+            assert!(!xml.contains("<description>"), "{xml}");
+            let layers = read("places.kml", xml.as_bytes()).unwrap();
+            let layer = &layers[0];
+            let fi = layer.dataset.field_index(&format!("{name}_1")).unwrap();
+            assert_eq!(layer.dataset.value(0, fi), &value);
+            assert_eq!(layer.report.messages.len(), 1, "{:?}", layer.report.messages);
+            assert!(layer.report.messages[0].contains("renamed"), "{:?}", layer.report.messages);
+        }
+    }
+
+    #[test]
+    fn extended_data_named_like_a_fixed_column_is_kept_under_a_free_name() {
+        // `name` becomes the placemark's name and, like every field, extended data too; `NAME`
+        // clashes with the name column ignoring case but holds something else.
+        let mut ds =
+            Dataset::new("t", GeometryType::Point, vec![Field::new("name", FieldType::Double), Field::new("NAME", FieldType::Integer)]);
+        ds.push_next(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Float(0.0), Value::Int(1)]);
+        let kml = crate::interop::to_kml(&ds, crate::io::name_field(&ds)).unwrap();
+        let layers = read("t.kml", kml.as_bytes()).unwrap();
+        let (back, report) = (&layers[0].dataset, &layers[0].report);
+        let names: Vec<&str> = back.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["name", "description", "folder", "style", "NAME_1"], "the copy of the name isn't a column of its own");
+        assert_eq!(back.value(0, 0), &Value::Text("0".into()));
+        assert_eq!(back.value(0, 4), &Value::Int(1));
+        assert_eq!(
+            report.messages,
+            [
+                "t: 1 extended data name was renamed, as RustGIS gives every placemark a name, description, folder and style column: 'NAME' → 'NAME_1'"
+            ]
+        );
+
+        // Without a clash, nothing is said.
+        let layers = read("trip.kml", DOC.as_bytes()).unwrap();
+        assert!(layers[0].report.messages.iter().all(|m| !m.contains("renamed")), "{:?}", layers[0].report.messages);
     }
 
     #[test]

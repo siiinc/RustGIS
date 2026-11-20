@@ -6,7 +6,7 @@
 //! ribbon's label groups edit and choose the same one (#858). The map-wide settings (Lock, Pause,
 //! View Unplaced) are on the ribbon only, and Convert on the ribbon and the layer's menu.
 
-use egui::{Align2, CornerRadius, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+use egui::{CornerRadius, RichText, Ui, vec2};
 use rustgis_engine::map::symbology::{
     DEFAULT_LABEL_CLASS, HALO_WIDTH, LABEL_SIZE, LabelClass, Labeling, MAX_LABEL_CLASSES, label_class_name,
 };
@@ -16,8 +16,7 @@ use serde_json::{Value, json};
 
 use crate::RustGisApp;
 use crate::textform::LABEL_W;
-use crate::theme::{Tokens, c32, regular, rgba, semibold};
-use crate::widgets::text_w;
+use crate::theme::{Tokens, c32, rgba, semibold};
 
 /// The placements as they sit around a feature, row by row; Automatic sits apart, above them.
 const GRID: [[LabelPlacement; 3]; 3] = [
@@ -81,72 +80,18 @@ enum Topic {
 fn topic(ui: &mut Ui, t: &Tokens) -> Topic {
     let key = egui::Id::unique("label_pane_topic");
     let mut tab = ui.data(|d| d.get_temp::<Topic>(key)).unwrap_or(Topic::Content);
-    let tabs = [
-        ("Content", "unique", Topic::Content),
-        ("Symbol", "g_text", Topic::Symbol),
-        ("Position", "placement", Topic::Position),
-        ("Range", "scale_label", Topic::Range),
-    ];
-    let font = |on: bool| if on { semibold(12.5) } else { regular(12.5) };
-    let (pad, icon, gap, h) = (8.0, 16.0, 5.0, 30.0);
-    // Measured in the chosen tab's font, so the tabs don't move as another is chosen.
-    let text = tabs.map(|(label, _, _)| text_w(ui, tl!(label), semibold(12.5)));
-    let room = ui.available_width() - 2.0 * (tabs.len() as f32 - 1.0);
-    // A tab's room besides its name, with or without its icon.
-    let extra = |icons: bool| 2.0 * pad + if icons { icon + gap } else { 0.0 };
-    let fits = |icons: bool| text.iter().map(|w| w + extra(icons)).sum::<f32>() <= room;
-    let (icons, names) = if fits(true) {
-        (true, true)
-    } else if fits(false) {
-        (false, true)
-    } else {
-        (true, false)
-    };
-    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
-    let base = row.max.y - 0.5;
-    ui.painter().hline(row.x_range(), base, Stroke::new(1.0, t.border));
-    let mut x = row.min.x;
-    for ((label, name, it), w) in tabs.into_iter().zip(text) {
-        let shown = tl!(label);
-        let on = it == tab;
-        let w = if names { extra(icons) + w } else { 36.0 };
-        let r = Rect::from_min_size(pos2(x, row.min.y), vec2(w, h));
-        x = r.max.x + 2.0;
-        let mut resp = ui.interact(r, key.with(label), Sense::click());
-        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, shown));
-        let p = ui.painter();
-        let body = Rect::from_min_max(pos2(r.min.x, r.min.y + 3.0), r.max);
-        let round = CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
-        if on {
-            p.rect_filled(body, round, t.pane);
-            p.rect_stroke(body, round, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
-            // Open onto the pane: the line under the tabs stops at the chosen one.
-            p.rect_filled(Rect::from_min_max(pos2(r.min.x + 1.0, base - 1.0), pos2(r.max.x - 1.0, row.max.y + 1.0)), 0.0, t.pane);
-            p.rect_filled(
-                Rect::from_min_max(pos2(r.min.x + 8.0, r.max.y - 3.0), pos2(r.max.x - 8.0, r.max.y - 1.0)),
-                CornerRadius::same(1),
-                t.accent,
-            );
-        } else if resp.hovered() {
-            p.rect_filled(body.shrink2(vec2(1.0, 2.0)), CornerRadius::same(5), t.hover);
-        }
-        let cy = body.center().y - 1.0;
-        if !names {
-            crate::icons::paint(p, Rect::from_center_size(pos2(r.center().x, cy), vec2(icon, icon)), name, t.icon, t.accent);
-            resp = resp.on_hover_text(shown);
-        } else {
-            let mut tx = r.min.x + pad;
-            if icons {
-                crate::icons::paint(p, Rect::from_min_size(pos2(tx, cy - icon / 2.0), vec2(icon, icon)), name, t.icon, t.accent);
-                tx += icon + gap;
-            }
-            let ink = if on { t.text } else { t.text_dim };
-            p.text(pos2(tx, cy), Align2::LEFT_CENTER, shown, font(on), ink);
-        }
-        if resp.clicked() {
-            tab = it;
-        }
-    }
+    crate::widgets::tabs(
+        ui,
+        t,
+        key,
+        &mut tab,
+        &[
+            crate::widgets::Tab { label: "Content", icon: "unique", hover: None, value: Topic::Content },
+            crate::widgets::Tab { label: "Symbol", icon: "g_text", hover: None, value: Topic::Symbol },
+            crate::widgets::Tab { label: "Position", icon: "placement", hover: None, value: Topic::Position },
+            crate::widgets::Tab { label: "Range", icon: "scale_label", hover: None, value: Topic::Range },
+        ],
+    );
     ui.data_mut(|d| d.insert_temp(key, tab));
     ui.add_space(4.0);
     tab
@@ -417,11 +362,13 @@ fn rename_box(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class, key: egui
         return;
     }
     if edit.lost_focus() {
+        // Left alone only when unchanged as typed. A name past the limit is sent as typed even when
+        // its cut is the class's own name: the command cuts it and says so (#2122).
         let name = label_class_name(&r.text);
-        if name == c.it.name {
+        if r.text.trim() == c.it.name {
             return;
         }
-        if run(app, "labels.class.rename", json!({"class": c.it.name, "name": name})).is_some() {
+        if run(app, "labels.class.rename", json!({"class": c.it.name, "name": r.text})).is_some() {
             // Default stays chosen by no name; another class goes by its new one.
             if c.name.is_some() {
                 choose(ui, app, l, Some(&name));
@@ -556,7 +503,9 @@ fn text_symbol(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
         // The whole range `labels.style` accepts (#457); the map follows a drag and letting
         // go runs the command once, so a drag is one undo step.
         let mut size = f64::from(c.it.size);
-        let r = ui.add(egui::DragValue::new(&mut size).range(LABEL_SIZE).speed(0.1).suffix(" pt")).labelled_by(input_label.id);
+        let r = ui
+            .add(egui::DragValue::new(&mut size).update_while_editing(false).range(LABEL_SIZE).speed(0.1).suffix(" pt"))
+            .labelled_by(input_label.id);
         let id = l.id;
         crate::ribbon::live_drag(
             app,
@@ -645,7 +594,9 @@ fn background(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     let number = |app: &mut RustGisApp, ui: &mut Ui, label: &str, cur: f32, range: std::ops::RangeInclusive<f64>, key: &'static str| {
         let input_label = ui.label(tl!(label));
         let mut v = f64::from(cur);
-        let r = ui.add(egui::DragValue::new(&mut v).range(range.clone()).speed(0.05).suffix(" pt")).labelled_by(input_label.id);
+        let r = ui
+            .add(egui::DragValue::new(&mut v).update_while_editing(false).range(range.clone()).speed(0.05).suffix(" pt"))
+            .labelled_by(input_label.id);
         crate::ribbon::live_drag(
             app,
             ui,
@@ -710,9 +661,16 @@ fn wrapping(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     let input_label = ui.label(tl!("Wrap length"));
     let mut n = f64::from(c.it.wrap_length);
     let r = ui
-        .add(egui::DragValue::new(&mut n).range(0..=MAX_WRAP_LENGTH).speed(0.2).max_decimals(0).custom_formatter(|v, _| {
-            if v <= 0.0 { tl!("Off").to_string() } else { crate::i18n::fmt("{n} characters", &[("n", &v.to_string())]) }
-        }))
+        .add(
+            egui::DragValue::new(&mut n)
+                .update_while_editing(false)
+                .range(0..=MAX_WRAP_LENGTH)
+                .speed(0.2)
+                .max_decimals(0)
+                .custom_formatter(|v, _| {
+                    if v <= 0.0 { tl!("Off").to_string() } else { crate::i18n::fmt("{n} characters", &[("n", &v.to_string())]) }
+                }),
+        )
         .labelled_by(input_label.id)
         .on_hover_text(tl!("Lines longer than this are broken between their words."));
     let id = l.id;
@@ -748,7 +706,9 @@ fn letter_spacing(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     let input_label = ui.label(tl!("Letter spacing"));
     let (lo, hi) = (rustgis_engine::map::layout::MIN_LETTER_SPACING, rustgis_engine::map::layout::MAX_LETTER_SPACING);
     let mut spacing = f64::from(c.it.spacing);
-    let r = ui.add(egui::DragValue::new(&mut spacing).range(lo..=hi).speed(0.05).suffix(" pt")).labelled_by(input_label.id);
+    let r = ui
+        .add(egui::DragValue::new(&mut spacing).update_while_editing(false).range(lo..=hi).speed(0.05).suffix(" pt"))
+        .labelled_by(input_label.id);
     let id = l.id;
     crate::ribbon::live_drag(
         app,
@@ -794,7 +754,9 @@ fn halo_style(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
         }
         let Some(width) = c.it.halo_width else { return };
         let mut w = f64::from(width);
-        let r = ui.add(egui::DragValue::new(&mut w).range(HALO_WIDTH).speed(0.05).suffix(" pt")).labelled_by(input_label.id);
+        let r = ui
+            .add(egui::DragValue::new(&mut w).update_while_editing(false).range(HALO_WIDTH).speed(0.05).suffix(" pt"))
+            .labelled_by(input_label.id);
         let id = l.id;
         crate::ribbon::live_drag(
             app,
@@ -888,6 +850,7 @@ pub(crate) fn family_picker(ui: &mut Ui, salt: impl std::hash::Hash + std::fmt::
     Picked { response, chosen }
 }
 
+/// Edits this label class's placement, including overlap and callout options, through commands.
 fn position(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     let cur = c.it.placement;
     let pick = |app: &mut RustGisApp, ui: &mut Ui, pl: LabelPlacement| {
@@ -924,10 +887,88 @@ fn position(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
         });
         if cur.along_line() {
             repeat(app, ui, l, c);
+            line_offset(app, ui, l, c);
+            // One label a line: other places along it, tried when its own won't do (#1187). Each
+            // repeat is already a place of its own.
+            if c.it.repeat.is_none() {
+                ui.add_space(4.0);
+                let mut on = c.it.other_positions;
+                let help = tl!("If its place is taken or (curved) the line bends too much, the label tries other places along the line.");
+                if ui.checkbox(&mut on, tl!("Try other places along the line")).on_hover_text(help).changed() {
+                    run(app, "labels.placement", c.params(json!({"otherPositions": on})));
+                }
+            }
         }
     }
     ui.add_space(6.0);
     offset(app, ui, l, c);
+    ui.add_space(6.0);
+    crowding(app, ui, l, c);
+}
+
+/// Where labels crowd: every one shown, over the others, rather than some left out; and
+/// callouts, which move a crowded label to a free spot nearby with a line back to its feature,
+/// no longer than so far.
+fn crowding(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
+    use rustgis_engine::map::symbology::{CALLOUT_REACH, callout_reach};
+    let id = l.id;
+    grid(ui, "crowding", |ui| {
+        let input_label = ui.label(tl!("Show all labels"));
+        let mut all = c.it.show_all;
+        if ui
+            .checkbox(&mut all, "")
+            .labelled_by(input_label.id)
+            .on_hover_text(tl!("Draw every label, over the others where they crowd, rather than leaving some out."))
+            .changed()
+        {
+            run(app, "labels.placement", c.params(json!({"showAll": all})));
+        }
+        ui.end_row();
+        let input_label = ui.label(tl!("Callouts"));
+        ui.horizontal(|ui| {
+            let mut on = c.it.callout.is_some();
+            if ui
+                .checkbox(&mut on, "")
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!(
+                    "Move a label crowded off its spot to a free one nearby, with a line back to its feature. Labels along lines stay."
+                ))
+                .changed()
+            {
+                run(app, "labels.placement", c.params(json!({"callout": on})));
+            }
+            let Some(reach) = c.it.callout else { return };
+            let mut v = f64::from(reach);
+            let r = ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .update_while_editing(false)
+                        .range(CALLOUT_REACH)
+                        .speed(1.0)
+                        .max_decimals(0)
+                        .prefix(format!("{} ", tl!("at most")))
+                        .suffix(" pt"),
+                )
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("The longest a callout's line may be."));
+            crate::ribbon::live_drag(
+                app,
+                ui,
+                &r,
+                f64::from(reach),
+                v,
+                |app, x| {
+                    if let Some(k) = app.session.map_mut().layer_mut(id).and_then(|l| class_mut(&mut l.labels, c.name)) {
+                        k.callout = callout_reach(x);
+                    }
+                },
+                |app, x| {
+                    run(app, "labels.placement", c.params(json!({"callout": x})));
+                },
+            );
+        });
+        ui.end_row();
+    });
 }
 
 /// Along a line, a label every so many points, spaced out from the one at its middle; off, the one
@@ -949,6 +990,7 @@ fn repeat(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
             let r = ui
                 .add(
                     egui::DragValue::new(&mut v)
+                        .update_while_editing(false)
                         .range(LABEL_REPEAT)
                         .speed(1.0)
                         .max_decimals(1)
@@ -977,6 +1019,57 @@ fn repeat(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     });
 }
 
+/// Along a line, how far the label sits from it (points, to the text's nearest edge), above it as
+/// the text reads or below it (#1187); at 0, on the line, and which side waits for a distance.
+fn line_offset(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
+    use rustgis_engine::map::symbology::{LABEL_OFFSET, label_line_offset};
+    let id = l.id;
+    let cur = c.it.line_offset;
+    // The side is kept apart from the distance, so passing through 0 (dragged or typed) doesn't
+    // turn a label below its line into one above it.
+    let side_key = ui.make_persistent_id(("line_offset_below", id, c.name));
+    if cur != 0.0 {
+        ui.data_mut(|d| d.insert_temp(side_key, cur < 0.0));
+    }
+    let below = ui.data(|d| d.get_temp(side_key)).unwrap_or(false);
+    let side = |below: bool| if below { -1.0 } else { 1.0 };
+    grid(ui, "line_offset", |ui| {
+        let input_label = ui.label(tl!("Distance"));
+        ui.horizontal(|ui| {
+            let mut v = f64::from(cur.abs());
+            let r = ui
+                .add(egui::DragValue::new(&mut v).update_while_editing(false).range(0.0..=*LABEL_OFFSET.end()).speed(0.1).suffix(" pt"))
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("How far the label sits from the line, to the text's nearest edge; 0 is on the line."));
+            crate::ribbon::live_drag(
+                app,
+                ui,
+                &r,
+                f64::from(cur.abs()),
+                v,
+                |app, x| {
+                    if let Some(k) = app.session.map_mut().layer_mut(id).and_then(|l| class_mut(&mut l.labels, c.name)) {
+                        k.line_offset = label_line_offset(x * side(below));
+                    }
+                },
+                |app, x| {
+                    run(app, "labels.placement", c.params(json!({"lineOffset": x * side(below)})));
+                },
+            );
+            // Which side, once it is off the line.
+            ui.add_enabled_ui(cur != 0.0, |ui| {
+                let mut pick = below;
+                ui.radio_value(&mut pick, false, tl!("Above"));
+                ui.radio_value(&mut pick, true, tl!("Below"));
+                if pick != below {
+                    run(app, "labels.placement", c.params(json!({"lineOffset": -cur})));
+                }
+            });
+        });
+        ui.end_row();
+    });
+}
+
 /// How far the label moves from where its placement puts it, right and down, in points.
 fn offset(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     use rustgis_engine::map::symbology::LABEL_OFFSET;
@@ -987,7 +1080,7 @@ fn offset(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
             let input_label = ui.label(tl!(label));
             let mut v = f64::from(cur.get(i).copied().unwrap_or(0.0));
             let r = ui
-                .add(egui::DragValue::new(&mut v).range(LABEL_OFFSET).speed(0.1).suffix(" pt"))
+                .add(egui::DragValue::new(&mut v).update_while_editing(false).range(LABEL_OFFSET).speed(0.1).suffix(" pt"))
                 .labelled_by(input_label.id)
                 .on_hover_text(tl!("A label along a line isn't moved."));
             crate::ribbon::live_drag(
@@ -1193,7 +1286,6 @@ fn apply_color_drag(app: &mut RustGisApp, drag: ColorDrag) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use egui_kittest::kittest::{NodeT, Queryable};
     use rustgis_engine::map::Rgba;
@@ -1365,6 +1457,105 @@ mod tests {
         h.state_mut().session.run("layer.select", &json!({"layer": countries})).unwrap();
         h.run();
         assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_none(), "not for polygons");
+    }
+
+    /// A line layer's labels sit a distance from the line (#1187): the row is there for a placement
+    /// along the line, the side waits for a distance, and Below puts the label under the line.
+    #[test]
+    fn a_distance_from_the_line_is_set_in_the_pane() {
+        use egui::accesskit::Role;
+        let mut h = harness(with_cities());
+        h.run();
+        let rivers = layer_id(h.state(), "Rivers");
+        h.state_mut().session.run("layer.select", &json!({"layer": rivers})).unwrap();
+        h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "position": "center"})).unwrap();
+        h.run();
+        open_tab(&mut h, "Position");
+        let offset =
+            |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer_by_name("Rivers").unwrap().labels.default.line_offset;
+        assert!(h.query_by_role_and_label(Role::SpinButton, "Distance").is_none(), "not off the line");
+        h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "position": "parallel"})).unwrap();
+        h.run();
+        assert!(h.query_by_role_and_label(Role::SpinButton, "Distance").is_some());
+        assert!(h.get_by_role_and_label(Role::RadioButton, "Below").accesskit_node().is_disabled(), "on the line, no side");
+        h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "lineOffset": 3})).unwrap();
+        h.run();
+        h.get_by_role_and_label(Role::RadioButton, "Below").click();
+        h.run();
+        assert_eq!(offset(&h), -3.0);
+        h.get_by_role_and_label(Role::RadioButton, "Above").click();
+        h.run();
+        assert_eq!(offset(&h), 3.0);
+        // Below, back on the line, then off it again: still below.
+        h.get_by_role_and_label(Role::RadioButton, "Below").click();
+        h.run();
+        h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "lineOffset": 0})).unwrap();
+        h.run();
+        assert!(h.get_by_role_and_label(Role::RadioButton, "Below").accesskit_node().is_disabled(), "on the line");
+        h.get_by_role_and_label(Role::SpinButton, "Distance").focus();
+        h.run();
+        h.get_by_role_and_label(Role::SpinButton, "Distance").type_text("2");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(offset(&h), -2.0, "the side waits for a distance");
+    }
+
+    /// A line layer's labels can try other places along the line (#1187): the box is there for a
+    /// placement along the line without a repeat, and hiding it leaves what it was set to.
+    #[test]
+    fn other_positions_are_set_in_the_pane_along_lines() {
+        use egui::accesskit::Role;
+        const BOX: &str = "Try other places along the line";
+        let mut h = harness(with_cities());
+        h.run();
+        let rivers = layer_id(h.state(), "Rivers");
+        h.state_mut().session.run("layer.select", &json!({"layer": rivers})).unwrap();
+        h.run();
+        open_tab(&mut h, "Position");
+        let on = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+            h.state().session.map().layer_by_name("Rivers").unwrap().labels.default.other_positions
+        };
+        assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_none(), "not off the line");
+        for position in ["parallel", "curved"] {
+            h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "position": position})).unwrap();
+            h.run();
+            assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_some(), "{position}");
+        }
+        h.get_by_role_and_label(Role::CheckBox, BOX).click();
+        h.run();
+        assert!(on(&h));
+        h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "repeat": 144})).unwrap();
+        h.run();
+        assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_none(), "not with a repeat");
+        assert!(on(&h), "hidden, it's kept");
+        h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "repeat": null})).unwrap();
+        h.run();
+        h.get_by_role_and_label(Role::CheckBox, BOX).click();
+        h.run();
+        assert!(!on(&h));
+        let countries = layer_id(h.state(), "Countries");
+        h.state_mut().session.run("layer.select", &json!({"layer": countries})).unwrap();
+        h.run();
+        assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_none(), "not for polygons");
+    }
+
+    /// The box along the line sets the class chosen, not Default (#1187).
+    #[test]
+    fn other_positions_along_lines_set_the_chosen_class() {
+        let mut app = with_cities();
+        let rivers = layer_id(&app, "Rivers");
+        app.session.run("layer.select", &json!({"layer": rivers})).unwrap();
+        app.run("labels.class.add", json!({"name": "Named"})).unwrap();
+        app.run("labels.placement", json!({"class": "Named", "position": "curved"})).unwrap();
+        let mut h = harness(app);
+        h.run();
+        pick_class(&mut h, "Default", "Named");
+        open_tab(&mut h, "Position");
+        h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Try other places along the line").click();
+        h.run();
+        let l = labels(h.state());
+        assert!(l.class("Named").unwrap().other_positions);
+        assert!(!l.default.other_positions);
     }
 
     #[test]
@@ -1665,6 +1856,62 @@ mod tests {
         let app = h.state_mut();
         app.run("edit.undo", json!(null)).unwrap();
         assert_eq!(clause(app).as_deref(), Some("pop_max > 5000000"), "undo brings the clause back");
+    }
+
+    /// The SQL tab's clause takes the language's functions and variables from the same menus as
+    /// Select By Attributes and the Query tab.
+    #[test]
+    fn the_sql_tab_offers_the_functions_and_variables_menus() {
+        use egui::accesskit::Role;
+        use rustgis_engine::data::query::{VARS, functions};
+        let app = with_cities();
+        let mut h = harness(app);
+        h.run();
+        h.get_by_label("+ New expression").click();
+        h.run();
+        type_clause(&mut h, "name =");
+        // One that takes arguments, so it is added open.
+        let first = functions().find(|f| f.max > 0).unwrap();
+        h.get_by_role_and_label(Role::Button, "Functions ▾").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, &format!("{}()", first.name)).click();
+        h.run();
+        let var = VARS[0].names[0];
+        h.get_by_role_and_label(Role::Button, "Variables ▾").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, var).click();
+        h.run();
+        let text = h.get_by_role(Role::MultilineTextInput).value().unwrap_or_default();
+        assert_eq!(text, format!("name = {}({var} ", first.name));
+    }
+
+    #[test]
+    fn retained_area_clauses_do_not_claim_clean_features_are_unlabelled() {
+        use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
+        let mut app = with_cities();
+        let id = app.session.active_layer.unwrap();
+        let c = Coord::new;
+        let mut data = Dataset::new("Area labels", GeometryType::Polygon, vec![Field::new("n", FieldType::Double)]);
+        for (n, ring) in [
+            (1.0, vec![c(0.0, 0.0), c(1.0, 0.0), c(1.0, 1.0), c(0.0, 0.0)]),
+            (2.0, vec![c(-180.0, 90.0), c(180.0, 90.0), c(-90.0, -90.0), c(90.0, -80.0)]),
+        ] {
+            data.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Value::Float(n)]);
+        }
+        let layer = app.session.map_mut().layer_mut(id).unwrap();
+        layer.dataset = data;
+        layer.labels.enabled = true;
+        layer.labels.default.field = "n".into();
+        layer.labels.default.where_ = Some("$area > 0".into());
+        layer.definition_query = Some("n = 1".into());
+        let mut h = harness(app);
+        h.run();
+        assert!(h.query_by_label_contains("This clause no longer reads").is_none());
+        assert_eq!(h.state().session.map().layer(id).unwrap().visible_rows(), [true, false]);
+        h.get_by_label("Check").click();
+        h.run();
+        assert!(h.query_by_label_contains("area is ambiguous").is_some());
+        assert_eq!(clause(h.state()).as_deref(), Some("$area > 0"));
     }
 
     /// A clause that doesn't read says why, and Apply leaves the layer as it was.
@@ -2139,6 +2386,69 @@ mod tests {
         assert_eq!(names(h.state()), ["big", "Default"]);
         assert!(shown(&h, "big"), "still chosen by its new name");
         assert_eq!(h.state().session.undo_depth(), steps + 1);
+    }
+
+    /// A name typed past 100 characters is cut to them, and the cut is said (#2122): the box sends
+    /// the name as typed, so the command sees how long it was.
+    #[test]
+    fn a_long_name_typed_in_the_pane_is_cut_and_said() {
+        let mut app = with_cities();
+        app.run("labels.class.add", json!({"name": "Big"})).unwrap();
+        let mut h = harness(app);
+        h.run();
+        pick_class(&mut h, "Default", "Big");
+        h.get_by_label("Rename").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.key_press(egui::Key::Backspace);
+        h.run();
+        h.get_by_role(egui::accesskit::Role::TextInput).type_text(&"b".repeat(101));
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let kept = "b".repeat(100);
+        assert_eq!(names(h.state()), [kept.as_str(), "Default"]);
+        assert!(shown(&h, &kept), "still chosen by its new name");
+        let said: Vec<&str> =
+            h.state().session.notices.iter().filter(|n| n.text.starts_with("Label Classes:")).map(|n| n.text.as_str()).collect();
+        let want = format!(
+            "Label Classes: Cities: a label class's name takes at most 100 characters, so the name given (101) is cut to 100, kept as '{kept}'"
+        );
+        assert_eq!(said, [want.as_str()]);
+    }
+
+    /// A name typed past 100 characters whose cut is the class's own name is still sent, so the
+    /// cut is said (#2122), rather than the box closing silently.
+    #[test]
+    fn a_long_name_typed_in_the_pane_that_cuts_to_the_same_name_is_said() {
+        let kept = "b".repeat(100);
+        let mut h = harness(with_cities());
+        h.run();
+        // A class made and renamed through the pane: a 100-character name is wider than the
+        // chooser, which the test can't click.
+        h.get_by_label("New").click();
+        h.run();
+        let rename = |h: &mut egui_kittest::Harness<'static, RustGisApp>, text: &str| {
+            h.get_by_label("Rename").click();
+            h.run();
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            h.key_press(egui::Key::Backspace);
+            h.run();
+            h.get_by_role(egui::accesskit::Role::TextInput).type_text(text);
+            h.run();
+            h.key_press(egui::Key::Enter);
+            h.run();
+        };
+        rename(&mut h, &kept);
+        assert_eq!(names(h.state()), [kept.as_str(), "Default"]);
+        rename(&mut h, &"b".repeat(101));
+        assert_eq!(names(h.state()), [kept.as_str(), "Default"]);
+        let said: Vec<&str> =
+            h.state().session.notices.iter().filter(|n| n.text.starts_with("Label Classes:")).map(|n| n.text.as_str()).collect();
+        let want = format!(
+            "Label Classes: Cities: a label class's name takes at most 100 characters, so the name given (101) is cut to 100, kept as '{kept}'"
+        );
+        assert_eq!(said, [want.as_str()]);
     }
 
     /// A rename left open when the pane is hidden is gone when it shows again.

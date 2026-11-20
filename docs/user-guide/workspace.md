@@ -11,9 +11,30 @@ streamed layers reopen their sources, and file-backed rasters reopen their files
 sources accessible when moving a project. See [Project items](data.md#project-items) for
 templates, packages and files for individual items.
 
+A project file holds the features of every layer loaded whole (GeoJSON, KML/KMZ, GPX, and
+Shapefiles of up to 100,000 features), so a project of many such layers grows large. How large a
+project can be saved and opened follows the computer's memory: on the desktop, as much as a
+quarter of it holds open (about 800 MiB of project for every 16 GB), from 512 MiB up to 4 GiB; in
+the web app and a 32-bit build, 512 MiB. Save refuses a project past it, rather than writing one that can't be opened
+again, and Open refuses a larger file, saying its size, the limit, and how much memory a computer
+needs to open it. A project saved on a
+computer with more memory may need one like it to open. A project package (`.rgispkg`) holds
+at most 1 GiB once unzipped (256 MiB in the web app), its project and its files together, as zip
+archives do here; the package file itself is smaller. `gp.env` reports the limit as
+`projectBytes`. A GeoPackage, FlatGeobuf, GeoParquet or Shapefile of more than 100,000 features
+(or any, added with `"stream": true`) is read in place and stays out of the project file; a
+smaller one is loaded whole.
+
 **Open** also accepts a project package (`.rgispkg`), as do drag-and-drop and the desktop
 command line. A package opens as a new, unsaved project; Save writes a plain `.rgis` file.
 Opening or creating a project clears undo history; saving does not.
+
+This version already reads format 2, a newer `.rgis` format
+([#1853](https://github.com/opengeos/RustGIS/issues/1853)), when the file needs nothing this
+version lacks, and saves it in the format it writes today. A project, package, template, map or
+layer file that needs something this version can't read (what it lists under `requires`) is
+refused, naming what it needs, rather than opened without it; one of a newer format still asks
+you to update RustGIS.
 
 A `•` after the project's name in the title bar means it has unsaved changes. Undoing or redoing
 back to the state you last saved clears it. Before the desktop app discards unsaved changes, it
@@ -32,9 +53,19 @@ The browser app doesn't ask yet; it warns before you leave a page with unsaved c
 default), RustGIS keeps your changes as a [recovery copy](#autosave-and-recovery) and offers them
 back the next time it starts; with autosave off, they are lost, so save before you quit.
 
-Saved layer addresses omit passwords, access keys, tokens and signatures. The open session
-keeps them, but after restarting RustGIS a protected source may need you to sign in to its
-connection again or add it again with credentials.
+Saving removes recognized credentials from supported layer and video addresses and from
+recognized task, model, notebook and history parameters. Notices count detected removals and
+content that could not be checked. Unrecognized credentials can remain in addresses without a
+notice. Diagnostic logging uses a broader sensitive-name list: a parameter named `auth` or
+`jwt` may be hidden in a diagnostic message while remaining in a saved address. Inspect
+shared addresses when a service uses names outside the recognized saved-credential rules.
+The open session keeps its credentials, but a saved workflow or protected source may
+need them again when reopened. User notes, feature data and opaque content are preserved.
+Review addresses and preserved content before sharing a file; see
+[Sharing projects and generated items](https://github.com/opengeos/RustGIS/blob/main/SECURITY.md#sharing-projects-and-generated-items)
+for the supported scope.
+A cloud-optimised GeoTIFF's look in its address (`#bands=…`, `#range=…`, `#dequantize=aef`, a data
+cube's fixed range too) is saved; any other `#` part isn't.
 
 ### Autosave and recovery
 
@@ -42,7 +73,7 @@ The desktop app keeps a recovery copy of unsaved work. While the project has cha
 saved, it writes a copy every few minutes (5 by default), and only when something changed since
 the last one. Choose how often, or turn it off, in **Settings › Autosave**
 (`ui.autosave={"minutes": 10}`; `0` is off). The copy is written in the background, so a large
-project doesn't hold up the app. It leaves out layer passwords, keys and tokens, as a saved project
+project doesn't hold up the app. It removes recognized layer credentials, as a saved project
 does. It is kept in the `recovery` folder of the app's
 [data folder](../installation.md#settings-data-and-cache-folders), not beside your project.
 Saving, opening or starting another project, and choosing **Don't Save** when you quit remove it.
@@ -75,8 +106,27 @@ The browser app doesn't autosave yet; it warns before you leave a page with unsa
 
 RustGIS keeps a **log** of the commands run in the session: what was done, when, with what, and
 whether it worked. It is an audit trail of the session, for reviewing work or recalling what was
-run; it runs nothing again (History's Copy as code and recorded tasks do that). Every
+run; it runs nothing again by itself, but an entry can be copied back as a Script pane line. Every
 front end goes into it alike: the app, scripts, the AI Assistant, the command line, Python and MCP.
+
+In the app, the **History** pane has three tabs: **Tool runs**, the tools run on the project (saved
+with it, and each can run again); **This project**, the session log's entries for the project open
+now (two projects of the same name are told apart); and **Session log**, which shows the whole
+session's log newest first: each command with whether it worked, when it started (UTC) and in which
+project, how long it took, its error and its parameters (on one line; all of them on hover). It
+lists the newest 200 that match and says how many there are; type part of a command's id (`layer.`,
+`export`) to filter, or tick **Failed only**.
+
+A right-click on an entry offers **Copy Parameters** and **Copy Command**, the entry as a line for
+the Script pane (`layer.buffer {"distance":10}`; undo and redo as themselves). A script run offers
+**Copy Script** and **Open in Script Pane** instead, which puts the script in the Script pane in
+place of its own (Ctrl+Z, ⌘+Z on a Mac, brings that back; not while the pane runs one). Where the
+log cut an entry's parameters short or took secrets out of them, copying its command or its
+parameters says so, as it may not run as it ran, and its script can be neither copied nor opened:
+it would run only in part. **Save Log As…** writes the whole log as CSV or JSON Lines, as the
+name's extension says (CSV without one; in the browser it is downloaded as CSV, and the download
+isn't itself an entry in the log, as a saved file is). **Clear Log** empties it and
+**Log Commands** turns it off or on.
 
 - **What goes in:** each command that changes the project, and each that names a file, folder,
   address or connection, reads included (an export, a download, a save, opening a file), plus
@@ -87,7 +137,33 @@ front end goes into it alike: the app, scripts, the AI Assistant, the command li
   file permission, since it names the files and addresses the user's commands used.
 - **Each entry:** `at` (when it started, in milliseconds since 1970, UTC; for a plugin's command
   that waited for its downloads, when its last run started), `command`, `params`, `ok`, `error`
-  when it failed, and `millis`, how long it took.
+  when it failed, `millis`, how long it took, `project`, the name of the project open when it ran
+  (the one it opened, for a command that opens one), and `partial`, true when its parameters were
+  cut short or had secrets taken out, and, for what a session plugin's program asked
+  for between the plugin's commands, `plugin`, that plugin's id (left out of `project.log` and
+  JSON Lines for other entries; an empty cell in CSV). Such a request's inputs belong to its own
+  entry, even when the next command answers it. New entries also carry
+  `rustgis_version`, the version that executed the command, and `inputs`, the local files actually
+  opened by its readers (including sidecars and a script's child commands). SQLite journal/WAL
+  companions present at read time are included too. Each fingerprint has
+  an absolute `path`, `size` in bytes, `modified_ns` (nanoseconds since 1970 UTC, as text), and
+  `sha256` when cheaply available. RustGIS reuses existing digests or hashes buffers already in
+  memory up to 8 MiB; it never rereads a large input just for the log. Streamed, random-access
+  and larger inputs have `sha256: null` and a `hash_unavailable` reason: compare their size and
+  modified time instead, which cannot prove identical content. Unavailable size or modified time
+  is `null`. Repeated identical observations are combined; different observations of one path
+  can appear separately. Each entry keeps at most 100 fingerprints; `inputs_omitted` counts
+  those left out (absent or zero when none), and a notice reports the omission. Joined steps
+  share this limit and update one omission notice with the cumulative count. Turning logging off
+  also stops fingerprint collection on background jobs started while it is off. The log captures local reads RustGIS makes; it cannot enumerate files
+  opened internally by another program or include metadata the browser's upload did not supply.
+  GDAL conversions name the original local file, including cache hits; DuckDB conversions name
+  the explicitly supplied local database, when there is one. Conversion caches and
+  temporary GeoPackage copies and reloads of files just exported are excluded. ER Mapper headers
+  include plainly named `DataFile` companions beside the header when cheaply identifiable;
+  observing them never adds a validation requirement to conversion. Files inside a database folder
+  opened by another program are not enumerated.
+  Older exported entries lack these optional fields, so their version and inputs are unknown.
 - **For the session only:** the log is kept in memory, across the projects opened or made in the
   session, until RustGIS closes or the log is cleared. A saved project, its recovery copy, a
   package or a template carries none of it, so sharing a project shares no log. Reading, writing
@@ -103,7 +179,8 @@ front end goes into it alike: the app, scripts, the AI Assistant, the command li
   as plain words, with no name or address form (a password typed into a note), isn't recognised:
   look at an exported log before sharing it. Each entry's parameters are clipped to about 4 KB of
   JSON (a long text is cut, a list keeps its first 100 items), its error to 500 characters and a
-  `…`, and the log keeps its last 10,000 entries, the oldest dropped first. Plugins' commands take
+  `…`, and the log keeps its last 10,000 entries, the oldest dropped first (the pane and an
+  export say how many were dropped, and which: the oldest, or older plugin entries). Plugins' commands take
   at most 1,000 of those places: past that, a plugin's new entry pushes out an older plugin entry,
   not one of the user's.
 
@@ -111,9 +188,10 @@ From scripts: `project.log {"since"?, "until"?, "command"?, "failed"?, "limit"?}
 newest last (`command` is an id, or the start of one ending in a dot, `layer.`; `limit` is a whole
 number, 100 by default and at most 1,000, with `count` saying how many match), and
 `project.exportLog {"path": "log.csv"}` writes it out as CSV (one row an entry, the parameters as a
-JSON column) or JSON Lines (`.jsonl` or `.ndjson`), as the path's extension says; any other
-extension (a `.json`, a project) is refused, whatever `format` is given. `project.clearLog` empties
-it (leaving its own entry) and `project.logCommands {"on": false}` stops it (what is there stays).
+JSON column, followed by plugin, project, RustGIS version, inputs as JSON and the count of inputs left out) or JSON Lines (`.jsonl` or `.ndjson`), as the path's extension says;
+any other extension (a `.json`, a project) is refused, whatever `format` is given.
+`project.clearLog` empties it (leaving its own entry) and `project.logCommands {"on": false}` stops
+it (what is there stays).
 
 ### GeoLibre projects
 
@@ -139,9 +217,10 @@ styles and field labels. The result includes `map`, `layers` and per-layer `note
 approximated presentation from skipped sources. Newer format versions are read as far as possible
 with a note. Unsupported layer kinds and project sections are reported rather than silently lost.
 
-Colour classes and proportional sizes are supported separately. Combined colour-and-size styles
-keep colour and use a fixed size; graduated colour class boundaries are retained; proportional
-sizes use RustGIS's area scaling. Label halos use RustGIS defaults. Tile overlays draw above feature
+Colour classes, proportional sizes and the two combined are supported. A combined
+colour-and-size style keeps its classes' colours and sizes each point by its field, by radius as
+GeoLibre does (**Size by** in the Symbology pane); graduated colour class boundaries are
+retained; a proportional size alone uses RustGIS's area scaling. Label halos use RustGIS defaults. Tile overlays draw above feature
 layers, and nested groups become flat folders with inherited visibility and opacity retained.
 Local data paths require a locally opened project or an explicit `dir`; URL and pasted-text imports cannot read local files without that folder.
 URL data downloaded in the browser fills its reserved layer position when it arrives; wait for
@@ -160,19 +239,72 @@ A QGIS project (`.qgs`, or a `.qgz` archive) opens as a new map of the current p
 on the desktop, or **Project › New › QGIS Project…** (`project.importQgis={"path": "…/towns.qgs"}`).
 The QGIS Project picker filters for `.qgs` and `.qgz` files on both desktop and web.
 Its layers come in the layer tree's order, each from its file (GeoPackage, Shapefile, GeoJSON,
-GeoTIFF and the other formats RustGIS reads), a CSV of
-points, XYZ tiles or a WMS layer, unchecked layers and groups hidden. The map takes the project's
+GeoTIFF and the other formats RustGIS reads, a SpatiaLite table, a GPX file's waypoints, routes
+or tracks), a CSV of points or WKT geometry, XYZ tiles (raster or vector, from their address),
+an MBTiles file on this computer (raster or vector), a PMTiles archive (raster or vector, a file
+or a web address) or a web service, unchecked layers and groups hidden. A web service's layer
+comes in as **Add Web Data** adds it, from the service: a WMS or WMTS layer; a WFS feature type or
+an OGC API collection, as features in the QGIS layer's style (a filter of the form `SELECT * FROM t
+WHERE …` becomes its definition query; another query is noted); an ArcGIS feature layer (of a
+feature or map service) as features, a map service's map or one of its layers drawn alone (the whole
+map, noted, when the service doesn't list that layer), an image service's image, or a vector tile
+service's tiles in the service's own style; a WCS coverage, read once over the view the project was
+saved with (all the way round a pole it holds), or whole when the project has no saved view RustGIS
+can use (or no coordinate system its view could be read in), noted either way (QGIS asks for each
+view). A WMTS layer is drawn from the service's Web Mercator tile matrix set where it has one, else
+from one in its own system, noted, as QGIS's choice of set isn't read. An OGC API collection its
+service answers with tiles comes in as tiles, its filter and style noted; one that offers only
+tiles, which a QGIS OGC API Features layer can't name, is left out, noted. Two layers on the same tiles (two map service layers drawn
+as its whole map, say) come in once, noted. A login the layer used (a user name and password, a
+token or key, or QGIS's saved authentication) isn't carried over and is noted: the service is asked
+with the login saved in RustGIS for it, if there is one. Other source settings RustGIS doesn't read
+(a WMS layer's own style, say) are noted by name (the first 32, the rest counted); one with no
+value, which may be a key written on its own, is taken as a login, never named. A service that
+doesn't answer, or doesn't list the layer, leaves that layer out, noted. In the web app, a web
+service's layer is left out, noted: add it with **Home › Add › Add Data › From Service**. On the
+desktop, the import waits for each service in turn. A memory
+layer comes in empty with its fields, as QGIS opens it (QGIS doesn't save its features). A
+virtual layer that selects every column of one file's layer (`SELECT * FROM t`, with or without
+a `WHERE` clause, its fields named with or without the table, or no query) comes in as that
+layer, the clause its filter; another query, or one on a layer that isn't a file's (a memory,
+CSV, database or web layer), is noted. Vector tiles are drawn in RustGIS's colours, noted: QGIS's own vector tile style (and a
+MapLibre style it was made from) isn't read. A PostGIS or SQL Server table isn't connected to on
+import. On the desktop, the notes name a saved connection to its database to log in to and add
+the table from: one already saved, else one made from the project's (without its password, at
+most 16 an import). Undo leaves it saved. A connection by service name, or with values an
+address would have to escape, is noted without one. The layer tree's groups come in
+as [layer groups](index.md), nested as in QGIS (to eight levels and 2,000 groups; the layers of
+groups past that go in the group holding them), open or closed, each layer in its group with its
+own box; a group drawn as one (a QGIS group layer) takes its visibility range and its
+opacity, the opacity applied to each of its layers. Web tile layers (XYZ, and WMS layers drawn as tiles) can't be in a group and come in
+outside it. The layers draw in the layer tree's order, also when the project sets an order of
+its own (noted). The map takes the project's
 coordinate system and its saved view (or its layers' extent, when that view shows none of them),
 with no basemap and no graticule, as QGIS draws it. A project in degrees (EPSG:4326 and other supported
 longitude/latitude systems) opens in the Equirectangular projection, the plate carrée QGIS draws
-it in. The import is one undo step.
+it in; a map QGIS turned keeps its rotation. The project's bookmarks come in at their places (from
+the coordinate system each was saved in), turned as QGIS turns them; their groups are noted. Its
+relations come in as [relationships](editing.md#data-design) between the layers that came in; one
+on several pairs of fields relates by the first, noted. A relation to a layer that came in as
+several tables relates to the one table with its field, noted as a guess. It isn't made, and is
+noted, when several of those tables have the field, or when a layer related to itself has its
+two fields in two different tables.
+A layer whose time QGIS reads from a date field (or starts at one) is bound to the
+[time slider](#views-and-tools) on that field, the slider left off, as QGIS opens a project with
+its time navigation off: every feature draws until it is turned on; the
+project's own span and steps, when it sets one, are noted. The import is one undo step.
 Relative layer paths resolve from the project's folder on desktop. In the browser, relative
 file sources cannot be resolved and are listed in the import notes.
 
 Each layer keeps its look:
 
 - **Renderers**: single symbol, categorized (as Unique Values, a category's merged values each a
-  class, its "all other values" category the rest), graduated (as Graduated Colors), and
+  class, its "all other values" category the rest; by a field, or by an expression as Unique
+  Values by that [expression](cartography.md), its boolean categories matching true and false;
+  one that can't be read on the layer draws every feature with the first category's symbol
+  that's switched on, or nothing when no category is, noted),
+  graduated (as Graduated Colors, by a field: ranges by an expression are noted and drawn with
+  the first range's symbol), and
   rule-based: as Unique Values on a field where every rule picks values of that field at every
   scale (an else rule the rest), else as Unique Values by an
   [expression](cartography.md) that gives each feature the first rule it meets, each rule a class
@@ -199,6 +331,30 @@ Each layer keeps its look:
   and random fills as a tint of their colour).
 - **Layer settings**: opacity, blending, visibility range, filter (subset string), and the
   reference scale.
+- **Diagrams**: pie charts as pie [diagrams](cartography.md#diagrams), their slices in QGIS's order and
+  direction from its start angle, with the categories' colours, the background, outline,
+  opacity and size (fixed, or between two values, which RustGIS takes as the sum of the
+  categories, noted when QGIS sizes by something else). A pie QGIS lays counterclockwise lists
+  its categories in reverse in RustGIS's legend, the order its slices run clockwise; the legend names
+  each category by its field, and a label QGIS gives it otherwise is noted. Sizes and
+  outlines past RustGIS's largest, and diagrams QGIS leaves out where they overlap, are noted.
+  A category by an expression, or on a
+  field the layer hasn't, is left out, noted. Histograms, stacked bars and text diagrams are
+  left out (RustGIS's bar diagrams draw each category's share, QGIS's histograms its value), and
+  scale ranges, distances from the feature and data-defined diagram settings noted.
+- **Annotations**: each annotation layer, and the project's main one (on top, as "Annotations"),
+  as a [graphics layer](cartography.md#graphics): markers, lines and polygons in their symbol's colours, sizes and widths;
+  point text, rectangle text and text along a line as text graphics, with their font size,
+  colour, weight, slant, letter spacing and alignment; pictures (PNG and JPEG) fitted in their box;
+  a rectangle text's or picture's background and frame as a rectangle. They are taken from the
+  layer's coordinate system to the map's and drawn in their z order. RustGIS centres a text
+  graphic on its point, draws it level and with its own halo, and draws text along a line level
+  at the line's middle, all noted. RustGIS draws a graphics layer's texts after all layers, so a
+  text QGIS draws under a shape, or under a layer above, comes out over it (noted). A picture
+  whose aspect is locked keeps it on the map, as QGIS does; an import keeps at most 64 MiB of
+  pictures as stored (base64, about 48 MiB of PNG or JPEG files), and those past it are left out
+  (noted). SVG pictures, callouts and annotations QGIS
+  keeps switched off are left out, noted.
 - **Rasters**: singleband grey as a stretch from black to white, singleband pseudocolour as a
   stretch along its colour map (interpolated), as Classify (discrete) or as Unique Values (exact),
   paletted as Unique Values, multiband colour as RGB and hillshade as Shaded Relief; with the
@@ -242,16 +398,20 @@ before, the rest (functions, arithmetic, `CASE`, `@map_scale`) as they are, for 
 lacks, a field the layer hasn't) is noted and left out, as is one measuring with `$area`,
 `$perimeter` or `$length`, which QGIS gives in the project's units. What RustGIS doesn't draw as QGIS does is drawn as
 near as it can, or left out, and said: the import's notes list, layer by layer, what was
-approximated (gradient and shapeburst fills' offsets left out and colour ramps other than gradients drawn from their first colour to their last, SVG, raster and random fills and dense brushes as a tint of their colour, SVG markers as circles,
+approximated (vector tile styles, a memory layer's fields of kinds RustGIS hasn't as text, gradient and shapeburst fills' offsets left out and colour ramps other than gradients drawn from their first colour to their last, SVG, raster and random fills and dense brushes as a tint of their colour, SVG markers as circles,
 dashed polygon outlines solid, label halos with sharp corners drawn round and blended ones drawn
 over the map, label backgrounds of other shapes drawn as rectangles, label distances from lines
 and polygons, a distance around points moved straight up, labels wrapped at a shortest line
 length or justified, values outside a graduated renderer's ranges in its first or last class, file options
-such as `layerid` that RustGIS doesn't read) and what was skipped (arrow lines, other data-defined
+such as `layerid` that RustGIS doesn't read, groups showing one layer at a time as ordinary groups,
+a group layer's opacity applied to each of its layers and its blending mode drawn as Normal, a
+relation on several pairs of fields related by the first, features shown over time from a start date
+alone, events lasting a fixed time shown at their date, a layer accumulating its features over time, features at the very end of a time step) and what was skipped (arrow lines, group layers' draw effects, other data-defined
 settings, draw effects, label callouts, contours and other raster
-renderers RustGIS has no match for, PostGIS, WFS
-and other sources RustGIS doesn't read, diagrams, joins, virtual fields, a layer's other styles,
-and the project's print layouts, annotations, bookmarks, map themes and relations). A database
+renderers RustGIS has no match for, PostGIS and SQL Server tables, WFS and other sources
+RustGIS doesn't read, virtual layers with other queries, histogram, stacked bar and text diagrams, joins, virtual fields, a layer's other styles,
+time from an expression, a fixed range or redrawn as the time changes, a raster's or a service's time, and the project's print layouts, QGIS 3's older annotation balloons, map themes,
+bookmark groups and bookmarks the map's projection doesn't reach, polymorphic relations and its time span and steps). A database
 password in a project never reaches the notes.
 
 A QGIS layer style (`.qml`) styles the selected layer the same way, a feature layer or a raster:
@@ -263,6 +423,19 @@ style is applied, noted as unchecked, and a band the file hasn't is drawn from i
 RustGIS works out a map's scale with the OGC's 0.28 mm screen pixel, QGIS at 96 pixels to the
 inch, so the same view is a larger scale in QGIS; scales from QGIS (reference scales, visibility
 ranges) are multiplied by 0.945 on the way in, so a layer shows at the same zoom in both.
+
+## Layers pane terminology
+
+- **Active layer**: the one layer that commands needing a layer act on, including the
+  Style and Data tabs, attribute table and Zoom To Layer. It is always part of the layer
+  selection. Use "active layer" rather than "current layer" or "selected layer" for this role.
+- **Layer selection**: the layers picked together in the Layers pane for an action on all
+  of them, such as removing, showing or hiding, moving or grouping. It is kept with the open
+  project's state and is not saved in the project file. Use "layer selection" rather than
+  "multi-select" or "layer set".
+- **Feature selection**: the features picked in a layer, shown by its count badge and the
+  Selection view. A bare "selection" always means feature selection. Layer selection picks
+  layers, so it is a separate concept.
 
 ## Panes and command search
 
@@ -383,8 +556,8 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
       **Delete**. A recorded tool's step is named after the tool.
     - In the Browser pane, a click on a task opens its steps; **Run All Steps** is in its context
       menu.
-    - A task from a file (`.rgistask`, or inside a project or a package) can't read or write files
-      or run scripts. Its built-in analysis tools may still name their output layers with a plain
+    - A task from a file (`.rgistask`, or inside a project or a package) can't read or write files,
+      use the network, run other software or perform actions reserved to the user. Its built-in analysis tools may still name their output layers with a plain
       name: one with `/`, `\`, `.` or `:` (a folder, an extension or a drive) makes the task count
       as writing files, so write `Buffer 1500 m` rather than `Buffer 1.5 km`. GeoLibre and plugin
       tools' outputs are refused.
@@ -398,8 +571,10 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
       <figcaption>The Time Slider in cumulative mode: every event up to 2018 is drawn.</figcaption>
     </figure>
 
-    - **Bind To Time Slider** (a layer's context menu, or the bar's **Layers** menu) picks the
-      layer's date field: the one most of whose values read as dates. Text dates (`2015-03-01`,
+    - **Bound to the time slider** (the Time tab of a layer's [Layer Properties](cartography.md#layer-properties),
+      or the bar's **Layers** menu) picks the layer's date field: the one it is bound to already (by
+      a QGIS project's import, say), else the one most of whose values read as dates, or the one
+      chosen in its list. Text dates (`2015-03-01`,
       `2015-03-01T12:00:00Z`, `2015/3/1`), epoch milliseconds or seconds, and years (`1958`) all
       read; times are UTC. Only the features whose date falls in the slider's window draw (and
       show in the legend). The bar's bars count each step's features.
@@ -436,7 +611,9 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
   Sync sends changed, new and deleted features back and refreshes it. A feature changed in the
   map since the last sync and also edited or deleted offline takes the offline version, with a
   warning naming it (Undo reverts the whole sync, restoring the map's version); an offline edit
-  to a feature since deleted from the map is dropped, with a warning too. **Feature Cache** prepares
+  to a feature since deleted from the map is dropped, with a warning too. **Package for the Field**
+  and **Bring Back** carry an area to a phone and its edits back (see [Field Work](field-work.md)).
+  **Feature Cache** prepares
   every layer's geometry for the current projection (Fill, Empty, Cancel, Auto Cache).
 - **Settings › Customize** chooses the ribbon's tabs and the Quick Access Toolbar's extra
   buttons. Settings and Help always remain visible. **Help** opens the user guide and the
@@ -444,17 +621,28 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
 - **Plugins**: **Plugins › Plugin Manager** installs, updates and removes [plugins](../plugins.md)
   from the registry at [plugins.rustgis.app](https://plugins.rustgis.app) or from a file.
 - **Language**: **Settings › Language** switches the interface among
-  [19 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
+  [22 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
   borders.
+- **Theme**: **Settings › Theme** picks the interface colours, spacing and text sizes, from the
+  built-in Light and Dark themes, a theme [file](../themes.md) in the desktop app’s themes folder, or
+  **Follow the System** where the platform reports its own theme. **Interface Scale** beside it
+  sets the whole interface from 80% to 200%.
 - **Autosave**: **Settings › Autosave** sets how often the desktop app keeps a
   [recovery copy](#autosave-and-recovery) of unsaved work, or turns it off.
+- **Performance**: **Settings › Performance › Threads** sets the most threads one piece of work
+  uses in the desktop app: a tool, a raster read, the drawing of a map's tiles. **Automatic** is
+  the computer's cores, up to 16; fewer keep cores free for other work, and on a computer with
+  more cores a higher setting lets the work use them. It is remembered for the next start and
+  isn't saved with a project (`ui.threads={"threads": 8}`, `null` for Automatic; the same as
+  [`gp.threads`](analysis.md#analysis-workflows)). The web app runs on one thread.
 - **Start-up**: **Settings › Start-up** sets what RustGIS opens with: **Start With** the World Atlas
   sample or a blank map, or, in the desktop app, **Last Project** (the `.rgis` project last opened
   or saved) or **Choose Project…** (one you pick once), the **Projection** the map opens in (a
-  preset or a supported projected EPSG or ESRI code, such as `3010` or `ESRI:102033`), and the **Extent** it opens on (the
-  full extent, or **Use Current View** to keep the view you are looking at). A project opened at
-  start keeps its own projection and view; the Projection and Extent settings apply to the sample
-  and a blank map. If the project no longer opens (moved or deleted), RustGIS starts with the sample
+  preset or a supported projected EPSG or ESRI code, such as `3010` or `ESRI:102033`, found by
+  name or code as in [Finding a coordinate system](maps.md#finding-a-coordinate-system)), and the
+  **Extent** it opens on (the full extent, or **Use Current View** to keep the view you are looking
+  at). A project opened at start keeps its own projection and view; the Projection and Extent
+  settings apply to the sample and a blank map. If the project no longer opens (moved or deleted), RustGIS starts with the sample
   and says why. After a crash it starts with the sample too, in case the project is what crashed, and offers
   back the [recovery copy](#autosave-and-recovery) autosave kept of unsaved work, if any;
   starting `rustgis --sample` also skips the start-up project. The choices are remembered on this

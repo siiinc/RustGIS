@@ -1,6 +1,7 @@
 //! Writes the seed corpus into `corpus/<target>/`: well-formed files made by RustGIS's own writers
-//! from the sample project's layers, so fuzzing starts from real files rather than guessing each
-//! format's magic bytes. The repository commits no data files; run this before fuzzing:
+//! from the sample project's layers and a layer of dates built here, so fuzzing starts from real
+//! files rather than guessing each format's magic bytes. The repository commits no data files; run
+//! this before fuzzing:
 //!
 //! ```sh
 //! cargo run --release --bin seeds
@@ -8,7 +9,7 @@
 
 use rustgis_data::io::{READ_EXTENSIONS, write_bytes, write_path};
 use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff, wkt};
-use rustgis_data::{Dataset, wkb};
+use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value, sheets, wkb};
 use rustgis_engine::{Project, Session};
 use rustgis_tiles::mvt;
 use std::path::{Path, PathBuf};
@@ -59,11 +60,81 @@ fn corpus(target: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Date and date-time strings that sit on the edges of the parsers: offsets, fractions, the end of a
+/// day and of a minute, the first and last year, and digits that aren't ASCII.
+const DATE_TEXT: &[&str] = &[
+    "2026-03-05",
+    "0001-01-01",
+    "9999-12-31",
+    "0000-01-01",
+    "10000-01-01",
+    "-0001-01-01",
+    "2026-02-29",
+    "2024-02-29",
+    "2026-13-01",
+    "2026-00-10",
+    "2026-03-05T09:00",
+    "2026-03-05T09:00:00Z",
+    "2026-03-05 09:00:00.123456+05:30",
+    "2026-03-05T09:00:00.1234567",
+    "2026-03-05T09:00:00.1234560",
+    "2026-03-05T24:00:00",
+    "2026-03-05T23:59:60",
+    "2026-03-05T09:00:00-0800",
+    "2026-03-05T09:00:00+02",
+    "2026-03-05T09:00:00+18:00",
+    "2026-03-05T09:00:00-18:01",
+    "2026-03-05T09:00:00Z0200",
+    "0001-01-01T00:00:00+18:00",
+    "9999-12-31T23:59:59.999999-18:00",
+    "9999-12-31T23:59:59.999999Z",
+    "0001-01-01T00:00:00Z",
+    "\u{0662}\u{0660}\u{0662}\u{0666}-03-05",
+    "２０２６-03-05",
+    "2026-03-05T09:00:00\u{2212}05:00",
+    "  2026-03-05  ",
+    "2026/03/05",
+    "20260305",
+    "<null>",
+];
+
+/// A table of dates and date-times (edge cases among them) in a point layer, so the seeds reach each
+/// format's date code.
+fn dated() -> Dataset {
+    let fields = vec![Field::new("day", FieldType::Date), Field::new("at", FieldType::DateTime), Field::new("n", FieldType::Integer)];
+    let mut ds = Dataset::new("dated", GeometryType::Point, fields);
+    let rows = [
+        ("2026-03-05", "2026-03-05T09:00:00+02:00"),
+        ("0001-01-01", "0001-01-01T00:00:00Z"),
+        ("9999-12-31", "9999-12-31T23:59:59.999999Z"),
+        ("1969-12-31", "1969-12-31T23:59:59.5-05:30"),
+        ("2024-02-29", "2024-02-29T12:00:00"),
+        ("1970-01-01", "1970-01-01T00:00:00.000001"),
+    ];
+    for (i, (d, t)) in rows.iter().enumerate() {
+        let at = Value::parse(t, FieldType::DateTime);
+        ds.push(Some(Geometry::Point(Coord::new(i as f64, 0.0))), vec![Value::parse(d, FieldType::Date), at, Value::Int(i as i64)]);
+    }
+    ds.push(Some(Geometry::Point(Coord::new(9.0, 0.0))), vec![Value::Null, Value::Null, Value::Null]);
+    ds
+}
+
+/// A point layer with one date-time field whose values are all zoned or all clock times, the two
+/// layouts GeoParquet stores as native timestamps (a column mixing them is written as text).
+fn times(name: &str, at: &[&str]) -> Dataset {
+    let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new("at", FieldType::DateTime)]);
+    for (i, t) in at.iter().enumerate() {
+        ds.push(Some(Geometry::Point(Coord::new(i as f64, 0.0))), vec![Value::parse(t, FieldType::DateTime)]);
+    }
+    ds.push(Some(Geometry::Point(Coord::new(9.0, 0.0))), vec![Value::Null]);
+    ds
+}
+
 /// The sample project's layers, each cut to its first few features.
 fn layers() -> Result<(Project, Vec<Dataset>)> {
     let mut s = Session::new(Project::new("seeds"));
     s.run("project.sample", &serde_json::Value::Null)?;
-    let layers = s
+    let mut layers: Vec<Dataset> = s
         .map()
         .layers
         .iter()
@@ -73,9 +144,108 @@ fn layers() -> Result<(Project, Vec<Dataset>)> {
             ds
         })
         .collect();
+    layers.push(dated());
+    layers.push(times("zoned", &["2026-03-05T09:00:00+02:00", "0001-01-01T00:00:00Z", "9999-12-31T23:59:59.999999-05:30"]));
+    layers.push(times("clock", &["2026-03-05T09:00:00", "1969-12-31T23:59:59.5", "9999-12-31T23:59:59.999999"]));
     Ok((s.project.clone(), layers))
 }
 
+/// An ArcGIS feature-service answer as a protocol buffer (`FeatureCollection.proto`): one feature of
+/// geometry type `kind` with an object id and a name, parts of `lengths` vertices (none: one part)
+/// and its coordinates, X and Y as differences; Z and M follow X and Y when `zm`.
+fn esripbf(kind: u64, zm: bool, lengths: &[u64], coords: &[i64]) -> Vec<u8> {
+    fn varint(out: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            out.push((v as u8 & 0x7f) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    let number = |field: u64, v: u64| {
+        let mut out = Vec::new();
+        varint(&mut out, field << 3);
+        varint(&mut out, v);
+        out
+    };
+    let message = |field: u64, bytes: &[u8]| {
+        let mut out = Vec::new();
+        varint(&mut out, (field << 3) | 2);
+        varint(&mut out, bytes.len() as u64);
+        out.extend_from_slice(bytes);
+        out
+    };
+    let double = |field: u64, v: f64| {
+        let mut out = Vec::new();
+        varint(&mut out, (field << 3) | 1);
+        out.extend_from_slice(&v.to_le_bytes());
+        out
+    };
+    let packed = |values: Vec<u64>| {
+        let mut out = Vec::new();
+        for v in values {
+            varint(&mut out, v);
+        }
+        out
+    };
+    let zigzag = |v: i64| ((v << 1) ^ (v >> 63)) as u64;
+    let scale = [double(1, 0.5), double(2, 0.5), double(3, 1.0), double(4, 1.0)].concat();
+    let translate = [double(1, -74.1), double(2, 4.6)].concat();
+    let transform = [number(1, 1), message(2, &scale), message(3, &translate)].concat();
+    let field = |name: &str, ty: u64| message(13, &[message(1, name.as_bytes()), number(2, ty)].concat());
+    let mut geometry = Vec::new();
+    if !lengths.is_empty() {
+        geometry.extend(message(2, &packed(lengths.to_vec())));
+    }
+    geometry.extend(message(3, &packed(coords.iter().map(|&c| zigzag(c)).collect())));
+    let feature = [message(1, &number(5, 1)), message(1, &message(1, b"seed")), message(2, &geometry)].concat();
+    let result = [
+        number(7, kind),
+        message(8, &number(1, 4326)),
+        number(10, u64::from(zm)),
+        number(11, u64::from(zm)),
+        message(12, &transform),
+        field("OBJECTID", 6),
+        field("NAME", 4),
+        message(15, &feature),
+    ]
+    .concat();
+    [message(1, b"10.0"), message(2, &message(1, &result))].concat()
+}
+
+/// A minimal compound file (`.xls` container): a header, a FAT in sector 0, a directory in sector 1
+/// (a root entry and an empty "Workbook" stream), a mini FAT in sector 2 and a mini stream in
+/// sector 3.
+fn compound() -> Vec<u8> {
+    const END: u32 = 0xFFFF_FFFE;
+    let words = |w: &[u32]| -> Vec<u8> {
+        let mut b: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        b.resize(512, 0xFF);
+        b
+    };
+    let entry = |name: &str, kind: u8, start: u32, len: u32| {
+        let mut e = vec![0u8; 128];
+        let utf16: Vec<u8> = name.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        e.splice(..utf16.len(), utf16.iter().copied());
+        e.splice(64..66, (utf16.len() as u16).to_le_bytes());
+        e[66] = kind;
+        e.splice(116..124, [start.to_le_bytes(), len.to_le_bytes()].concat());
+        e
+    };
+    let mut header = vec![0u8; 76];
+    header.splice(..8, *b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1");
+    header.splice(24..34, [0x3E, 0, 3, 0, 0xFE, 0xFF, 9, 0, 6, 0]);
+    header.splice(44..52, [1u32.to_le_bytes(), 1u32.to_le_bytes()].concat());
+    header.splice(56..76, [4096u32, 2, 1, END, 0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let mut difat = vec![0u32];
+    difat.resize(109, 0xFFFF_FFFF);
+    header.extend(difat.iter().flat_map(|v| v.to_le_bytes()));
+    let mut dir = [entry("Root Entry", 5, 3, 64), entry("Workbook", 2, 0, 0)].concat();
+    dir.resize(512, 0);
+    [header, words(&[0xFFFF_FFFD, END, END, END]), dir, words(&[END]), vec![0u8; 512]].concat()
+}
+
+/// Writes each target's seed files into `corpus/<target>/`, from RustGIS's own writers where there is one
+/// and from hand-encoded bytes where there isn't.
 fn main() -> Result<()> {
     let (project, layers) = layers()?;
 
@@ -139,13 +309,35 @@ fn main() -> Result<()> {
     };
     seed(&dir, &mut n, &mvt::encode(&tile))?;
 
+    // ArcGIS feature-service answers (`f=pbf`): RustGIS doesn't write them, so they are encoded
+    // here, a point, a line with Z and M, and a polygon with a hole.
+    let (dir, mut n) = (corpus("esripbf")?, 0);
+    seed(&dir, &mut n, &esripbf(0, false, &[], &[4, 6]))?;
+    seed(&dir, &mut n, &esripbf(2, true, &[2, 2], &[1, 1, 7, 3, 2, 0, 7, 0, 5, 5, 9, 1, 0, 1, 9, 2]))?;
+    let ring = [0, 0, 0, 10, 10, 0, 0, -10, -10, 0, 2, 2, 2, 0, 0, 2, -2, 0, 0, -2];
+    seed(&dir, &mut n, &esripbf(3, false, &[5, 5], &ring))?;
+
     let (dir, mut n) = (corpus("project")?, 0);
     let mut small = project;
     for layer in &mut small.map_mut().layers {
         layer.dataset.features.truncate(FEATURES);
     }
     seed(&dir, &mut n, serde_json::to_string(&small).map_err(|e| e.to_string())?.as_bytes())?;
+    // A project whose first layer holds dates.
+    small.map_mut().layers.first_mut().ok_or_else(|| "the sample project has no layers".to_string())?.dataset = dated();
+    seed(&dir, &mut n, serde_json::to_string(&small).map_err(|e| e.to_string())?.as_bytes())?;
     seed(&dir, &mut n, serde_json::to_string(&Project::new("empty")).map_err(|e| e.to_string())?.as_bytes())?;
+
+    let (dir, mut n) = (corpus("dates")?, 0);
+    for text in DATE_TEXT {
+        seed(&dir, &mut n, text.as_bytes())?;
+    }
+
+    // Workbooks: an `.xlsx` from the crate's own builder, and a minimal `.xls` compound file
+    // (RustGIS writes neither), so the fuzzer starts inside both of calamine's containers.
+    let (dir, mut n) = (corpus("sheets")?, 0);
+    seed(&dir, &mut n, &sheets::xlsx(&[("Sheet1", &[&["name", "x", "y"], &["a", "1", "2"]]), ("Other", &[&["n"], &["1"]])]))?;
+    seed(&dir, &mut n, &compound())?;
 
     let _ = std::fs::remove_dir_all(&scratch);
     println!("seeds written: read_layers {nr}, sniff {ns}");

@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::rc::Rc;
 
+mod dataset;
+pub use dataset::DatasetDiscovery;
+
 #[path = "ogc_info.rs"]
 mod info;
 #[path = "ogc_warp.rs"]
@@ -26,7 +29,7 @@ pub enum Offer {
     Tiles { template: String },
     /// Features: an address answering GeoJSON.
     Features { url: String },
-    /// A MapLibre style document (an ArcGIS vector tile service's).
+    /// A MapLibre style document.
     Style { url: String },
     /// Vector tiles (`{z}/{x}/{y}`, Mapbox Vector Tiles) and the names of their layers, as an OGC
     /// API Tiles collection gives them.
@@ -50,11 +53,14 @@ pub struct LayerTime {
     /// Whether several times may be asked for at once: a list or an interval (a WMS layer's
     /// `multipleValues`, WMS 1.3.0 Annex C.2); otherwise one time.
     pub multiple: bool,
+    /// How many of its times are left out: the earliest past `MAX_TIME_VALUES`, and those past
+    /// [`MAX_DOCUMENT_TIME_VALUES`], kept for all of a document's layers together.
+    pub cut: usize,
 }
 
 /// Most time values kept for a layer: enough for every year of a century and more (swisstopo's
 /// aerial photos list 92), as the time slider steps through them.
-const MAX_TIME_VALUES: usize = 1000;
+pub const MAX_TIME_VALUES: usize = 1000;
 
 /// Most time values of a layer's dimension read for its default and latest, the last it lists
 /// (each a few bytes of the document, whose size is capped).
@@ -68,7 +74,7 @@ fn last(mut values: Vec<String>, n: usize) -> Vec<String> {
 
 /// Most time values kept for all of a WMS document's layers together (swisstopo's 56 list about
 /// 2,000).
-const MAX_DOCUMENT_TIME_VALUES: usize = 50_000;
+pub const MAX_DOCUMENT_TIME_VALUES: usize = 50_000;
 
 /// The most steps the time slider takes (`rustgis_map::time::MAX_STEPS`).
 const MAX_SLIDER_STEPS: usize = 20_000;
@@ -335,9 +341,16 @@ fn layer_time(default: Option<&str>, all: Vec<String>, check: fn(&str) -> Result
     });
     let default = default.and_then(|t| check(t).ok()).or(listed)?;
     // The latest few: those the default and the latest are among.
-    let skip = all.len().saturating_sub(MAX_TIME_VALUES);
-    let values = all.into_iter().skip(skip).collect();
-    Some(LayerTime { default, values, multiple })
+    let cut = all.len().saturating_sub(MAX_TIME_VALUES);
+    let values = all.into_iter().skip(cut).collect();
+    Some(LayerTime { default, values, multiple, cut })
+}
+
+/// The note for layers whose own times run past [`MAX_TIME_VALUES`] (`layers` of them).
+fn long_times_note(layers: usize) -> String {
+    format!(
+        "{layers} layers list more than {MAX_TIME_VALUES} times: RustGIS keeps the latest {MAX_TIME_VALUES} of each, and the earliest are left out"
+    )
 }
 
 /// A WMS layer's own time dimension: its `Dimension` named `time` with its values (WMS 1.3.0
@@ -439,22 +452,91 @@ pub struct Service {
     pub notes: Vec<String>,
     /// An OGC API landing page's advertised JSON collections document, resolved against it.
     pub collections_url: Option<String>,
+    /// Advertised dataset tiles and styles, read through the shared discovery document budget.
+    pub dataset: Option<DatasetDiscovery>,
+    /// How many of `layers` a listing shows, when not all of them: the others are read only to be
+    /// added by name.
+    pub listed: Option<usize>,
     /// Some advertised collections were left out (past the listing limit, or with an items
     /// address RustGIS doesn't fetch): the listing isn't the whole service.
     pub incomplete: bool,
+    /// Destinations that did not inherit one or more query pairs; reported by the caller.
+    pub withheld_addresses: u32,
+    /// The document goes past what is read of it: the first note saying so, also in `notes`.
+    /// (Notes can quote the document, so this isn't told from their text.)
+    pub past_read_limit: Option<String>,
 }
 
-/// Most layers listed from one service.
-const MAX_LAYERS: usize = 2_000;
+/// Most layers or collections `service.layers` lists from one document. An OGC API collection
+/// can make up to three layers (features, map tiles, vector tiles), so its listing can pass this
+/// many layers. In an OGC document the others are still read ([`Service::listed`]), so that they
+/// can be added by name: which ones come first is up to the server, and some change their order
+/// between answers (#1519). Reading stops at [`MAX_READ_LAYERS`], or sooner when the layers'
+/// request addresses are long ([`read_limit`], [`MAX_COPIED_ADDRESS_BYTES`]); past that none is
+/// read. An ArcGIS list is read only as far as it is listed.
+pub const MAX_LISTED_LAYERS: usize = 2_000;
+/// Most layers or collections read from one document, which is hostile input.
+const MAX_READ_LAYERS: usize = if cfg!(test) { 3_000 } else { 100_000 };
+/// Most bytes of a document's own request addresses (its GetMap's, GetFeature's…) copied into
+/// its layers together: each layer's address repeats them, so long ones lower how many are read.
+const MAX_COPIED_ADDRESS_BYTES: usize = if cfg!(test) { 8 << 20 } else { 64 << 20 };
+
+/// How many layers are read from a document whose layers each copy `per_layer` bytes of its
+/// request addresses: [`MAX_READ_LAYERS`], fewer for long addresses, at least one. (Fewer than
+/// are listed only for addresses over 32 KiB, which no service needs: 2000 copies of a 1 MB one
+/// would take 2 GB.)
+fn read_limit(per_layer: usize) -> usize {
+    (MAX_COPIED_ADDRESS_BYTES / per_layer.max(1)).clamp(1, MAX_READ_LAYERS)
+}
+
+/// Says why a document past a [`read_limit`] lower than [`MAX_READ_LAYERS`] was read no further.
+fn note_copied_addresses(service: &mut Service, per_layer: usize, limit: usize) {
+    if limit < MAX_READ_LAYERS {
+        service.notes.push(format!(
+            "each of its layers copies {per_layer} bytes of the document's request addresses, so RustGIS reads {limit} of them, not {MAX_READ_LAYERS}"
+        ));
+    }
+}
+/// The bytes of addresses a layer holds: what its offer is fetched from, and its tile list.
+fn address_bytes(layer: &ServiceLayer) -> usize {
+    let offer = match &layer.offer {
+        Offer::Tiles { template } | Offer::VectorTiles { template, .. } => template.len(),
+        Offer::Features { url } | Offer::Style { url } | Offer::Service { url } => url.len(),
+        Offer::Coverage(c) => c.endpoint.len() + c.id.len(),
+    };
+    offer + layer.tilesets.as_ref().map_or(0, String::len)
+}
+
+/// How a note says that a document went past what is read of it.
+const PAST_READ_LIMIT: &str = "RustGIS reads at most";
 /// Features asked of a WFS in one request.
 pub const FEATURE_LIMIT: usize = 50_000;
 /// Features asked of an OGC API in one request: servers cap their pages (often at 10,000) and
 /// some refuse a larger `limit` outright.
 pub const OGC_API_LIMIT: usize = 10_000;
 
+/// Notes the layers of a document past the `limit` that is read of it, and keeps the first such
+/// note as [`Service::past_read_limit`].
+fn note_past_read_limit(service: &mut Service, left: usize, what: &str, limit: usize) {
+    let note = format!("{PAST_READ_LIMIT} {limit} {what} from one document: {left} left out");
+    service.past_read_limit.get_or_insert_with(|| note.clone());
+    service.notes.push(note);
+}
+
+/// Stops the listing at [`MAX_LISTED_LAYERS`], for a document whose every entry makes one layer.
+fn cut_listing(service: &mut Service) {
+    if service.layers.len() > MAX_LISTED_LAYERS {
+        service.listed = Some(MAX_LISTED_LAYERS);
+    }
+}
+
 /// The address to fetch a service's capabilities from: OGC API landing pages and collection lists
 /// are JSON; WMS, WMTS and WFS addresses get a GetCapabilities request unless they have one.
+/// A runtime service-login binding stays attached only to same-origin derived requests.
 pub fn capabilities_url(url: &str, kind: Option<&str>) -> String {
+    if let Ok(Some(bound)) = crate::login_address::parse(url) {
+        return crate::login_address::inherit(url, &capabilities_url(bound.url, kind));
+    }
     // ArcGIS REST: the service's JSON description.
     if kind.is_some_and(|k| k.eq_ignore_ascii_case("arcgis")) || (kind.is_none() && is_arcgis(url)) {
         return if query_value(url, "f").is_some_and(|f| f.eq_ignore_ascii_case("json") || f.eq_ignore_ascii_case("pjson")) {
@@ -491,6 +573,9 @@ pub fn capabilities_url(url: &str, kind: Option<&str>) -> String {
 
 /// Requests JSON once, retaining the address's other query parameters.
 pub fn json_url(address: &str) -> String {
+    if let Ok(Some(bound)) = crate::login_address::parse(address) {
+        return crate::login_address::inherit(address, &json_url(bound.url));
+    }
     let Ok(mut url) = url::Url::parse(address) else { return with_query(address, "f=json") };
     // Authentication and signed query values can depend on their original byte encoding.
     let mut format_seen = false;
@@ -524,14 +609,29 @@ fn is_data_link(link: &serde_json::Value) -> bool {
 }
 
 /// Chooses JSON before an untyped data link, without guessing an endpoint or copying credentials.
-fn collections_link(address: &str, links: &[serde_json::Value]) -> Option<String> {
-    let base = url::Url::parse(address).ok()?;
+fn collections_link(address: &str, links: &[serde_json::Value]) -> Option<(String, bool)> {
+    discovery_link(address, links, is_data_link)
+}
+
+/// Chooses an advertised JSON representation without guessing paths or forwarding query keys.
+fn discovery_link(address: &str, links: &[serde_json::Value], relation: impl Fn(&serde_json::Value) -> bool) -> Option<(String, bool)> {
+    representation_link(address, links, relation, "application/json")
+}
+
+/// Selects a declared representation, retaining the advertised query and login policy.
+fn representation_link(
+    address: &str,
+    links: &[serde_json::Value],
+    relation: impl Fn(&serde_json::Value) -> bool,
+    media: &str,
+) -> Option<(String, bool)> {
+    let base = url::Url::parse(crate::login_address::inner(address)).ok()?;
     links
         .iter()
-        .filter(|l| is_data_link(l))
+        .filter(|l| relation(l))
         .filter_map(|l| {
             let priority = match l.get("type").and_then(|v| v.as_str()) {
-                Some(t) if t.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json")) => 0,
+                Some(t) if t.split(';').next().is_some_and(|t| t.trim().eq_ignore_ascii_case(media)) => 0,
                 None => 1,
                 _ => return None,
             };
@@ -545,8 +645,13 @@ fn collections_link(address: &str, links: &[serde_json::Value]) -> Option<String
             }
             next.set_fragment(None);
             // A typed JSON link already selects its representation; its query is authoritative.
-            let next = if priority == 0 { next.into() } else { json_url(next.as_str()) };
-            Some((priority, next))
+            let next: String = if priority == 0 { next.into() } else { json_url(next.as_str()) };
+            let inherited =
+                crate::address::inherit_query(crate::login_address::inner(address), &next, crate::address::Relation::Advertised, &["f"]);
+            // The chosen representation/link stays authoritative. Count settings it omits,
+            // including safe options we deliberately did not append to this advertised link.
+            let withheld = inherited.withheld || inherited.url != next;
+            Some((priority, (crate::login_address::inherit(address, &next), withheld)))
         })
         .min_by_key(|(priority, _)| *priority)
         .map(|(_, url)| url)
@@ -564,6 +669,7 @@ fn is_arcgis(url: &str) -> bool {
 
 /// The part of an address after its host: the path, query and fragment.
 fn after_host(url: &str) -> &str {
+    let url = crate::login_address::inner(url);
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     rest.find(['/', '?', '#']).and_then(|i| rest.get(i..)).unwrap_or("")
 }
@@ -576,45 +682,99 @@ fn origin(url: &str) -> &str {
 }
 
 /// The value of a query parameter, by its whole name (any case).
-fn query_value<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn query_value<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+    let url = crate::login_address::inner(url);
     let q = url.split('#').next()?.split_once('?')?.1;
     q.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-        k.eq_ignore_ascii_case(key).then_some(v)
+        (if key == "token" { crate::address::normalized_name(k).as_deref() == Some("token") } else { k.eq_ignore_ascii_case(key) })
+            .then_some(v)
     })
 }
 
 /// Whether an address is a web address (`http://` or `https://`), not another scheme that only
 /// starts with those letters.
 fn is_web(url: &str) -> bool {
+    let url = crate::login_address::inner(url);
     let l = url.get(..8).unwrap_or(url).to_ascii_lowercase();
     l.starts_with("http://") || l.starts_with("https://")
 }
 
 /// A link from a document at `from`, resolved: absolute, scheme-relative (`//host/…`),
 /// host-relative (`/…`) or relative to the document's folder. `None` for other schemes.
+/// A supplied runtime wrapper contributes only its URL, never its authority: only the bound
+/// document's canonical origin retains that document's runtime login binding.
 fn resolve(from: &str, href: &str) -> Option<String> {
+    crate::login_address::parse(from).ok()?;
+    crate::login_address::parse(href.trim()).ok()?;
+    let url = resolve_inner(crate::login_address::inner(from), crate::login_address::inner(href.trim()))?;
+    Some(crate::login_address::inherit(from, &url))
+}
+
+fn resolve_inner(from: &str, href: &str) -> Option<String> {
     let href = href.trim();
     if is_web(href) {
         return Some(href.to_string());
     }
-    if href.contains("://") || href.starts_with("data:") || href.starts_with("javascript:") || href.is_empty() {
+    if href.starts_with('?') {
+        return Some(format!("{}{href}", base(from)));
+    }
+    if href.starts_with('#') {
+        return Some(format!("{}{href}", from.split('#').next().unwrap_or(from)));
+    }
+    let has_scheme = href.split_once(':').is_some_and(|(scheme, _)| {
+        let mut bytes = scheme.bytes();
+        bytes.next().is_some_and(|b| b.is_ascii_alphabetic()) && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    });
+    if has_scheme || href.is_empty() {
         return None;
     }
     if let Some(rest) = href.strip_prefix("//") {
         let scheme = from.split_once("://").map(|(s, _)| s).unwrap_or("https");
-        return Some(format!("{scheme}://{rest}"));
+        let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let mut url = String::with_capacity(scheme.len() + 3 + rest.len());
+        url.push_str(scheme);
+        url.push_str("://");
+        url.push_str(rest.get(..host_end)?);
+        let root = url.len();
+        push_resolved_path(&mut url, rest.get(host_end..)?, root);
+        return Some(url);
     }
-    if href.starts_with('/') {
-        return Some(format!("{}{href}", origin(from)));
-    }
+    let host = origin(from);
     let b = base(from);
-    let dir = if after_host(b).is_empty() {
-        format!("{b}/")
-    } else {
-        b.get(..b.rfind('/').map(|i| i + 1).unwrap_or(b.len())).unwrap_or(b).to_string()
-    };
-    Some(format!("{dir}{href}"))
+    let path = b.get(host.len()..).unwrap_or("");
+    let dir = if href.starts_with('/') { "" } else { path.rfind('/').and_then(|i| path.get(..=i)).unwrap_or("/") };
+    let mut url = String::with_capacity(host.len() + dir.len() + href.len());
+    url.push_str(host);
+    push_resolved_path(&mut url, dir, host.len());
+    push_resolved_path(&mut url, href, host.len());
+    Some(url)
+}
+
+/// Appends a relative URL's path with literal dot segments resolved (RFC 3986). Templates,
+/// percent escapes and the query/fragment tail stay byte-for-byte; parents stop at the root.
+fn push_resolved_path(out: &mut String, href: &str, root: usize) {
+    let tail_at = href.find(['?', '#']).unwrap_or(href.len());
+    let path = href.get(..tail_at).unwrap_or(href);
+    if !path.split('/').any(|segment| matches!(segment, "." | "..")) {
+        out.push_str(href);
+        return;
+    }
+    for segment in path.split_inclusive('/') {
+        match segment.strip_suffix('/').unwrap_or(segment) {
+            "." => {}
+            ".." => {
+                let end = out.len().saturating_sub(usize::from(out.ends_with('/')));
+                let parent = out.get(root..end).and_then(|path| path.rfind('/')).map(|i| root + i + 1).unwrap_or(root);
+                out.truncate(parent);
+                if out.len() == root {
+                    out.push('/');
+                }
+            }
+            _ => out.push_str(segment),
+        }
+    }
+    out.push_str(href.get(tail_at..).unwrap_or(""));
 }
 
 /// The words in the notes on OGC API collections left out as 3D content, by which
@@ -640,6 +800,9 @@ fn items_3d(from: &str, link: &serde_json::Value) -> Option<&'static str> {
 }
 
 fn with_query(url: &str, q: &str) -> String {
+    if let Ok(Some(bound)) = crate::login_address::parse(url) {
+        return crate::login_address::inherit(url, &with_query(bound.url, q));
+    }
     let (base, frag) = url.split_once('#').map(|(b, f)| (b, Some(f))).unwrap_or((url, None));
     let sep = if base.contains('?') { if base.ends_with('?') || base.ends_with('&') { "" } else { "&" } } else { "?" };
     match frag {
@@ -648,9 +811,12 @@ fn with_query(url: &str, q: &str) -> String {
     }
 }
 
-/// A service's address for its requests when its document names none: the address without the
-/// OGC request parameters, keeping the others (MapServer's `map=`, a token).
+/// A service request endpoint without OGC operation parameters, keeping unrelated query values
+/// (MapServer's `map=`, a token), whether advertised or used as a fallback.
 fn endpoint(url: &str) -> String {
+    if let Ok(Some(bound)) = crate::login_address::parse(url) {
+        return crate::login_address::inherit(url, &endpoint(bound.url));
+    }
     let b = base(url);
     let kept: Vec<&str> = url
         .split('#')
@@ -807,7 +973,7 @@ fn wms(url: &str, root: &Node) -> Service {
         .and_then(|g| g.descendants().find(|n| n.is_element() && local(n) == "Get"))
         .and_then(|g| child(&g, "OnlineResource"))
         .and_then(|o| href(&o))
-        .filter(|h| is_web(h))
+        .and_then(|h| resolve(url, &h))
         // The request's own parameters replace any the advertised address carries (a `TIME`).
         .map(|h| info::without_wms_keys(&h))
         .unwrap_or_else(|| endpoint(url));
@@ -826,11 +992,17 @@ fn wms(url: &str, root: &Node) -> Service {
     let mut service = Service { kind: "WMS".into(), title, ..Service::default() };
     let (mut skipped, mut too_long) = (0, 0);
     let mut time_budget = MAX_DOCUMENT_TIME_VALUES;
+    // The layers whose times were cut short (per layer past MAX_TIME_VALUES, and for the document).
+    let (mut cut_times, mut long_times) = (0, 0);
+    let mut layer_boxes = LayerBoxes::new();
     // Layers inherit their parents' coordinate systems, nearest valid geographic bounds, queryable
     // attribute and time dimension.
     // The SLD profile's GetLegendGraphic (WMS 1.3.0 with SLD 1.1, 1.1.1 with SLD 1.0), when the
     // service offers it in a format RustGIS shows: a layer's legend, drawn from its default style.
     let legend_graphic = wms_legend_graphic(root, url, &get_map, version);
+    let per_layer =
+        get_map.len() + info_request.as_ref().map_or(0, |r| r.url.len()) + legend_graphic.as_ref().map_or(0, |g| g("").url.len());
+    let limit = read_limit(per_layer);
     // (What a layer passes on is shared by its sublayers, not copied for each: a hostile document
     // may give one layer a great many.)
     type Inherited<'a, 'i> = (Node<'a, 'i>, Rc<Systems>, Option<[f64; 4]>, bool, Rc<[Node<'a, 'i>]>, Option<Rc<LayerTime>>, Scales);
@@ -840,20 +1012,25 @@ fn wms(url: &str, root: &Node) -> Service {
         .flat_map(|c| children(&c, "Layer").collect::<Vec<_>>())
         .map(|l| (l, Rc::default(), None, false, Rc::from([]), None, Scales::default()))
         .collect();
+    // Read in document order (the last pushed is the first read), so the layers past the read
+    // limit are the document's last, and a parent comes before its sublayers.
+    stack.reverse();
     while let Some((layer, inherited_crs, inherited_bbox, inherited_queryable, inherited_styles, inherited_time, inherited_scales)) =
         stack.pop()
     {
-        if service.layers.len() >= MAX_LAYERS {
+        if service.layers.len() >= limit {
+            let named = |l: &Node| l.descendants().filter(|n| n.is_element() && local(n) == "Layer" && child(n, "Name").is_some()).count();
+            let left = named(&layer) + stack.iter().map(|entry| named(&entry.0)).sum::<usize>();
+            if left > 0 {
+                note_past_read_limit(&mut service, left, "layers", limit);
+                note_copied_addresses(&mut service, per_layer, limit);
+            }
             break;
         }
         // (A layer naming none of its own shares its parent's list, and what is worked out of it.)
         let own: Vec<String> =
             layer.children().filter(|c| c.is_element() && matches!(local(c), "CRS" | "SRS")).map(|c| text_of(&c)).collect();
-        let crs: Rc<Systems> = if own.is_empty() {
-            inherited_crs
-        } else {
-            Rc::new(Systems { names: inherited_crs.names.iter().cloned().chain(own).collect(), ..Systems::default() })
-        };
+        let crs: Rc<Systems> = if own.is_empty() { inherited_crs } else { Rc::new(Systems::with_own(&inherited_crs, &own)) };
         let bbox = child(&layer, "EX_GeographicBoundingBox")
             .and_then(|b| {
                 let f = |k: &str| child_text(&b, k).and_then(|t| t.parse::<f64>().ok());
@@ -877,15 +1054,14 @@ fn wms(url: &str, root: &Node) -> Service {
         };
         // Its own scale hints replace those it inherits (WMS 1.3.0 §7.2.4.8).
         let scales = Scales::of(&layer, inherited_scales);
-        for sub in children(&layer, "Layer") {
+        for sub in children(&layer, "Layer").collect::<Vec<_>>().into_iter().rev() {
             stack.push((sub, Rc::clone(&crs), bbox, queryable, Rc::clone(&styles), time.clone(), scales));
         }
         let Some(name) = child_text(&layer, "Name") else { continue };
         // In Web Mercator, as the service draws it, else in a system of its own, warped (#769);
         // with the other systems it is offered in, for a map drawn in one of them.
-        let mercator = crs.names.iter().any(|c| c.split_whitespace().any(is_web_mercator));
-        let listed = crs.candidates.get_or_init(|| wms_candidates(&crs.names));
-        let mut native = wms_native(&layer, listed, v13, bbox, mercator);
+        let mercator = crs.mercator;
+        let mut native = wms_native(&layer, &crs.first, v13, bbox, mercator, &mut layer_boxes);
         if !mercator && native.is_none() {
             skipped += 1;
             continue;
@@ -954,19 +1130,30 @@ fn wms(url: &str, root: &Node) -> Service {
             offer: Offer::Tiles { template },
             bbox,
             tilesets: None,
-            // (The values listed for the whole document are capped: a parent's many, inherited by
-            // a great many layers, aren't copied to each.)
+            // The values listed for the whole document are capped (a parent's many, inherited by a
+            // great many layers, aren't copied to each), spent in document order: those a listing
+            // shows first.
             time: time.as_deref().map(|t| {
                 let keep = t.values.len().min(time_budget);
                 let values: Vec<String> = t.values.iter().skip(t.values.len() - keep).cloned().collect();
                 time_budget -= values.len();
-                LayerTime { values, default: t.default.clone(), multiple: t.multiple }
+                cut_times += usize::from(keep < t.values.len());
+                long_times += usize::from(t.cut > 0);
+                LayerTime { cut: t.cut + t.values.len() - keep, values, default: t.default.clone(), multiple: t.multiple }
             }),
             feature_info,
             legends,
         });
     }
-    service.layers.reverse();
+    if cut_times > 0 {
+        service.notes.push(format!(
+            "{cut_times} layers keep fewer or none of their times: RustGIS keeps {MAX_DOCUMENT_TIME_VALUES} for one document, and they come after them"
+        ));
+    }
+    if long_times > 0 {
+        service.notes.push(long_times_note(long_times));
+    }
+    cut_listing(&mut service);
     if skipped > 0 {
         service.notes.push(format!("{skipped} layers aren't offered in a coordinate system RustGIS can draw and are left out"));
     }
@@ -978,12 +1165,60 @@ fn wms(url: &str, root: &Node) -> Service {
     service
 }
 
-/// The coordinate systems a WMS layer is offered in, its own and those it inherits, and those of
-/// them RustGIS knows (worked out once, for the layers sharing the list).
+/// The coordinate systems a WMS layer is offered in, its own and those it inherits: whether Web
+/// Mercator is among them, and the first [`warp::MAX_SYSTEMS`] RustGIS can draw the layer in, in
+/// order of preference (see [`wms_candidates`]), the only ones [`wms_native`] takes. A layer
+/// naming systems of its own adds them to its parent's first ones, so the many a service's root
+/// may list (a GeoServer's thousands) are worked out once, not again for each layer (#1519).
 #[derive(Default)]
 struct Systems {
-    names: Vec<String>,
-    candidates: std::cell::OnceCell<Vec<Candidate>>,
+    /// Where a sublayer's own names are numbered from: all the names its parents list, those
+    /// RustGIS leaves out included (only the order matters).
+    names: usize,
+    mercator: bool,
+    first: Vec<Candidate>,
+}
+
+impl Systems {
+    fn with_own(parent: &Systems, own: &[String]) -> Systems {
+        // Each with whether it is known to be usable: the parent's are. Whether one is depends only
+        // on its code, and finding out makes its transformer, so it is asked only of those that
+        // come before the first `MAX_SYSTEMS` usable ones, as `wms_native` did of the whole list.
+        let mut all: Vec<(Candidate, bool)> = parent.first.iter().map(|c| (c.clone(), true)).collect();
+        let inherited = all.len();
+        // (`wms_candidates` gives one name for each system: only the parent's can repeat one.)
+        for mut c in wms_candidates(own) {
+            c.3 += parent.names;
+            // One name for each system, as in `wms_candidates`: CRS:84 over EPSG:4326, else the
+            // first listed. (A system past the parent's first ones comes after them all here too.)
+            match all[..inherited].iter_mut().find(|(p, _)| p.1 == c.1) {
+                Some((p, _)) if warp::is_crs84(&c.0) && !warp::is_crs84(&p.0) => *p = c,
+                Some(_) => {}
+                None => all.push((c, false)),
+            }
+        }
+        all.sort_by_key(|(c, _)| (candidate_rank(c), c.3));
+        Systems {
+            names: parent.names + own.iter().map(|c| c.split_whitespace().count()).sum::<usize>(),
+            mercator: parent.mercator || own.iter().any(|c| c.split_whitespace().any(is_web_mercator)),
+            first: all
+                .into_iter()
+                .filter(|(c, known)| *known || warp::usable(c.1).is_some())
+                .take(warp::MAX_SYSTEMS)
+                .map(|(c, _)| c)
+                .collect(),
+        }
+    }
+}
+
+/// Where a system comes in a WMS layer's order of preference: projected, CRS:84, other
+/// geographic.
+fn candidate_rank((name, _, c, _): &Candidate) -> u8 {
+    match (c.is_geographic(), warp::is_crs84(name)) {
+        (false, _) => 0,
+        (true, true) => 1,
+        (true, false) => 2,
+    }
 }
 
 /// A system of a WMS layer's list that RustGIS knows: its name there, its EPSG code, it, and its
@@ -1011,13 +1246,8 @@ fn wms_candidates(crs: &[String]) -> Vec<Candidate> {
     // One name for each system (EPSG:4326 and CRS:84 differ only in their axes: CRS:84 kept).
     listed.sort_by_cached_key(|(name, code, _, _)| (*code, !warp::is_crs84(name)));
     listed.dedup_by_key(|(_, code, _, _)| *code);
-    let rank = |(name, _, c, _): &Candidate| match (c.is_geographic(), warp::is_crs84(name)) {
-        (false, _) => 0,
-        (true, true) => 1,
-        (true, false) => 2,
-    };
     // In the order the service lists them, the preferred first.
-    listed.sort_by_key(|l| (rank(l), l.3));
+    listed.sort_by_key(|l| (candidate_rank(l), l.3));
     listed
 }
 
@@ -1025,27 +1255,36 @@ fn wms_candidates(crs: &[String]) -> Vec<Candidate> {
 /// candidates (see [`wms_candidates`]), and the one a Web Mercator map takes its pictures in: Web
 /// Mercator itself (`mercator`), else the first. `None` for a layer offered in Web Mercator
 /// alone (its address stays as it was) or in nothing usable. In WMS 1.3.0 a bounding box follows
-/// the system's axes as EPSG defines them ([`crate::raster::epsg_axes`]); for a system whose
+/// the system's axes as EPSG defines them ([`crate::raster::crs::epsg_north_first`]); for a system whose
 /// order RustGIS doesn't know, as the layer's own `BoundingBox` in it is written (else latitude
 /// first in a geographic system other than CRS:84).
-fn wms_native(layer: &Node, listed: &[Candidate], v13: bool, area: Option<[f64; 4]>, mercator: bool) -> Option<(String, warp::Warp)> {
+fn wms_native<'a, 'i>(
+    layer: &Node<'a, 'i>,
+    listed: &[Candidate],
+    v13: bool,
+    area: Option<[f64; 4]>,
+    mercator: bool,
+    read: &mut LayerBoxes<'a, 'i>,
+) -> Option<(String, warp::Warp)> {
     // Its boxes by system (its own, else the nearest it inherits: WMS 1.3.0 §7.2.4.6.8), read
-    // once a layer.
-    let mut boxes: std::collections::HashMap<u32, Node> = std::collections::HashMap::new();
+    // once for each layer they belong to.
     if v13 {
-        for b in layer
-            .ancestors()
-            .filter(|a| a.is_element() && local(a) == "Layer")
-            .flat_map(|a| children(&a, "BoundingBox").collect::<Vec<_>>())
-        {
-            // (By code: the box may name the system otherwise than the list, `EPSG:2056` for
-            // `urn:ogc:def:crs:EPSG::2056`; but a CRS:84 box, longitude first, isn't an
-            // EPSG:4326 one.)
-            if let Some(code) = b.attribute("CRS").or(b.attribute("SRS")).filter(|c| !warp::is_crs84(c)).and_then(warp::epsg_of) {
-                boxes.entry(code).or_insert(b);
-            }
+        for a in layer.ancestors().filter(|a| a.is_element() && local(a) == "Layer") {
+            read.entry(a.id()).or_insert_with(|| {
+                let mut boxes = std::collections::HashMap::new();
+                for b in children(&a, "BoundingBox") {
+                    // (By code: the box may name the system otherwise than the list, `EPSG:2056` for
+                    // `urn:ogc:def:crs:EPSG::2056`; but a CRS:84 box, longitude first, isn't an
+                    // EPSG:4326 one.)
+                    if let Some(code) = b.attribute("CRS").or(b.attribute("SRS")).filter(|c| !warp::is_crs84(c)).and_then(warp::epsg_of) {
+                        boxes.entry(code).or_insert(b);
+                    }
+                }
+                boxes
+            });
         }
     }
+    let read = &*read;
     let lat_first = |name: &str, system: crate::raster::Crs| {
         v13 && !warp::is_crs84(name) && {
             // In the order of the system's axes as EPSG defines them (WMS 1.3.0 §6.7.3.3); for a
@@ -1053,7 +1292,7 @@ fn wms_native(layer: &Node, listed: &[Candidate], v13: bool, area: Option<[f64; 
             if let Some(north) = epsg_north_first(system) {
                 return north;
             }
-            let own = warp::epsg_of(name).and_then(|code| boxes.get(&code));
+            let own = warp::epsg_of(name).and_then(|code| layer.ancestors().find_map(|a| read.get(&a.id())?.get(&code)));
             let written = own.and_then(|b| {
                 let f = |k: &str| b.attribute(k).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite());
                 Some([f("minx")?, f("miny")?, f("maxx")?, f("maxy")?])
@@ -1080,12 +1319,17 @@ fn wms_native(layer: &Node, listed: &[Candidate], v13: bool, area: Option<[f64; 
     Some((first.name, warp::Warp { epsg, grid: warp::Grid::Map { lat_first }, area, systems }))
 }
 
+/// The `BoundingBox`es of the WMS layers read so far, by system. A service's layers often share one
+/// parent: looking through its children or its boxes again for each would take the square of
+/// their number.
+type LayerBoxes<'a, 'i> = std::collections::HashMap<roxmltree::NodeId, std::collections::HashMap<u32, Node<'a, 'i>>>;
+
 /// Whether `system` is written north (or latitude) first as EPSG defines its axes, when
-/// RustGIS's table knows it ([`crate::raster::epsg_axes`]).
+/// it is known ([`crate::raster::crs::epsg_north_first`]).
 fn epsg_north_first(system: crate::raster::Crs) -> Option<bool> {
     match system {
         crate::raster::Crs::Custom(_) => None,
-        s => crate::raster::epsg_axes::north_first(s.epsg()),
+        s => crate::raster::crs::epsg_north_first(s.epsg()),
     }
 }
 
@@ -1285,10 +1529,17 @@ fn wmts(url: &str, root: &Node) -> Service {
         .find(|n| n.is_element() && local(n) == "GetTile")
         .and_then(|g| g.descendants().find(|n| n.is_element() && local(n) == "Get"))
         .and_then(|g| href(&g))
-        .filter(|h| is_web(h))
+        .and_then(|h| resolve(url, &h))
+        .map(|h| endpoint(&h))
         .unwrap_or_else(|| endpoint(url));
-    let (mut skipped, mut too_long) = (0, 0);
-    for layer in children(&contents, "Layer").take(MAX_LAYERS) {
+    let (mut skipped, mut too_long, mut long_times) = (0, 0, 0);
+    let limit = read_limit(kvp.len());
+    let left = children(&contents, "Layer").count().saturating_sub(limit);
+    if left > 0 {
+        note_past_read_limit(&mut service, left, "layers", limit);
+        note_copied_addresses(&mut service, kvp.len(), limit);
+    }
+    for layer in children(&contents, "Layer").take(limit) {
         let Some(name) = child_text(&layer, "Identifier") else { continue };
         let title = child_text(&layer, "Title").unwrap_or_else(|| name.clone());
         let default_style = children(&layer, "Style").find(|s| s.attribute("isDefault") == Some("true")).or_else(|| child(&layer, "Style"));
@@ -1391,7 +1642,7 @@ fn wmts(url: &str, root: &Node) -> Service {
                 let f = r.attribute("format").unwrap_or("");
                 !f.contains("pbf") && !f.contains("mvt")
             })
-            .filter_map(|r| r.attribute("template").filter(|t| is_web(t)).map(str::to_string))
+            .filter_map(|r| r.attribute("template").and_then(|t| resolve(url, t)))
             .collect();
         let timed = |t: &&String| t.contains("{Time}");
         let resource =
@@ -1432,6 +1683,7 @@ fn wmts(url: &str, root: &Node) -> Service {
             too_long += 1;
             continue;
         }
+        long_times += usize::from(time.as_ref().is_some_and(|t| t.cut > 0));
         service.layers.push(ServiceLayer {
             // A Web Mercator set's own zooms, else those a warped set's matrices make (#769).
             zooms: wmts_zooms(&layer, set, &sets).or_else(|| native.as_ref().and_then(|(_, w)| w.zooms())),
@@ -1445,6 +1697,7 @@ fn wmts(url: &str, root: &Node) -> Service {
             legends,
         });
     }
+    cut_listing(&mut service);
     if skipped > 0 {
         service.notes.push(format!("{skipped} layers have no tile matrix set RustGIS can draw and are left out"));
     }
@@ -1452,6 +1705,9 @@ fn wmts(url: &str, root: &Node) -> Service {
         service.notes.push(format!(
             "{too_long} layers in another coordinate system are left out: their addresses are longer than {MAX_ADDRESS} bytes"
         ));
+    }
+    if long_times > 0 {
+        service.notes.push(long_times_note(long_times));
     }
     service
 }
@@ -1491,7 +1747,8 @@ fn wfs(url: &str, root: &Node) -> Service {
         })
         .and_then(|g| g.descendants().find(|n| n.is_element() && local(n) == "Get"))
         .and_then(|g| href(&g).or_else(|| g.attribute("onlineResource").map(str::to_string)))
-        .filter(|h| is_web(h))
+        .and_then(|h| resolve(url, &h))
+        .map(|h| endpoint(&h))
         .unwrap_or_else(|| endpoint(url));
     // The GeoJSON output format the server names (GetFeature's, else the service-wide list);
     // `application/json` when it lists none.
@@ -1510,7 +1767,13 @@ fn wfs(url: &str, root: &Node) -> Service {
         return service;
     };
     let Some(list) = child(root, "FeatureTypeList") else { return service };
-    for ft in children(&list, "FeatureType").take(MAX_LAYERS) {
+    let (per_layer, limit) = (get.len() + json.len(), read_limit(get.len() + json.len()));
+    let left = children(&list, "FeatureType").count().saturating_sub(limit);
+    if left > 0 {
+        note_past_read_limit(&mut service, left, "feature types", limit);
+        note_copied_addresses(&mut service, per_layer, limit);
+    }
+    for ft in children(&list, "FeatureType").take(limit) {
         let Some(name) = child_text(&ft, "Name") else { continue };
         let title = child_text(&ft, "Title").unwrap_or_else(|| name.clone());
         let bbox = child(&ft, "WGS84BoundingBox")
@@ -1562,6 +1825,7 @@ fn wfs(url: &str, root: &Node) -> Service {
             legends: Vec::new(),
         });
     }
+    cut_listing(&mut service);
     service
 }
 
@@ -1635,8 +1899,9 @@ pub struct Coverage {
     /// common servers answer too, rather than 1.1's multipart answers).
     pub version: String,
     pub id: String,
-    /// The output formats the capabilities list (WCS 2.0's `formatSupported`).
-    pub formats: Vec<String>,
+    /// The output formats the capabilities list (WCS 2.0's `formatSupported`): one list for all
+    /// of a document's coverages, which may be a great many.
+    pub formats: std::sync::Arc<[String]>,
 }
 
 /// What DescribeCoverage says a coverage is: the GeoTIFF format to ask for, the names of its
@@ -1668,9 +1933,10 @@ fn wcs(url: &str, root: &Node) -> Service {
         .and_then(|g| href(&g).or_else(|| g.descendants().find(|n| n.is_element() && local(n) == "OnlineResource").and_then(|o| href(&o))))
         // MapServer escapes its `&` twice: `&amp;` is still there after the XML is read.
         .map(|h| h.replace("&amp;", "&"))
-        .filter(|h| is_web(h))
+        .and_then(|h| resolve(url, &h))
+        .map(|h| endpoint(&h))
         .unwrap_or_else(|| endpoint(url));
-    let formats: Vec<String> = root
+    let formats: std::sync::Arc<[String]> = root
         .descendants()
         .filter(|n| n.is_element() && matches!(local(n), "formatSupported" | "SupportedFormat"))
         .map(|n| text_of(&n))
@@ -1683,7 +1949,8 @@ fn wcs(url: &str, root: &Node) -> Service {
         lonlat_box(*lo.first()?, *lo.get(1)?, *hi.first()?, *hi.get(1)?)
     };
     let mut add = |id: String, title: Option<String>, bbox: Option<[f64; 4]>| {
-        let coverage = Coverage { endpoint: get.clone(), version: version.into(), id: id.clone(), formats: formats.clone() };
+        let coverage =
+            Coverage { endpoint: get.clone(), version: version.into(), id: id.clone(), formats: std::sync::Arc::clone(&formats) };
         service.layers.push(ServiceLayer {
             zooms: None,
             title: title.filter(|t| !t.is_empty()).unwrap_or_else(|| id.clone()),
@@ -1696,11 +1963,17 @@ fn wcs(url: &str, root: &Node) -> Service {
             legends: Vec::new(),
         });
     };
-    let mut n = 0;
+    let (mut n, mut left, mut long_ids) = (0, 0, 0);
+    let limit = read_limit(get.len());
     // WCS 1.1 and 2.0: `CoverageSummary` (nested ones too), named by `CoverageId` or `Identifier`.
     for s in root.descendants().filter(|n| n.is_element() && local(n) == "CoverageSummary") {
         let Some(id) = child_text(&s, "CoverageId").or_else(|| child_text(&s, "Identifier")) else { continue };
-        if id.len() > 500 || n >= MAX_LAYERS {
+        if id.len() > 500 {
+            long_ids += 1;
+            continue;
+        }
+        if n >= limit {
+            left += 1;
             continue;
         }
         n += 1;
@@ -1710,7 +1983,12 @@ fn wcs(url: &str, root: &Node) -> Service {
     // WCS 1.0: `CoverageOfferingBrief`, named by `name`, its bounds a `lonLatEnvelope`.
     for b in root.descendants().filter(|n| n.is_element() && local(n) == "CoverageOfferingBrief") {
         let Some(id) = child_text(&b, "name") else { continue };
-        if id.len() > 500 || n >= MAX_LAYERS {
+        if id.len() > 500 {
+            long_ids += 1;
+            continue;
+        }
+        if n >= limit {
+            left += 1;
             continue;
         }
         n += 1;
@@ -1721,6 +1999,14 @@ fn wcs(url: &str, root: &Node) -> Service {
             lonlat_box(*pos.first()?, *pos.get(1)?, *pos.get(2)?, *pos.get(3)?)
         });
         add(id, child_text(&b, "label"), bbox);
+    }
+    cut_listing(&mut service);
+    if left > 0 {
+        note_past_read_limit(&mut service, left, "coverages", limit);
+        note_copied_addresses(&mut service, get.len(), limit);
+    }
+    if long_ids > 0 {
+        service.notes.push(format!("{long_ids} coverages are left out: their identifiers are longer than 500 bytes"));
     }
     service
 }
@@ -2094,7 +2380,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             }
             return;
         }
-        for l in v.get("layers").and_then(|l| l.as_array()).into_iter().flatten().take(MAX_LAYERS) {
+        for l in v.get("layers").and_then(|l| l.as_array()).into_iter().flatten().take(MAX_LISTED_LAYERS) {
             let (Some(id), Some(name)) = (l.get("id").and_then(|i| i.as_i64()), l.get("name").and_then(|n| n.as_str())) else { continue };
             // Group layers have sub-layers and no features of their own.
             if l.get("subLayerIds").is_some_and(|s| s.as_array().is_some_and(|a| !a.is_empty())) {
@@ -2140,7 +2426,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         // A dynamic map's layers, each drawn alone (`layers=show:<id>`): a national layer is
         // seen whole this way, where its features would stop at the server's record limit.
         if !template_is_cache(&service) {
-            for l in v.get("layers").and_then(|l| l.as_array()).into_iter().flatten().take(MAX_LAYERS) {
+            for l in v.get("layers").and_then(|l| l.as_array()).into_iter().flatten().take(MAX_LISTED_LAYERS) {
                 let (Some(id), Some(name)) = (l.get("id").and_then(|i| i.as_i64()), l.get("name").and_then(|n| n.as_str())) else {
                     continue;
                 };
@@ -2193,18 +2479,33 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             legends: Vec::new(),
         });
     } else {
+        if let Some((root, id)) = b.rsplit_once('/')
+            && id.parse::<u32>().is_ok()
+            && ["/mapserver", "/featureserver"].iter().any(|s| root.to_ascii_lowercase().ends_with(s))
+        {
+            let root = crate::diagnostics::address_in_message(root);
+            return Err(format!(
+                "this is layer '{id}': list its service with service.layers using url '{root}', then use service.add with that url and layer '{id}'"
+            ));
+        }
         return Err("an ArcGIS address, but not a FeatureServer, MapServer, ImageServer or VectorTileServer".into());
     }
+    let left = v.get("layers").and_then(|l| l.as_array()).map_or(0, Vec::len).saturating_sub(MAX_LISTED_LAYERS);
+    if left > 0 {
+        note_past_read_limit(&mut service, left, "layers", MAX_LISTED_LAYERS);
+    }
     // A feature layer is read past the server's record limit, page by page, where the layer
-    // supports it ([`read_pages`]). A cut-off answer is pointed out when it lands.
+    // supports it ([`begin`]). A cut-off answer is pointed out when it lands.
     if let Some(max) = v.get("maxRecordCount").and_then(|m| m.as_i64())
         && service.layers.iter().any(|l| matches!(l.offer, Offer::Features { .. }))
     {
         service.notes.push(format!(
-            "a feature layer is read up to {MAX_PAGED_FEATURES} features, {max} per request, where the server pages its layers"
+            "a feature layer is read up to {} features on this computer, {max} per request, where the server pages its layers",
+            max_paged_features()
         ));
     }
-    // A secured service's token goes with every request.
+    // Offers are constructed under the service. A suffix supplied by its document still has
+    // to pass the raw-path check before it may receive the service's token.
     if let Some(token) = query_value(url, "token").filter(|t| !t.is_empty()) {
         for l in &mut service.layers {
             match &mut l.offer {
@@ -2213,7 +2514,15 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 | Offer::Style { url: u }
                 | Offer::VectorTiles { template: u, .. }
                 | Offer::Service { url: u }
-                | Offer::Coverage(Coverage { endpoint: u, .. }) => *u = with_query(u, &format!("token={token}")),
+                | Offer::Coverage(Coverage { endpoint: u, .. }) => {
+                    if crate::address::Scope::of(crate::login_address::inner(url))
+                        .is_some_and(|scope| scope.covers_below(crate::login_address::inner(u)))
+                    {
+                        *u = with_query(u, &format!("token={token}"));
+                    } else {
+                        service.withheld_addresses = service.withheld_addresses.saturating_add(1);
+                    }
+                }
             }
         }
     }
@@ -2255,7 +2564,7 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
     // Names RustGIS won't put into an address (spaces, `?`, `..`): counted in a note.
     let mut unnamed = 0;
     // ArcGIS's own system folder holds geometry and printing tools, never maps.
-    for f in v.get("folders").and_then(|f| f.as_array()).into_iter().flatten().take(MAX_LAYERS) {
+    for f in v.get("folders").and_then(|f| f.as_array()).into_iter().flatten().take(MAX_LISTED_LAYERS) {
         let Some(name) = f.as_str().and_then(|n| {
             let ok = arcgis_name(n);
             unnamed += usize::from(ok.is_none());
@@ -2279,7 +2588,7 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
             legends: Vec::new(),
         });
     }
-    for s in v.get("services").and_then(|s| s.as_array()).into_iter().flatten().take(MAX_LAYERS) {
+    for s in v.get("services").and_then(|s| s.as_array()).into_iter().flatten().take(MAX_LISTED_LAYERS) {
         let Some(kind) = s.get("type").and_then(|t| t.as_str()) else {
             skipped += 1;
             continue;
@@ -2311,23 +2620,52 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
     if unnamed > 0 {
         service.notes.push(format!("{unnamed} folders or services with names RustGIS can't put in an address are left out"));
     }
+    for (key, what) in [("folders", "folders"), ("services", "services")] {
+        let left = v.get(key).and_then(|l| l.as_array()).map_or(0, Vec::len).saturating_sub(MAX_LISTED_LAYERS);
+        if left > 0 {
+            note_past_read_limit(&mut service, left, what, MAX_LISTED_LAYERS);
+        }
+    }
     service
 }
 
 // ---------------------------------------------------------------------------------------------
 // OGC API Features
 
+/// Reads collections or starts dataset discovery only from advertised links.
 fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
-    let collections = v.get("collections").and_then(|c| c.as_array());
+    let collections = v.get("collections").and_then(|c| c.as_array()).filter(|collections| {
+        !collections.is_empty()
+            || !v.get("links").and_then(serde_json::Value::as_array).is_some_and(|links| {
+                links.iter().any(|link| dataset::relation(link, "tilesets-map") || dataset::relation(link, "tilesets-vector"))
+            })
+    });
     let Some(collections) = collections else {
         // A landing page can offer both dataset tiles and a collections document to discover.
         let title = v.get("title").and_then(|t| t.as_str()).unwrap_or_default().to_string();
         let mut service = Service { kind: "OGC API Tiles".into(), title: title.clone(), ..Service::default() };
         let links = v.get("links").and_then(|l| l.as_array()).cloned().unwrap_or_default();
-        service.collections_url = collections_link(url, &links);
+        if let Some((next, withheld)) = collections_link(url, &links) {
+            service.collections_url = Some(next);
+            service.withheld_addresses = u32::from(withheld);
+        }
+        let dataset = DatasetDiscovery::landing(url, &links, &mut service.withheld_addresses);
+        let map_url = dataset.as_ref().and_then(DatasetDiscovery::map_url).map(str::to_string);
+        if service.collections_url.is_none() {
+            service.dataset = dataset;
+        } else if let Some(dataset) = dataset {
+            let notes = dataset.collections_notes();
+            service.incomplete |= !notes.is_empty();
+            service.notes.extend(notes);
+        }
         let name = if title.is_empty() { "tiles".to_string() } else { title };
-        // The dataset's layers aren't listed here, so its vector tiles can't be styled: map tiles only.
-        if let Some((t, list)) = tileset(url, &links, TileRel::Map) {
+        // Collections discovery keeps its existing map resolver, enabled only by a usable
+        // JSON metadata link. Dataset-only landings use the validated plan instead.
+        if service.dataset.is_none()
+            && let Some(map_url) = map_url
+            && let Some((t, list, withheld)) = tileset(url, &[serde_json::json!({"rel":"tilesets-map","href":map_url})], TileRel::Map)
+        {
+            service.withheld_addresses = service.withheld_addresses.saturating_add(u32::from(withheld));
             service.layers.push(ServiceLayer {
                 zooms: None,
                 name: "map".into(),
@@ -2340,8 +2678,8 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 legends: Vec::new(),
             });
         }
-        if !service.layers.is_empty() || service.collections_url.is_some() {
-            if service.layers.is_empty() {
+        if !service.layers.is_empty() || service.collections_url.is_some() || service.dataset.is_some() {
+            if service.layers.is_empty() && service.dataset.is_none() {
                 service.kind = "OGC API Features".into();
             }
             return Ok(service);
@@ -2360,7 +2698,22 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
     // Collections whose items are 3D content, not features, by what it is and whether their tiles
     // are listed.
     let mut three_d: Vec<((&str, bool), Vec<&str>)> = Vec::new();
-    for c in collections.iter().take(MAX_LAYERS) {
+    // A collection's layers copy the document's own address when their items or tiles links are
+    // missing or relative, and nothing bounds that address: reading stops once the layers'
+    // addresses reach `MAX_COPIED_ADDRESS_BYTES` (after the first collection, as `read_limit`).
+    let (mut copied, mut counted) = (0usize, 0);
+    let mut read = collections.len().min(MAX_READ_LAYERS);
+    for (i, c) in collections.iter().take(MAX_READ_LAYERS).enumerate() {
+        copied = service.layers.get(counted..).unwrap_or_default().iter().map(address_bytes).fold(copied, usize::saturating_add);
+        counted = service.layers.len();
+        // A collection may make several layers: the list stops at a collection, with all its own.
+        if i == MAX_LISTED_LAYERS {
+            service.listed = Some(service.layers.len());
+        }
+        if i > 0 && copied > MAX_COPIED_ADDRESS_BYTES {
+            read = i;
+            break;
+        }
         let Some(id) = c.get("id").and_then(|i| i.as_str()) else { continue };
         let links = c.get("links").and_then(|l| l.as_array()).cloned().unwrap_or_default();
         let title = c.get("title").and_then(|t| t.as_str()).unwrap_or(id).to_string();
@@ -2381,7 +2734,8 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         // tiles' layer is named after the collection, as the standard has it.
         let map = tileset(url, &links, TileRel::Map);
         let vector = tileset(url, &links, TileRel::Vector);
-        if let Some((t, list)) = &map {
+        if let Some((t, list, withheld)) = &map {
+            service.withheld_addresses = service.withheld_addresses.saturating_add(u32::from(*withheld));
             service.layers.push(ServiceLayer {
                 zooms: None,
                 name: format!("{id} (map tiles)"),
@@ -2394,7 +2748,8 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 legends: Vec::new(),
             });
         }
-        if let Some((t, list)) = &vector {
+        if let Some((t, list, withheld)) = &vector {
+            service.withheld_addresses = service.withheld_addresses.saturating_add(u32::from(*withheld));
             service.layers.push(ServiceLayer {
                 zooms: None,
                 name: format!("{id} (vector tiles)"),
@@ -2479,12 +2834,13 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             (true, false) => format!("{noun} {named} also {verb} {what}, {LEFT_OUT_3D}; their tiles are listed"),
         });
     }
-    if collections.len() > MAX_LAYERS {
-        service.notes.push(format!("only the first {MAX_LAYERS} collections are listed"));
+    if collections.len() > read {
+        note_past_read_limit(&mut service, collections.len() - read, "collections", read);
+        note_copied_addresses(&mut service, copied.div_ceil(read.max(1)), read);
     }
-    service.incomplete = unreadable > 0 || collections.len() > MAX_LAYERS;
+    service.incomplete = unreadable > 0 || collections.len() > MAX_LISTED_LAYERS.min(read);
     if service.layers.iter().any(|l| matches!(l.offer, Offer::Features { .. })) {
-        service.notes.push(format!("a collection is read up to {MAX_PAGED_FEATURES} features, page by page"));
+        service.notes.push(format!("a collection is read up to {} features on this computer, page by page", max_paged_features()));
     }
     if tiled > 0 {
         service.kind = if service.layers.iter().any(|l| matches!(l.offer, Offer::Features { .. })) {
@@ -2507,9 +2863,9 @@ enum TileRel {
 /// `tilesets-vector` link: the template at the usual path under the tileset list
 /// (`…/WebMercatorQuad/{tileMatrix}/{tileRow}/{tileCol}`), and the list's address (JSON), whose
 /// WebMercatorQuad tileset advertises the template [`resolve_tiles`] reads (the usual path is what
-/// is used when that can't be read). Both keep the link's query (a token, a collections choice),
-/// all but `f`.
-fn tileset(from: &str, links: &[serde_json::Value], which: TileRel) -> Option<(String, String)> {
+/// is used when that can't be read). The constructed template keeps the link's query except
+/// `f` only under its checked source path; the third result counts a withheld destination.
+fn tileset(from: &str, links: &[serde_json::Value], which: TileRel) -> Option<(String, String, bool)> {
     let suffix = match which {
         TileRel::Map => "tilesets-map",
         TileRel::Vector => "tilesets-vector",
@@ -2533,23 +2889,17 @@ fn tileset(from: &str, links: &[serde_json::Value], which: TileRel) -> Option<(S
         TileRel::Vector => format!("{at}/WebMercatorQuad/{{z}}/{{y}}/{{x}}?f=mvt"),
     };
     let list = if query_value(&href, "f").is_some() { href.clone() } else { with_query(&href, "f=json") };
-    Some((carry_query(&template, &href), list))
+    let inherited = crate::address::inherit_query(
+        crate::login_address::inner(&href),
+        crate::login_address::inner(&template),
+        crate::address::Relation::Constructed,
+        &["f"],
+    );
+    Some((crate::login_address::inherit(&template, &inherited.url), list, inherited.withheld))
 }
 
-/// `template` with the query parameters of `link` it doesn't have, but `f` (the representation
-/// the link was for).
-fn carry_query(template: &str, link: &str) -> String {
-    let q = link.split('#').next().and_then(|u| u.split_once('?')).map(|(_, q)| q).unwrap_or("");
-    let mut out = template.to_string();
-    for kv in q.split('&').take(32) {
-        let k = kv.split_once('=').map(|(k, _)| k).unwrap_or(kv);
-        if kv.is_empty() || k.eq_ignore_ascii_case("f") || query_value(&out, k).is_some() || kv.contains(['{', '}']) {
-            continue;
-        }
-        out = with_query(&out, kv);
-    }
-    out
-}
+/// Notice template shared by native discovery and the translated asynchronous UI resolver.
+pub const QUERY_WITHHELD_NOTICE: &str = "{n} address(es) the service listed didn't get its keys or other settings: RustGIS sends those only to addresses it builds itself from the one given; add such an address with its own key if it needs one";
 
 /// What an OGC API tiles document says on the way to a tile template: the template, or the
 /// address of the document to read next (a tileset list's WebMercatorQuad tileset).
@@ -2559,46 +2909,105 @@ pub enum TilesStep {
     Next(String),
 }
 
+/// One discovery result and the number of destinations that lost query settings. Callers must
+/// report this count, including when a later fetch fails and falls back to a constructed URL.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TilesResolution {
+    pub step: TilesStep,
+    pub withheld_addresses: u32,
+}
+
+/// Applies the advertised-link policy; the document cannot claim a constructed relationship.
+fn advertised_tiles(list: &str, to: &str, next: bool) -> TilesResolution {
+    let inherited = crate::address::inherit_query(
+        crate::login_address::inner(list),
+        crate::login_address::inner(to),
+        crate::address::Relation::Advertised,
+        &["f"],
+    );
+    // Preserve only the destination's binding: a foreign document cannot recover a login
+    // merely by linking back to the original query source's origin.
+    let url = crate::login_address::inherit(to, &inherited.url);
+    let step = if next {
+        TilesStep::Next(if query_value(&url, "f").is_some() { url } else { with_query(&url, "f=json") })
+    } else {
+        TilesStep::Template(url)
+    };
+    TilesResolution { step, withheld_addresses: u32::from(inherited.withheld) }
+}
+
 /// One step of reading an OGC API tile template: `body` is the tileset list (or a tileset)
-/// fetched from `doc`; `list` is the list's address, whose query the template keeps. `None` when
+/// fetched from `doc`; `list` is the query source. Advertised links receive SAFE_OPTIONS only;
+/// withheld settings are counted for the caller's notice. `None` when
 /// the document names no WebMercatorQuad tileset or tile template.
-pub fn resolve_tiles(list: &str, doc: &str, body: &[u8], vector: bool) -> Option<TilesStep> {
+pub fn resolve_tiles(list: &str, doc: &str, body: &[u8], vector: bool) -> Option<TilesResolution> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let links = |v: &serde_json::Value| v.get("links").and_then(|l| l.as_array()).cloned().unwrap_or_default();
     let Some(sets) = v.get("tilesets").and_then(|t| t.as_array()) else {
         // A tileset: its tile template.
-        return item_template(doc, &links(&v), vector).map(|t| TilesStep::Template(carry_query(&t, list)));
+        if !tile_data_type(&v, vector) {
+            return None;
+        }
+        return item_template(doc, &links(&v), vector).map(|t| advertised_tiles(list, &t, false));
     };
-    let mercator = |t: &serde_json::Value| {
-        let tiling = links(t);
-        let named: Vec<String> = ["tileMatrixSetURI", "tileMatrixSetId", "tileMatrixSet", "id"]
-            .iter()
-            .filter_map(|k| t.get(*k).and_then(|x| x.as_str()))
-            .chain(
-                tiling
-                    .iter()
-                    .filter(|l| l.get("rel").and_then(|r| r.as_str()).is_some_and(|r| r.contains("tiling-scheme")))
-                    .filter_map(|l| l.get("href").and_then(|h| h.as_str())),
-            )
-            .map(|n| base(n).trim_end_matches('/').to_ascii_lowercase())
-            .collect();
-        named.iter().any(|n| n.ends_with("webmercatorquad") || n.ends_with("googlemapscompatible"))
-    };
-    let kind_fits = |t: &serde_json::Value| match t.get("dataType").and_then(|d| d.as_str()) {
-        Some(d) => (d == "vector") == vector,
-        None => true,
-    };
-    let t = sets.iter().take(200).find(|t| mercator(t) && kind_fits(t))?;
+    let t = sets.iter().take(200).find(|t| web_mercator_tileset(t) && tile_data_type(t, vector))?;
     let ls = links(t);
     if let Some(template) = item_template(doc, &ls, vector) {
-        return Some(TilesStep::Template(carry_query(&template, list)));
+        return Some(advertised_tiles(list, &template, false));
     }
     let next = ls
         .iter()
         .find(|l| l.get("rel").and_then(|r| r.as_str()).is_some_and(|r| r == "self" || r.ends_with("/tileset")))
         .and_then(|l| resolve(doc, l.get("href")?.as_str()?))?;
-    let next = carry_query(&next, list);
-    Some(TilesStep::Next(if query_value(&next, "f").is_some() { next } else { with_query(&next, "f=json") }))
+    Some(advertised_tiles(list, &next, true))
+}
+
+/// Keeps an absent declaration compatible with older services, but never treats coverage or
+/// an unknown declared type as a map. OGC API Tiles 1.0 distinguishes map, vector and coverage.
+fn tile_data_type(t: &serde_json::Value, vector: bool) -> bool {
+    match t.get("dataType") {
+        None => true,
+        Some(declared) => match declared.as_str() {
+            Some("map") => !vector,
+            Some("vector") => vector,
+            _ => false,
+        },
+    }
+}
+
+/// Recognizes the supported global tile pyramid from declared tileset metadata. A canonical
+/// declaration identifies the grid; a tiling-scheme link locates a definition and may use an
+/// arbitrary server path (OGC API Tiles 1.0, section 5.2).
+fn web_mercator_tileset(t: &serde_json::Value) -> bool {
+    let links = t.get("links").and_then(|l| l.as_array());
+    let mut named: Vec<&str> =
+        ["tileMatrixSetURI", "tileMatrixSetId", "tileMatrixSet"].iter().filter_map(|k| t.get(*k).and_then(|x| x.as_str())).collect();
+    if named.is_empty() {
+        named.extend(
+            links
+                .into_iter()
+                .flatten()
+                .filter(|l| {
+                    l.get("rel")
+                        .and_then(|r| r.as_str())
+                        .is_some_and(|r| r == "tiling-scheme" || r == "http://www.opengis.net/def/rel/ogc/1.0/tiling-scheme")
+                })
+                .filter_map(|l| l.get("href").and_then(|h| h.as_str())),
+        );
+    }
+    if named.is_empty()
+        && let Some(id) = t.get("id").and_then(|id| id.as_str())
+    {
+        named.push(id);
+    }
+    !named.is_empty()
+        && named.iter().all(|n| {
+            base(n)
+                .trim_end_matches('/')
+                .rsplit(['/', ':'])
+                .next()
+                .is_some_and(|n| n.eq_ignore_ascii_case("WebMercatorQuad") || n.eq_ignore_ascii_case("GoogleMapsCompatible"))
+        })
 }
 
 /// A tileset's advertised tile template (its `item` link, `{tileMatrix}/{tileRow}/{tileCol}`) as
@@ -2619,7 +3028,7 @@ fn item_template(from: &str, links: &[serde_json::Value], vector: bool) -> Optio
     } else {
         items.iter().find(|l| ty(l) == "image/png").or_else(|| items.iter().find(|l| ty(l).starts_with("image/")))
     }
-    .or_else(|| items.first())?;
+    .or_else(|| items.iter().find(|link| link.get("type").is_none()))?;
     let href = pick.get("href")?.as_str()?;
     if href.len() > 2000 {
         return None;
@@ -2681,8 +3090,44 @@ pub fn partial_note(bytes: &[u8]) -> Option<String> {
     (next(&head) || next(&tail)).then(|| "the server sent one page of its features; the rest aren't read".into())
 }
 
-/// Most features read from a collection that comes in pages.
-pub const MAX_PAGED_FEATURES: usize = 100_000;
+/// The fewest features [`max_paged_features`] allows, and its limit in the browser.
+pub const PAGED_FEATURES_FLOOR: usize = 100_000;
+/// The most [`max_paged_features`] allows, however much memory the computer has.
+pub const PAGED_FEATURES_CEILING: usize = 1_000_000;
+
+/// Most features read from a collection that comes in pages: on the desktop, as many as a quarter
+/// of the computer's memory holds at 20 KB each (about 100,000 for every 8 GB, the pages read
+/// included), from [`PAGED_FEATURES_FLOOR`] up to [`PAGED_FEATURES_CEILING`] (#1318).
+/// Less once RustGIS holds more than half the memory, never below the floor ([`crate::memory::planned`], #2431).
+pub fn max_paged_features() -> usize {
+    crate::memory::planned(PAGED_FEATURES_FLOOR, PAGED_FEATURES_CEILING, 20 << 10)
+}
+
+/// The most bytes of why a layer's protocol buffer pages couldn't be read that its note says.
+const MAX_REASON: usize = 200;
+
+/// The note of a layer read in GeoJSON because its protocol buffer pages couldn't be read (`why`),
+/// before the reading's own `note`.
+fn read_in_geojson(why: &str, note: Option<String>) -> String {
+    let said = format!("its protocol buffer pages couldn't be read ({why}), so it is read in GeoJSON");
+    match note {
+        Some(note) => format!("{said}; {note}"),
+        None => said,
+    }
+}
+
+/// The least memory [`max_decoded_bytes`] allows, and its limit in the browser.
+pub const DECODED_FLOOR: usize = 512 << 20;
+/// The most memory [`max_decoded_bytes`] allows, however much the computer has.
+pub const DECODED_CEILING: usize = 3 << 30;
+
+/// Most memory, in bytes, an ArcGIS layer's protocol buffer pages may take once read: on the
+/// desktop a quarter of the computer's memory, from [`DECODED_FLOOR`] up to [`DECODED_CEILING`].
+/// The download budget doesn't bound it: a vertex takes 1 to 3 bytes in a page and 16 read.
+/// Less once RustGIS holds more than half the memory, never below the floor ([`crate::memory::planned`], #2431).
+pub fn max_decoded_bytes() -> usize {
+    crate::memory::planned(DECODED_FLOOR, DECODED_CEILING, 1)
+}
 
 /// A feature collection page's JSON `next` link, resolved against the page's address.
 fn next_page(url: &str, page: &serde_json::Value) -> Option<String> {
@@ -2700,8 +3145,21 @@ fn exceeded(page: &serde_json::Value) -> bool {
         .any(|v| v.and_then(|v| v.as_bool()) == Some(true))
 }
 
+/// What an ArcGIS layer read from a query asking for a window of its own says of its symbology,
+/// which its description says and isn't asked for (#2152).
+const WINDOW_DRAWING: &str = "its service's symbology, not read for an address that asks for its own resultOffset or resultRecordCount, drawn with RustGIS's single symbol";
+
+/// What an ArcGIS layer says of its symbology when its description couldn't be read (`why`), cut
+/// and with any secret left out (#2152).
+fn drawing_unread(why: &str) -> String {
+    // An error holding an address isn't repeated: `redact` keeps its path, which can hold a key.
+    let mut why = if why.contains("://") { "its description couldn't be fetched".to_string() } else { crate::diagnostics::redact(why) };
+    crate::diagnostics::cut_with_ellipsis(&mut why, MAX_REASON);
+    format!("its service's symbology, which RustGIS couldn't read ({why}), drawn with RustGIS's single symbol")
+}
+
 /// Whether an address is an ArcGIS layer's query (`…/FeatureServer/0/query`, `…/MapServer/3/query`).
-fn is_arcgis_query(url: &str) -> bool {
+pub(crate) fn is_arcgis_query(url: &str) -> bool {
     let b = base(url).trim_end_matches('/').to_ascii_lowercase();
     b.ends_with("/query") && (b.contains("/featureserver/") || b.contains("/mapserver/"))
 }
@@ -2709,16 +3167,16 @@ fn is_arcgis_query(url: &str) -> bool {
 /// How an ArcGIS layer is read past its record limit: pages of `size` features, in the order of
 /// its object ids (`order`) so that no feature is skipped or read twice.
 #[derive(Debug, PartialEq)]
-struct ArcgisPaging {
-    size: Option<usize>,
-    order: Option<String>,
+pub(crate) struct ArcgisPaging {
+    pub(crate) size: Option<usize>,
+    pub(crate) order: Option<String>,
 }
 
 /// How a layer's description (`…/FeatureServer/0?f=json`) lets it be read in pages: `None` unless it
 /// says it supports them (`advancedQueryCapabilities.supportsPagination`, from ArcGIS Server 10.3).
 /// Its `maxRecordCount` is the page size when it is a count RustGIS would ask for; its object id
 /// field, the order, when it is a plain field name (it goes into the address).
-fn arcgis_paging(layer: &serde_json::Value) -> Option<ArcgisPaging> {
+pub(crate) fn arcgis_paging(layer: &serde_json::Value) -> Option<ArcgisPaging> {
     if layer.pointer("/advancedQueryCapabilities/supportsPagination").and_then(|p| p.as_bool()) != Some(true) {
         return None;
     }
@@ -2726,7 +3184,7 @@ fn arcgis_paging(layer: &serde_json::Value) -> Option<ArcgisPaging> {
         .get("maxRecordCount")
         .and_then(|m| m.as_u64())
         .and_then(|m| usize::try_from(m).ok())
-        .filter(|m| (1..=MAX_PAGED_FEATURES).contains(m));
+        .filter(|m| (1..=max_paged_features()).contains(m));
     let oid_field = || {
         layer
             .get("fields")?
@@ -2745,9 +3203,89 @@ fn arcgis_paging(layer: &serde_json::Value) -> Option<ArcgisPaging> {
     Some(ArcgisPaging { size, order })
 }
 
+/// Whether a layer's description lists protocol buffers among the formats its queries answer in
+/// (`supportedQueryFormats`, such as `"JSON, geoJSON, PBF"`).
+pub(crate) fn supports_pbf(layer: &serde_json::Value) -> bool {
+    layer.get("supportedQueryFormats").and_then(|f| f.as_str()).is_some_and(|f| f.split(',').any(|f| f.trim().eq_ignore_ascii_case("pbf")))
+}
+
+/// An ArcGIS query asking for its answer as `format` (`f`, in any case), in place of the format
+/// it named; its fragment kept, as [`with_query`] keeps it.
+fn with_format(query: &str, format: &str) -> String {
+    with_query_value(query, "f", format)
+}
+
+/// Replaces one query value in any case, preserving opaque settings, login bindings and fragments.
+pub(crate) fn with_query_value(query: &str, key: &str, value: &str) -> String {
+    if let Ok(Some(bound)) = crate::login_address::parse(query) {
+        return crate::login_address::inherit(query, &with_query_value(bound.url, key, value));
+    }
+    let (url, fragment) = query.split_once('#').map_or((query, None), |(u, f)| (u, Some(f)));
+    let (base, q) = url.split_once('?').unwrap_or((url, ""));
+    let kept: Vec<&str> =
+        q.split('&').filter(|kv| !kv.is_empty() && !kv.split('=').next().is_some_and(|k| k.eq_ignore_ascii_case(key))).collect();
+    let asked = with_query(&with_query(base, &kept.join("&")), &format!("{key}={}", encode(value)));
+    if let Some(f) = fragment { format!("{asked}#{f}") } else { asked }
+}
+
+/// An ArcGIS feature query with its SQL where clause replaced as one encoded value. Other
+/// service protocols return None, so a caller cannot silently ignore an unsupported filter.
+pub fn features_where(query: &str, clause: &str) -> Option<String> {
+    is_arcgis_query(query).then(|| with_query_value(query, "where", clause))
+}
+
+/// A bounded service error envelope, including those returned with HTTP 200 instead of 5xx.
+/// Feature collections and binary pages are left to their own readers.
+fn arcgis_page_error(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > EDGE {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    arcgis_error_text(&v)
+}
+
+/// What an ArcGIS answer already read (`v`) says when it is the service's error (`{"error": …}`),
+/// whatever its size, as [`arcgis_page_error`] says it.
+pub(crate) fn arcgis_error_text(v: &serde_json::Value) -> Option<String> {
+    let error = v.get("error")?.as_object()?;
+    let code = error.get("code").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let message = error.get("message").and_then(serde_json::Value::as_str).unwrap_or("query refused");
+    let mut message = crate::diagnostics::redact(message);
+    crate::diagnostics::cut_with_ellipsis(&mut message, MAX_REASON);
+    Some(format!("service error: {code}: {message}"))
+}
+
+/// Reads only transport status prefixes or our own service-error prefix, never a number in a URL.
+fn page_error_status(error: &str) -> Option<u16> {
+    let error = error.trim();
+    let rest =
+        error.strip_prefix("http status: ").or_else(|| error.strip_prefix("HTTP ")).or_else(|| error.strip_prefix("service error: "))?;
+    let (code, after) = rest.split_at_checked(3)?;
+    (after.is_empty() || after.starts_with(':') || after.starts_with(" (retry after ")).then(|| code.parse().ok()).flatten()
+}
+
+/// Size-sensitive failures only. Cancellation, exhausted read budgets, authorization and invalid
+/// queries must not cause extra requests; an individual transport timeout leaves room to retry.
+fn smaller_page_may_help(error: &str) -> bool {
+    // A requested wait isn't a size failure.
+    if error.contains(" (retry after ") {
+        return false;
+    }
+    if let Some(status) = page_error_status(error) {
+        return status == 408 || (500..600).contains(&status);
+    }
+    let error = error.to_ascii_lowercase();
+    error != "the pages timed out"
+        && !error.contains("cancelled")
+        && ["timeout", "timed out", "connection reset", "connection aborted", "unexpected eof"].iter().any(|s| error.contains(s))
+}
+
 /// The description of the layer an ArcGIS query reads (`…/FeatureServer/0?f=json`), with the
 /// query's token.
-fn arcgis_layer_url(query: &str) -> String {
+pub(crate) fn arcgis_layer_url(query: &str) -> String {
+    if let Ok(Some(bound)) = crate::login_address::parse(query) {
+        return crate::login_address::inherit(query, &arcgis_layer_url(bound.url));
+    }
     let b = base(query).trim_end_matches('/');
     let layer = b.get(..b.len().saturating_sub("/query".len())).unwrap_or(b);
     match query_value(query, "token").filter(|t| !t.is_empty()) {
@@ -2847,20 +3385,22 @@ fn unidentified_hash(feature: &RawValue) -> Option<u64> {
     Some(hash.finish())
 }
 
-/// A feature collection read page by page: `first` (from `url`), then each page `get` returns, up
-/// to `max` features, as [`read_pages`] leads (the blocking way to drive it). The pages' features
-/// in one collection, and a note when some features were left unread; a first page that leads
-/// nowhere comes back unchanged.
+/// A service's features at `url` read page by page, each answer `get` returns, up to `max`
+/// features, as [`begin`] leads (the blocking way to drive it). The pages' features in one
+/// collection, and a note when some features were left unread; a first page that leads nowhere
+/// comes back unchanged. An error when the features couldn't be fetched at all.
 pub fn join_pages(
     url: &str,
-    first: Vec<u8>,
     max: usize,
     mut get: impl FnMut(&str) -> Result<Vec<u8>, String>,
-) -> (Vec<u8>, Option<String>) {
-    let mut step = read_pages(url, first, max);
+) -> Result<(Vec<u8>, Option<String>), String> {
+    let mut step = begin(url, max);
     loop {
         match step {
-            Step::Done(bytes, note) => return (bytes, note),
+            Step::Done(bytes, note) => return Ok((bytes, note)),
+            // Not given by [`begin`], which reads in GeoJSON.
+            Step::Decoded(..) => return Err("the pages were read as protocol buffers".into()),
+            Step::Failed(e) => return Err(e),
             Step::Fetch(pages) => {
                 let answer = get(pages.next_url());
                 step = (*pages).land(answer);
@@ -2869,14 +3409,20 @@ pub fn join_pages(
     }
 }
 
-/// Where reading a collection page by page has got to ([`read_pages`]).
+/// Where reading a collection page by page has got to ([`begin`]).
 #[derive(Debug)]
 pub enum Step {
     /// The next answer to fetch ([`Pages::next_url`]), to hand to [`Pages::land`].
     Fetch(Box<Pages>),
     /// The collection as read (the pages joined, or the first page as it came) and a note when
-    /// some features were left unread.
+    /// some features were left unread, or it was read in GeoJSON because its protocol buffer
+    /// pages couldn't be read.
     Done(Vec<u8>, Option<String>),
+    /// An ArcGIS layer read in protocol buffer pages (`f=pbf`, see [`begin_with_pbf`]): its
+    /// features, what reading them said, and a note when some were left unread.
+    Decoded(Box<crate::Dataset>, crate::ReadReport, Option<String>),
+    /// The features couldn't be fetched at all: why.
+    Failed(String),
 }
 
 /// A feature collection being read page by page, sans I/O: it says which address to fetch next
@@ -2886,7 +3432,7 @@ pub enum Step {
 pub struct Pages {
     /// The first page's address.
     url: String,
-    /// The first page, without its features.
+    /// The first page, without its features (null until a page is read).
     doc: serde_json::Value,
     /// The features read, each its JSON text as the server wrote it: read into values, a
     /// feature's every coordinate would be one, several times the text's size (#830).
@@ -2897,14 +3443,30 @@ pub struct Pages {
     next: String,
     from: String,
     phase: Phase,
+    /// The protocol buffer pages read, as one layer, and what reading them said.
+    decoded: Option<(crate::Dataset, crate::ReadReport, crate::esripbf::Losses)>,
+    /// The memory those pages take, in bytes, and the most they may ([`max_decoded_bytes`]).
+    decoded_bytes: usize,
+    decoded_budget: usize,
+    /// Why the layer's first protocol buffer page couldn't be read, when it is read in GeoJSON
+    /// pages instead: said in the note it ends with.
+    pbf_failed: Option<String>,
+    /// How an ArcGIS layer's description says it is drawn (its `drawingInfo`, an object), or what
+    /// says why it couldn't be read, until taken ([`Pages::take_drawing_info`]).
+    drawing_info: Option<Result<serde_json::Value, String>>,
 }
 
 /// What the answer being fetched is.
 #[derive(Debug)]
 enum Phase {
-    /// An ArcGIS layer's description, which says whether it can be read in pages; `first` is the
-    /// first page as it came, kept for when it can't.
-    Describe { first: Vec<u8> },
+    /// An ArcGIS layer's description, fetched before its first page: it says whether the layer
+    /// can be read in pages, and how long they may be. `pbf`: in protocol buffer pages when it
+    /// lists them.
+    Describe { pbf: bool },
+    /// The address asked for, as it is: the first page. `paging`: how the ArcGIS layer it queries
+    /// is read in pages when this one is cut off (its description named no page size RustGIS
+    /// asks for, so the pages are as long as this one).
+    First { paging: Option<ArcgisPaging> },
     /// A WFS hits response, used when its GeoJSON gives no next link.
     WfsHits,
     /// WFS offsets count returned rows, while ids prevent overlapping pages adding duplicates.
@@ -2921,8 +3483,19 @@ enum Phase {
     Linked { total: Option<u64> },
     /// An ArcGIS page, `size` long from an offset, in `order`. `start` is the first such page's
     /// first feature (a server that ignores the offset sends it again), once it is read; until
-    /// then `first` keeps the first page as it came, to fall back on.
-    Offsets { size: usize, order: Option<String>, start: Option<serde_json::Value>, first: Option<Vec<u8>> },
+    /// then `first` keeps the first page as it came, to fall back on (none: the address asked
+    /// for is fetched as it is instead). `pbf`: the pages are asked for as protocol buffers.
+    /// `smaller` counts failed page requests retried at a smaller size, for the final notice.
+    /// `fallback_size` lets a format fallback try the original size before shrinking anew.
+    Offsets {
+        size: usize,
+        order: Option<String>,
+        start: Option<serde_json::Value>,
+        first: Option<Vec<u8>>,
+        pbf: bool,
+        smaller: usize,
+        fallback_size: usize,
+    },
 }
 
 /// A feature collection page's members other than its features (an object), and its features
@@ -2983,33 +3556,102 @@ fn first_value(features: &[Box<RawValue>]) -> Option<serde_json::Value> {
     serde_json::from_str(features.first()?.get()).ok()
 }
 
-/// Starts reading a feature collection page by page from its first page (`first`, from `url`), up
-/// to `max` features. An OGC API or WFS page leads to the next by its `next` link. A WFS
-/// request without a next link uses a hits count and STARTINDEX pages (WFS 2.0). An ArcGIS
-/// query that stopped at the server's record limit (`exceededTransferLimit`) is read again in
-/// pages (`resultOffset`, `resultRecordCount`, in the order of its object ids) when the layer's
-/// description says it can be (fetched first: `advancedQueryCapabilities.supportsPagination`):
-/// from the start, since the first page, asked for in no order, may not be the paged order's. The pages' features end up in one collection,
-/// with the first page's other members and without its paging ones. A first page that leads
-/// nowhere is done at once, unchanged (and [`partial_note`] says what it holds). Legacy WFS
-/// without links warns when its requested MAXFEATURES limit is reached.
-pub fn read_pages(url: &str, first: Vec<u8>, max: usize) -> Step {
+/// What tells a protocol buffer page from another, to find a page sent again: its first feature's
+/// object id, or else (no id, or an empty one) its fingerprint, taken from the page as it was sent
+/// (ids are numbered within each page, two pages may start with the same row, and a page sent
+/// again may be cut shorter by the limit).
+fn first_mark(page: &crate::esripbf::Page) -> Option<serde_json::Value> {
+    let f = page.dataset.features.first()?;
+    let id = page
+        .object_id_field
+        .and_then(|i| f.attrs.get(i))
+        .filter(|id| **id != crate::Value::Null)
+        .and_then(|id| serde_json::to_value(id).ok());
+    id.or_else(|| Some(serde_json::Value::String(format!("{:016x}", page.fingerprint))))
+}
+
+/// Starts reading a service's features at `url`, up to `max`, before anything is fetched.
+///
+/// An ArcGIS layer's query (one that doesn't ask for a window of its own: `resultOffset`,
+/// `resultRecordCount`) fetches the layer's description first. When it says the layer can be read
+/// in pages (`advancedQueryCapabilities.supportsPagination`) of a size it names
+/// (`maxRecordCount`), the layer is read in pages (`resultOffset`, `resultRecordCount`) in the
+/// order of its object ids from the start, so a layer past its record limit isn't read once in no
+/// order and again in pages. Otherwise, or when the paging fails before a page is read, the query
+/// is fetched as it is; a description naming no page size pages it, when it is cut off
+/// (`exceededTransferLimit`), in pages as long as its answer.
+///
+/// Any other address is fetched as it is. An OGC API or WFS page leads to the next by its `next`
+/// link. A WFS request without a next link uses a hits count and STARTINDEX pages (WFS 2.0).
+/// Legacy WFS without links warns when its requested MAXFEATURES limit is reached.
+///
+/// The pages' features end up in one collection, with the first page's other members and
+/// without its paging ones. A first page that leads nowhere is done at once, unchanged (and
+/// [`partial_note`] says what it holds).
+pub fn begin(url: &str, max: usize) -> Step {
+    start(url, max, false)
+}
+
+/// Like [`begin`], but an ArcGIS layer whose description lists protocol buffers among its query
+/// formats (`supportedQueryFormats`) is read in `f=pbf` pages, which end in [`Step::Decoded`]. When
+/// its first page can't be fetched or read as one, the layer is read in GeoJSON pages instead. A
+/// layer whose description names no page size is read in GeoJSON, as [`begin`] reads it: its pages are as
+/// long as its first answer, asked for as it is.
+pub fn begin_with_pbf(url: &str, max: usize) -> Step {
+    start(url, max, true)
+}
+
+/// [`begin`], reading an ArcGIS layer in protocol buffer pages when `pbf` and it lists them.
+fn start(url: &str, max: usize, pbf: bool) -> Step {
+    // A query that asks for a window of its own is read as asked.
+    let paged = is_arcgis_query(url) && ["resultOffset", "resultRecordCount"].iter().all(|k| query_value(url, k).is_none());
+    let (next, phase) =
+        if paged { (arcgis_layer_url(url), Phase::Describe { pbf }) } else { (url.to_string(), Phase::First { paging: None }) };
+    Step::Fetch(Box::new(Pages {
+        url: url.to_string(),
+        doc: serde_json::Value::Null,
+        features: Vec::new(),
+        max,
+        seen: std::collections::HashSet::new(),
+        next,
+        from: url.to_string(),
+        phase,
+        decoded: None,
+        decoded_bytes: 0,
+        decoded_budget: max_decoded_bytes(),
+        pbf_failed: None,
+        // A query asking for a window of its own skips the description that says how it is drawn.
+        drawing_info: (is_arcgis_query(url) && !paged).then(|| Err(WINDOW_DRAWING.to_string())),
+    }))
+}
+
+/// Reads on from the first page (`first`, the answer to `url` as it is), as [`begin`] says;
+/// `paging`, how the ArcGIS layer it queries is read in pages when it is cut off.
+fn read_first(url: &str, first: Vec<u8>, max: usize, paging: Option<ArcgisPaging>) -> Step {
     let (head, tail) = edges(&first);
     let linked = head.contains("\"next\"") || tail.contains("\"next\"");
-    // A query that asks for a window of its own (`resultOffset`, `resultRecordCount`) is read as asked.
-    let limited = is_arcgis_query(url)
-        && ["resultOffset", "resultRecordCount"].iter().all(|k| query_value(url, k).is_none())
-        && (is_true(&head, "exceededTransferLimit") || is_true(&tail, "exceededTransferLimit"));
+    let limited = paging.is_some() && (is_true(&head, "exceededTransferLimit") || is_true(&tail, "exceededTransferLimit"));
     let wfs = is_wfs_query(url);
     let legacy_wfs = is_legacy_wfs_query(url);
     if !(linked || limited || wfs || legacy_wfs) {
         return Step::Done(first, None);
     }
-    let Ok(Some((doc, features))) = split_page(&first) else { return Step::Done(first, None) };
+    let Ok(Some((doc, mut features))) = split_page(&first) else { return Step::Done(first, None) };
     let (next, phase) = if linked && let Some(next) = next_page(url, &doc) {
         (next, Phase::Linked { total: doc.get("totalFeatures").and_then(serde_json::Value::as_u64) })
-    } else if limited && exceeded(&doc) {
-        (arcgis_layer_url(url), Phase::Describe { first })
+    } else if limited
+        && exceeded(&doc)
+        && let Some(paging) = paging
+        && (paging.size.is_some() || !features.is_empty())
+    {
+        // Offsets count in one order: this page, asked for in none, may hold other features than
+        // the paged order's first, so the layer is read again from the start.
+        let size = paging.size.unwrap_or(features.len());
+        features.clear();
+        (
+            arcgis_page_url(url, 0, size, paging.order.as_deref()),
+            Phase::Offsets { size, order: paging.order, start: None, first: Some(first), pbf: false, smaller: 0, fallback_size: size },
+        )
     } else if wfs {
         (wfs_page_url(url, None, 0), Phase::WfsHits)
     } else {
@@ -3041,14 +3683,48 @@ pub fn read_pages(url: &str, first: Vec<u8>, max: usize) -> Step {
         next,
         from: url.to_string(),
         phase,
+        decoded: None,
+        decoded_bytes: 0,
+        decoded_budget: max_decoded_bytes(),
+        pbf_failed: None,
+        drawing_info: None,
     };
-    match pages.phase {
-        Phase::Linked { .. } | Phase::WfsHits => pages.advance(),
-        _ => Step::Fetch(Box::new(pages)),
-    }
+    pages.advance()
 }
 
+/// Longest a reader of [`Pages`] waits for an ArcGIS layer's description, read before its
+/// features ([`Pages::describing`]): one that hangs is given up on, and the layer's query is
+/// fetched as it is.
+pub const DESCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Most bytes a reader of [`Pages`] takes for an ArcGIS layer's description, which doesn't count
+/// against the features' budget: a few kilobytes as a rule, so one larger than this is given up
+/// on, and the layer's query fetched as it is.
+pub const DESCRIPTION_MAX: usize = 4 << 20;
+
 impl Pages {
+    /// Whether the answer to fetch now is an ArcGIS layer's description, read before its features.
+    pub fn describing(&self) -> bool {
+        matches!(self.phase, Phase::Describe { .. })
+    }
+
+    /// Leaves time for smaller-page retries within a blocking reader's total deadline.
+    /// A single-feature page cannot shrink, so it keeps the reader's remaining wait.
+    pub fn page_timeout(&self) -> Option<std::time::Duration> {
+        matches!(self.phase, Phase::Offsets { size, .. } if size > 1).then_some(std::time::Duration::from_secs(10))
+    }
+
+    /// How the ArcGIS layer being read says it is drawn: its description's `drawingInfo` (an
+    /// object), once the description is read, or a note saying why it couldn't be read (the
+    /// description failed, wasn't JSON, was the service's error or held a `drawingInfo` that isn't
+    /// an object; or the query asks for a window of its own, so none was asked for). Only the first
+    /// time it is asked for; none when there is nothing to say (no description, or one without a
+    /// `drawingInfo`). A reader takes it before fetching and after landing the description, before
+    /// the features are read.
+    pub fn take_drawing_info(&mut self) -> Option<Result<serde_json::Value, String>> {
+        self.drawing_info.take()
+    }
+
     /// The address to fetch now.
     pub fn next_url(&self) -> &str {
         &self.next
@@ -3062,16 +3738,59 @@ impl Pages {
 
     /// How many features have been read so far.
     pub fn read(&self) -> usize {
-        self.features.len()
+        self.features.len() + self.decoded.as_ref().map_or(0, |(ds, ..)| ds.features.len())
     }
 
     /// Takes the answer to [`next_url`](Self::next_url) (or why it couldn't be fetched): the next
-    /// address to fetch, or the collection as read.
+    /// address to fetch, or the collection as read. A layer read in GeoJSON because its protocol
+    /// buffer pages couldn't be read says so in its note.
     pub fn land(mut self, answer: Result<Vec<u8>, String>) -> Step {
+        let Some(why) = self.pbf_failed.take() else { return self.land_page(answer) };
+        match self.land_page(answer) {
+            // Carried to the next page, whichever reading goes on with it.
+            Step::Fetch(mut pages) => {
+                pages.pbf_failed = Some(why);
+                Step::Fetch(pages)
+            }
+            Step::Done(bytes, note) => Step::Done(bytes, Some(read_in_geojson(&why, note))),
+            Step::Decoded(ds, report, note) => Step::Decoded(ds, report, Some(read_in_geojson(&why, note))),
+            step => step,
+        }
+    }
+
+    /// Identifies a failed query without exposing its token or unbounded server text.
+    fn page_failure(&self, error: &str) -> String {
+        let layer = crate::diagnostics::address_in_message(&arcgis_layer_url(&self.url));
+        let offset = query_value(&self.next, "resultOffset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(self.read());
+        let mut error = crate::diagnostics::redact(error);
+        crate::diagnostics::cut_with_ellipsis(&mut error, MAX_REASON);
+        format!("the page after feature {} couldn't be read ({error}); layer {layer}, offset {offset}; the rest aren't read", self.read())
+    }
+
+    /// Applies one answer, retrying only failures a smaller query can plausibly fix.
+    fn land_page(mut self, answer: Result<Vec<u8>, String>) -> Step {
         if matches!(self.phase, Phase::WfsHits) {
-            let matched = answer.ok().and_then(|b| wfs_matched(&b));
-            let Some(matched) = matched else {
-                return self.stop("the WFS total couldn't be read; the features received may be incomplete".into());
+            // Why the request failed is kept, so the notice says why completeness is unknown.
+            let matched = match answer {
+                Ok(b) => wfs_matched(&b).ok_or(None),
+                // An error holding an address isn't repeated: `redact` keeps its path, which can
+                // hold a key.
+                Err(e) => Err(Some(e).filter(|e| !e.contains("://"))),
+            };
+            let matched = match matched {
+                Ok(matched) => matched,
+                Err(why) => {
+                    // Without the credentials an address in the error may hold, and not all of a
+                    // long one.
+                    let why = why
+                        .map(|e| {
+                            let mut e = crate::diagnostics::redact(&e);
+                            crate::diagnostics::cut_with_ellipsis(&mut e, MAX_REASON);
+                            format!(" ({e})")
+                        })
+                        .unwrap_or_default();
+                    return self.stop(format!("the WFS total couldn't be read{why}; the features received may be incomplete"));
+                }
             };
             let offset = self.features.len();
             if offset > self.max {
@@ -3101,27 +3820,90 @@ impl Pages {
             };
             return self.advance();
         }
-        if let Phase::Describe { first } = &mut self.phase {
-            let first = std::mem::take(first);
-            let paging = answer.ok().and_then(|b| serde_json::from_slice(&b).ok()).and_then(|l| arcgis_paging(&l));
-            let Some(paging) = paging else { return Step::Done(first, None) };
-            let size = paging.size.unwrap_or(self.features.len());
-            if size == 0 {
-                return Step::Done(first, None);
+        if let Phase::Describe { pbf } = self.phase {
+            // Read once, whatever its size: the service's error may be as long as a description.
+            let read: Result<serde_json::Value, String> = answer.and_then(|b| {
+                let v: serde_json::Value = serde_json::from_slice(&b).map_err(|_| "not JSON".to_string())?;
+                match arcgis_error_text(&v) {
+                    Some(error) => Err(error),
+                    None if !v.is_object() => Err("not an object".to_string()),
+                    None => Ok(v),
+                }
+            });
+            let (mut layer, unread) = match read {
+                Ok(layer) => (Some(layer), None),
+                Err(why) => (None, Some(why)),
+            };
+            self.drawing_info = match (layer.as_mut().and_then(|l| l.as_object_mut()?.remove("drawingInfo")), unread) {
+                (_, Some(why)) => Some(Err(drawing_unread(&why))),
+                (Some(d), None) if d.is_object() => Some(Ok(d)),
+                (None | Some(serde_json::Value::Null), None) => None,
+                (Some(_), None) => Some(Err(drawing_unread("not an object"))),
+            };
+            let pbf = pbf && layer.as_ref().is_some_and(supports_pbf);
+            return match layer.as_ref().and_then(arcgis_paging) {
+                Some(ArcgisPaging { size: Some(size), order }) => {
+                    let page = arcgis_page_url(&self.url, 0, size, order.as_deref());
+                    self.next = if pbf { with_format(&page, "pbf") } else { page };
+                    self.phase = Phase::Offsets { size, order, start: None, first: None, pbf, smaller: 0, fallback_size: size };
+                    self.advance()
+                }
+                paging => self.ask_as_it_is(paging),
+            };
+        }
+        let arcgis = is_arcgis_query(&self.url);
+        let answer = if arcgis {
+            answer.and_then(|bytes| match arcgis_page_error(&bytes) {
+                Some(error) => Err(error),
+                None => Ok(bytes),
+            })
+        } else {
+            answer
+        };
+        let read = self.read();
+        if let Err(error) = &answer {
+            if smaller_page_may_help(error)
+                && let Phase::Offsets { size, order, pbf, smaller, .. } = &mut self.phase
+                && *size > 1
+            {
+                *size = (*size / 2).max(1);
+                let page = arcgis_page_url(&self.url, read, *size, order.as_deref());
+                self.from = self.next.clone();
+                self.next = if *pbf { with_format(&page, "pbf") } else { page };
+                *smaller += 1;
+                return self.advance();
             }
-            // Offsets count in one order: the first page, asked for in none, may hold other
-            // features than the paged order's first, so the layer is read again from the start.
-            self.features.clear();
-            self.next = arcgis_page_url(&self.url, 0, size, paging.order.as_deref());
-            self.from = self.url.clone();
-            self.phase = Phase::Offsets { size, order: paging.order, start: None, first: Some(first) };
-            return self.advance();
+            // A PBF refusal can be format-specific; try GeoJSON with the same clause first.
+            if arcgis
+                && page_error_status(error) == Some(400)
+                && !matches!(self.phase, Phase::Offsets { pbf: true, .. })
+                && query_value(&self.url, "where").is_some_and(|w| !w.eq_ignore_ascii_case("1%3D1") && w != "1=1")
+            {
+                return Step::Failed(self.page_failure(&format!("the server rejected the query with its where clause: {error}")));
+            }
+        }
+        if matches!(self.phase, Phase::Offsets { pbf: true, .. }) {
+            return self.land_pbf(answer);
+        }
+        if let Phase::First { paging } = &mut self.phase {
+            let paging = paging.take();
+            return match answer {
+                Ok(first) => read_first(&self.url, first, self.max, paging),
+                Err(e) => Step::Failed(if arcgis { self.page_failure(&e) } else { e }),
+            };
         }
         let read = self.features.len();
         let (page, mut more) = match answer.and_then(|b| split_page(&b)) {
             Ok(Some(page)) => page,
             Ok(None) => return self.stop(format!("the page after feature {read} isn't a feature collection; the rest aren't read")),
-            Err(e) => return self.stop(format!("the page after feature {read} couldn't be read ({e}); the rest aren't read")),
+            Err(e) => {
+                let why = if arcgis {
+                    self.page_failure(&e)
+                } else {
+                    format!("the page after feature {read} couldn't be read ({e}); the rest aren't read")
+                };
+                return self.stop(why);
+            }
         };
         let following = match &mut self.phase {
             Phase::WfsOffsets { matched, offset, size, ids, unidentified, overlap, duplicates } => {
@@ -3163,7 +3945,7 @@ impl Pages {
                 }
                 Some(wfs_page_url(&self.url, Some(*offset), *size))
             }
-            Phase::Offsets { size, order, start, first } => {
+            Phase::Offsets { size, order, start, first, .. } => {
                 // A server that doesn't honour `resultOffset` sends its first page again.
                 if start.is_some() && first_value(&more) == *start {
                     return self.stop("the server sent its first features again instead of the next ones; the rest aren't read".into());
@@ -3180,6 +3962,11 @@ impl Pages {
             }
             _ => next_page(&self.next, &page),
         };
+        // An ArcGIS layer read in pages from its description: the first page read gives the
+        // collection's other members.
+        if self.doc.is_null() {
+            self.doc = page;
+        }
         self.features.extend(more);
         if self.features.len() > self.max {
             return self.finish_at_max();
@@ -3209,24 +3996,151 @@ impl Pages {
         }
     }
 
+    /// Takes a protocol buffer page of an ArcGIS layer: its features joined to those read. A first
+    /// page that can't be fetched, or comes but can't be read as one, has the layer read in GeoJSON
+    /// pages instead (a server may list protocol buffers and fail them); a later one ends the read
+    /// with the pages read.
+    fn land_pbf(mut self, answer: Result<Vec<u8>, String>) -> Step {
+        let read = self.read();
+        // The features past the limit aren't read, so what they lost isn't counted.
+        let room = self.max.saturating_sub(read);
+        let Phase::Offsets { size, order, pbf, fallback_size, .. } = &mut self.phase else { return self.finish(None) };
+        let page = answer.and_then(|bytes| crate::esripbf::read_page_within(&bytes, "query", room).map_err(|e| e.to_string()));
+        let page = match page {
+            Ok(page) => page,
+            Err(e) if self.decoded.is_none() => {
+                *pbf = false;
+                // A format-specific failure needn't force GeoJSON into single-feature pages.
+                *size = *fallback_size;
+                // Said in a notice: without the credentials an address or a service's own error
+                // message may hold, and not all of a long one.
+                let mut why = crate::diagnostics::redact(&e);
+                crate::diagnostics::cut_with_ellipsis(&mut why, MAX_REASON);
+                self.pbf_failed = Some(why);
+                // A query that asked for protocol buffers itself is read in GeoJSON too.
+                if query_value(&self.url, "f").is_some_and(|f| f.eq_ignore_ascii_case("pbf")) {
+                    self.url = with_format(&self.url, "geojson");
+                }
+                self.next = arcgis_page_url(&self.url, 0, *size, order.as_deref());
+                return self.advance();
+            }
+            Err(e) => {
+                let why = self.page_failure(&e);
+                return self.stop(why);
+            }
+        };
+        self.join_page(page)
+    }
+
+    /// Joins a protocol buffer page to those read, and asks for the next one.
+    fn join_page(mut self, page: crate::esripbf::Page) -> Step {
+        let read = self.read();
+        let Phase::Offsets { size, order, start, .. } = &mut self.phase else { return self.finish(None) };
+        // A server that doesn't honour `resultOffset` sends its first page again.
+        let mark = first_mark(&page);
+        if start.is_some() && mark == *start {
+            return self.stop("the server sent its first features again instead of the next ones; the rest aren't read".into());
+        }
+        if start.is_none() {
+            *start = mark;
+        }
+        // The first page is kept whatever it takes (the reader bounds a page); a later one that
+        // would take the layer past its memory budget isn't joined.
+        let bytes = self.decoded_bytes.saturating_add(page.memory);
+        if self.decoded.is_some() && bytes > self.decoded_budget {
+            let mb = self.decoded_budget >> 20;
+            return self.stop(format!("the page after feature {read} would take the layer past {mb} MB of memory; the rest aren't read"));
+        }
+        self.decoded_bytes = bytes;
+        let cut = page.left_out > 0;
+        let returned = page.dataset.features.len();
+        let following =
+            page.exceeded_transfer_limit.then(|| with_format(&arcgis_page_url(&self.url, read + returned, *size, order.as_deref()), "pbf"));
+        // What the features lost is summed over the pages, and said once (in `finish`); the
+        // page's other messages, about its fields and system, once each.
+        let report = page.report;
+        match &mut self.decoded {
+            None => self.decoded = Some((page.dataset, report, page.losses)),
+            Some((ds, joined, losses)) => {
+                // By name and type: the first page's aliases are kept.
+                let same = |a: &crate::Field, b: &crate::Field| a.name == b.name && a.ty == b.ty;
+                if ds.fields.len() != page.dataset.fields.len() || !ds.fields.iter().zip(&page.dataset.fields).all(|(a, b)| same(a, b)) {
+                    return self.stop(format!("the page after feature {read} has other fields than the first; the rest aren't read"));
+                }
+                // Each page's positions are in its own system, and its geometries of its own type;
+                // a page that doesn't say one is joined.
+                let other_crs = ds.crs.is_some() && page.dataset.crs.is_some() && ds.crs != page.dataset.crs;
+                let none = crate::GeometryType::None;
+                let other_type =
+                    ds.geometry_type != none && page.dataset.geometry_type != none && ds.geometry_type != page.dataset.geometry_type;
+                if other_crs || other_type {
+                    let what = if other_crs { "coordinate system" } else { "geometry type" };
+                    return self.stop(format!("the page after feature {read} has another {what} than the first; the rest aren't read"));
+                }
+                // A page without features may not say its geometry type.
+                if ds.geometry_type == none {
+                    ds.geometry_type = page.dataset.geometry_type;
+                }
+                ds.zm_dropped |= page.dataset.zm_dropped;
+                ds.crs_incomplete |= page.dataset.crs_incomplete;
+                for f in page.dataset.features.into_vec() {
+                    ds.push_next(f.geometry, f.attrs);
+                }
+                joined.skipped = joined.skipped.saturating_add(report.skipped);
+                for m in report.messages {
+                    if !joined.messages.contains(&m) {
+                        joined.messages.push(m);
+                    }
+                }
+                losses.add(&page.losses);
+            }
+        }
+        if cut || self.read() > self.max {
+            return self.finish_at_max();
+        }
+        match following {
+            Some(n) => {
+                self.from = std::mem::replace(&mut self.next, n);
+                self.advance()
+            }
+            None => self.finish(None),
+        }
+    }
+
     /// Done early, with a note; or, when an ArcGIS layer's paged reading stops before any of its
-    /// features are read, with the first page as it came (which says it was cut off).
+    /// features are read, with the first page as it came (which says it was cut off), or the
+    /// query fetched as it is when none was.
     fn stop(mut self, note: String) -> Step {
         let note = match self.phase {
             Phase::WfsOffsets { matched, .. } => format!("{} of {matched} WFS features read: {note}", self.features.len()),
             Phase::WfsHits => format!("{} WFS features read: {note}", self.features.len()),
             _ => note,
         };
-        if let Phase::Offsets { first: Some(first), .. } = &mut self.phase {
-            return Step::Done(std::mem::take(first), None);
+        if let Phase::Offsets { first, start: None, .. } = &mut self.phase {
+            return match first.take() {
+                Some(first) => Step::Done(first, None),
+                None => self.ask_as_it_is(None),
+            };
         }
         self.finish(Some(note))
+    }
+
+    /// The query fetched as it is, from nothing read: an ArcGIS layer that can't be read in pages
+    /// from its description (`paging`: in pages as long as its answer, when it is cut off).
+    fn ask_as_it_is(mut self, paging: Option<ArcgisPaging>) -> Step {
+        self.features.clear();
+        self.decoded = None;
+        self.doc = serde_json::Value::Null;
+        self.next = self.url.clone();
+        self.from = self.url.clone();
+        self.phase = Phase::First { paging };
+        Step::Fetch(Box::new(self))
     }
 
     /// The next page fetched, unless the features are all read that may be or the pages lead
     /// back to one already read.
     fn advance(mut self) -> Step {
-        if self.features.len() > self.max || (self.features.len() == self.max && !matches!(self.phase, Phase::WfsHits)) {
+        if self.read() > self.max || (self.read() == self.max && !matches!(self.phase, Phase::WfsHits)) {
             return self.finish_at_max();
         }
         if !self.seen.insert(self.next.clone()) {
@@ -3239,12 +4153,30 @@ impl Pages {
     fn finish_at_max(mut self) -> Step {
         let max = self.max;
         self.features.truncate(max);
-        let note = format!("the first {max} features are read; the rest aren't");
-        if matches!(self.phase, Phase::WfsHits | Phase::WfsOffsets { .. }) { self.stop(note) } else { self.finish(Some(note)) }
+        if let Some((ds, ..)) = &mut self.decoded {
+            ds.features.truncate(max);
+        }
+        // Not through `stop`, whose "N WFS features read:" would say the count twice.
+        let note = match self.phase {
+            Phase::WfsOffsets { matched, .. } => format!("the first {max} of {matched} WFS features are read; the rest aren't"),
+            _ => format!("the first {max} features are read; the rest aren't"),
+        };
+        self.finish(Some(note))
     }
 
     /// The pages' features in the first page's collection, without its paging members.
     fn finish(mut self, note: Option<String>) -> Step {
+        let note = if let Phase::Offsets { smaller, .. } = &self.phase
+            && *smaller > 0
+        {
+            let said = format!("{smaller} failed page request(s) retried with smaller pages");
+            Some(match note {
+                Some(note) => format!("{note}; {said}"),
+                None => said,
+            })
+        } else {
+            note
+        };
         let note = if let Phase::WfsOffsets { duplicates, .. } = &self.phase
             && *duplicates > 0
         {
@@ -3256,6 +4188,14 @@ impl Pages {
         } else {
             note
         };
+        if let Some((ds, mut report, losses)) = self.decoded.take() {
+            report.messages.extend(losses.messages());
+            return Step::Decoded(Box::new(ds), report, note);
+        }
+        // Done before a page was read (a limit of none).
+        if self.doc.is_null() {
+            self.doc = serde_json::json!({"type": "FeatureCollection"});
+        }
         if let Some(members) = self.doc.as_object_mut() {
             for paging in ["links", "numberMatched", "numberReturned", "exceededTransferLimit"] {
                 members.remove(paging);
@@ -3538,8 +4478,97 @@ pub fn fix_axes(bytes: &[u8], bounds: Option<[f64; 4]>) -> Option<Vec<u8>> {
 mod fixtures;
 
 #[cfg(test)]
+#[path = "ogc_document_tests.rs"]
+mod document_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_and_collections_preserve_only_the_explicit_login() {
+        let binding = "0123456789abcdef";
+        let origin = "https://maps.example.org";
+        for (url, kind) in [
+            ("https://MAPS.example.org:443/wms?map=x", None),
+            ("https://maps.example.org/ogc/features?f=html&key=a%2Fb", Some("ogcapi")),
+            ("https://maps.example.org/rest/services/P/FeatureServer", Some("arcgis")),
+            ("https://maps.example.org/capabilities.xml", None),
+        ] {
+            let address = crate::login_address::bind(binding, origin, url).unwrap();
+            let requested = capabilities_url(&address, kind);
+            let bound = crate::login_address::parse(&requested).unwrap().unwrap();
+            assert_eq!((bound.binding, bound.origin), (binding, origin));
+            assert_eq!(bound.url, capabilities_url(url, kind));
+            assert_eq!(capabilities_url(&requested, kind), requested);
+            assert!(crate::login_address::parse(&capabilities_url(url, kind)).unwrap().is_none());
+        }
+        let address = crate::login_address::bind(binding, origin, "https://maps.example.org/api?key=a%2Fb").unwrap();
+        for href in ["/collections", "https://MAPS.example.org:443/collections"] {
+            let links = serde_json::json!([{"rel":"data","type":"application/json","href":href}]);
+            let (next, withheld) = collections_link(&address, links.as_array().unwrap()).unwrap();
+            assert_eq!(crate::login_address::parse(&next).unwrap().unwrap().binding, binding);
+            assert!(withheld, "the advertised destination omits the original key");
+        }
+        let links = serde_json::json!([{"rel":"data","type":"application/json","href":"https://other.example.org/collections"}]);
+        assert_eq!(collections_link(&address, links.as_array().unwrap()).unwrap(), ("https://other.example.org/collections".into(), true));
+    }
+
+    #[test]
+    fn linked_pages_drop_the_login_after_leaving_its_origin() {
+        let first_url =
+            crate::login_address::bind("0123456789abcdef", "https://maps.example.org", "https://maps.example.org/api/items").unwrap();
+        let page = |id, href| {
+            serde_json::to_vec(&serde_json::json!({
+                "type":"FeatureCollection", "features":[{"id":id}],
+                "links":[{"rel":"next","type":"application/geo+json","href":href}]
+            }))
+            .unwrap()
+        };
+        let Step::Fetch(start) = begin(&first_url, 100) else {
+            panic!("the first page must be fetched");
+        };
+        let Step::Fetch(pages) = start.land(Ok(page(1, "https://MAPS.example.org:443/api/items?page=2"))) else {
+            panic!("the second page must be fetched");
+        };
+        assert_eq!(pages.referrer(), first_url);
+        let second_url = pages.next_url().to_string();
+        let bound = crate::login_address::parse(&second_url).unwrap().unwrap();
+        assert_eq!(bound.binding, "0123456789abcdef");
+        assert_eq!(bound.url, "https://MAPS.example.org:443/api/items?page=2");
+        let Step::Fetch(pages) = pages.land(Ok(page(2, "https://other.example.org/items?page=3"))) else {
+            panic!("the foreign page must be fetched anonymously");
+        };
+        assert_eq!(pages.referrer(), second_url);
+        assert_eq!(pages.next_url(), "https://other.example.org/items?page=3");
+        let Step::Fetch(pages) = pages.land(Ok(page(3, "https://maps.example.org/api/items?page=4"))) else {
+            panic!("the returning page must remain anonymous");
+        };
+        assert_eq!(pages.next_url(), "https://maps.example.org/api/items?page=4");
+        assert!(crate::login_address::parse(pages.next_url()).unwrap().is_none());
+        assert_eq!(
+            resolve(&first_url, "/api/items?page=2").unwrap(),
+            crate::login_address::bind("0123456789abcdef", "https://maps.example.org", "https://maps.example.org/api/items?page=2")
+                .unwrap()
+        );
+        assert_eq!(resolve("https://maps.example.org/api", &first_url).unwrap(), "https://maps.example.org/api/items");
+    }
+
+    /// Reads as [`super::join_pages`] does, the address asked for answered with `first` (once) and
+    /// every other with `get`.
+    fn join_pages(
+        url: &str,
+        first: Vec<u8>,
+        max: usize,
+        mut get: impl FnMut(&str) -> Result<Vec<u8>, String>,
+    ) -> (Vec<u8>, Option<String>) {
+        let mut first = Some(first);
+        super::join_pages(url, max, |u| match first.take_if(|_| u == url) {
+            Some(first) => Ok(first),
+            None => get(u),
+        })
+        .unwrap()
+    }
 
     /// A layer's box names its system otherwise than its list (`EPSG:3035` for the URN): found by
     /// code, it still says the service writes LAEA Europe north first.
@@ -3548,7 +4577,7 @@ mod tests {
         let xml = r#"<Layer><CRS>urn:ogc:def:crs:EPSG::3035</CRS><BoundingBox CRS="EPSG:3035" minx="2700000" miny="4000000" maxx="3600000" maxy="4700000"/></Layer>"#;
         let doc = roxmltree::Document::parse(xml).unwrap();
         let listed = wms_candidates(&["urn:ogc:def:crs:EPSG::3035".to_string()]);
-        let (_, w) = wms_native(&doc.root_element(), &listed, true, Some([6.0, 47.0, 15.0, 55.0]), false).unwrap();
+        let (_, w) = wms_native(&doc.root_element(), &listed, true, Some([6.0, 47.0, 15.0, 55.0]), false, &mut LayerBoxes::new()).unwrap();
         assert_eq!((w.epsg, w.grid), (3035, warp::Grid::Map { lat_first: true }));
     }
 
@@ -3560,7 +4589,8 @@ mod tests {
         let order = |xml: &str, crs: &str, v13: bool| {
             let doc = roxmltree::Document::parse(xml).unwrap();
             let listed = wms_candidates(&[crs.to_string()]);
-            let (_, w) = wms_native(&doc.root_element(), &listed, v13, Some([10.0, 47.5, 13.0, 50.5]), false).unwrap();
+            let (_, w) =
+                wms_native(&doc.root_element(), &listed, v13, Some([10.0, 47.5, 13.0, 50.5]), false, &mut LayerBoxes::new()).unwrap();
             w.grid
         };
         let gk4 = "<Layer><CRS>EPSG:31468</CRS></Layer>";
@@ -3752,7 +4782,26 @@ mod tests {
         assert_eq!(resolve("https://x.org", "a/items").as_deref(), Some("https://x.org/a/items"));
         assert_eq!(resolve("http://x.org/c", "//y.org/a").as_deref(), Some("http://y.org/a"));
         assert_eq!(resolve("https://x.org/c", "https://y.org/a").as_deref(), Some("https://y.org/a"));
-        for bad in ["file:///etc/passwd", "httpfoo://x/a", "javascript:alert(1)", ""] {
+        assert_eq!(
+            resolve("https://x.org/cgi-bin/mapserv?SERVICE=WMS&REQUEST=GetCapabilities#old", "?map=advertised").as_deref(),
+            Some("https://x.org/cgi-bin/mapserv?map=advertised")
+        );
+        assert_eq!(resolve("https://x.org/folder/c", "path/part:detail").as_deref(), Some("https://x.org/folder/path/part:detail"));
+        assert_eq!(resolve("https://x.org/folder/c", "?key=value:detail").as_deref(), Some("https://x.org/folder/c?key=value:detail"));
+        for (from, href, expected) in [
+            ("https://x.org/cgi-bin/mapserv#old", "#frag", "https://x.org/cgi-bin/mapserv#frag"),
+            ("https://x.org/cgi-bin/mapserv?map=kept#old", "#frag", "https://x.org/cgi-bin/mapserv?map=kept#frag"),
+            ("https://x.org/cgi-bin/mapserv?map=kept#old", "#", "https://x.org/cgi-bin/mapserv?map=kept#"),
+            (
+                "https://x.org/cgi-bin/mapserv?old=discard#old",
+                "?upstream=https://data.example/tiles",
+                "https://x.org/cgi-bin/mapserv?upstream=https://data.example/tiles",
+            ),
+        ] {
+            assert_eq!(resolve(from, href).as_deref(), Some(expected), "{href}");
+        }
+        for bad in ["file:///etc/passwd", "file:/etc/passwd", "mailto:x", "CuStOm+v1.0:payload", "httpfoo://x/a", "javascript:alert(1)", ""]
+        {
             assert_eq!(resolve("https://x.org/c", bad), None, "{bad}");
         }
         assert!(is_web("HTTPS://x.org") && !is_web("httpfoo:x") && !is_web("http:/x"));
@@ -4285,7 +5334,17 @@ mod tests {
         {
             let (bytes, note) = join_pages(url, first.to_vec(), 100, |_| answer.clone());
             assert_eq!(count(&bytes), 2);
-            assert!(note.unwrap().contains("incomplete"));
+            let note = note.unwrap();
+            assert!(note.contains("incomplete"));
+            // The failed request's reason is kept.
+            assert_eq!(note.contains("(timeout)"), answer.is_err(), "{note}");
+        }
+        // A credential in the failed request's address isn't repeated in the notice.
+        {
+            let failed = Err::<Vec<u8>, String>("error sending request for url (https://x.test/wfs?token=abc123)".to_string());
+            let (_, note) = join_pages(url, first.to_vec(), 100, |_| failed.clone());
+            let note = note.unwrap();
+            assert!(note.contains("incomplete") && !note.contains("abc123"), "{note}");
         }
         for last in [
             Err("timeout".into()),
@@ -4309,10 +5368,14 @@ mod tests {
             if calls == 1 { Ok(hits.to_vec()) } else { Ok(br#"{"features":[{"id":3},{"id":4}]}"#.to_vec()) }
         });
         assert_eq!(count(&bytes), 3);
-        assert!(note.unwrap().contains("3 of 4 WFS features read"));
+        let note = note.unwrap();
+        assert!(note.contains("the first 3 of 4 WFS features are read"), "{note}");
+        assert!(!note.contains("WFS features read:"), "{note}");
         let (bytes, note) = join_pages(url, first.to_vec(), 1, |_| panic!("limit checked before hits"));
         assert_eq!(count(&bytes), 1);
-        assert!(note.unwrap().contains("first 1"));
+        let note = note.unwrap();
+        assert!(note.contains("first 1"), "{note}");
+        assert!(!note.contains("WFS features read:"), "{note}");
         for suffix in ["&STARTINDEX=0", "&RESULTTYPE=hits"] {
             let (bytes, note) =
                 join_pages(&format!("{url}{suffix}"), first.to_vec(), 100, |_| panic!("explicit request must stay unchanged"));
@@ -4421,11 +5484,320 @@ mod tests {
         }
     }
 
-    /// An ArcGIS layer past its record limit: read again from the start in pages of the layer's
-    /// `maxRecordCount` ordered by its object ids (its first page, asked for in no order, may hold
-    /// other features than the ordered first: Hawaii's zoning did), each from where the last
-    /// stopped, until a page no longer says it was cut off. A layer that can't be paged, or whose
-    /// paging fails before a page is read, comes back as it was (with its note).
+    /// An ArcGIS layer whose description lists protocol buffers is read in `f=pbf` pages, in the
+    /// order of its object ids, into one layer (#1326); [`begin`] keeps reading it in GeoJSON. A
+    /// first page that can't be fetched, or comes but can't be read as one, has the layer read in
+    /// GeoJSON pages; a later one that fails, a server that
+    /// sends its first page again, a page of other fields, coordinate system or geometry type and
+    /// the limit end the read with the pages read so far, and a note. What the pages' features lost is said once, summed.
+    #[test]
+    fn arcgis_pbf_pages_joined_when_the_layer_lists_them() {
+        use crate::esripbf::tests::{page as pbf, page_with_z as pbf_z};
+        let query = "https://x.org/arcgis/rest/services/P/FeatureServer/0/query?where=1%3D1&outFields=*&f=geojson&token=t";
+        let description = "https://x.org/arcgis/rest/services/P/FeatureServer/0?f=json&token=t";
+        let layer = br#"{"objectIdField": "OBJECTID", "maxRecordCount": 2, "supportedQueryFormats": "JSON, geoJSON, PBF",
+            "advancedQueryCapabilities": {"supportsPagination": true}}"#;
+        let offset = |u: &str| query_value(u, "resultOffset").and_then(|v| v.parse::<u64>().ok());
+        // Five features in pages of two, each cut off unless it reaches the last.
+        let pbf_page = |u: &str| offset(u).map(|o| pbf(&(o..(o + 2).min(5)).collect::<Vec<_>>(), o + 2 < 5, "OBJECTID"));
+        let json_page = |u: &str| {
+            let o = offset(u)?;
+            let features: Vec<_> = (o..(o + 2).min(5)).map(|i| serde_json::json!({"type": "Feature", "id": i, "properties": {}})).collect();
+            let mut p = serde_json::json!({"type": "FeatureCollection", "features": features});
+            if o + 2 < 5 {
+                p["properties"] = serde_json::json!({"exceededTransferLimit": true});
+            }
+            serde_json::to_vec(&p).ok()
+        };
+        // Reads to the end, answering by address and keeping the addresses asked for.
+        let run = |pbf_reads: bool, max: usize, answer: &dyn Fn(&str) -> Result<Vec<u8>, String>| {
+            let mut asked = Vec::new();
+            let mut step = if pbf_reads { begin_with_pbf(query, max) } else { begin(query, max) };
+            loop {
+                match step {
+                    Step::Fetch(pages) => {
+                        asked.push(pages.next_url().to_string());
+                        let a = if pages.next_url() == description { Ok(layer.to_vec()) } else { answer(pages.next_url()) };
+                        step = (*pages).land(a);
+                    }
+                    other => return (other, asked),
+                }
+            }
+        };
+        let ids = |ds: &crate::Dataset| -> Vec<f64> { ds.features.iter().filter_map(|f| f.attrs.first()?.as_f64()).collect() };
+        let pbf_server = |u: &str| {
+            if query_value(u, "f") == Some("pbf") { pbf_page(u).ok_or_else(|| "404".to_string()) } else { Err("not asked".into()) }
+        };
+
+        // The pages as protocol buffers, from offset 0, into one layer.
+        let (step, asked) = run(true, 100, &pbf_server);
+        let Step::Decoded(ds, report, note) = step else { panic!("{step:?}") };
+        assert_eq!((ids(&ds), note, report.messages.len()), (vec![0.0, 1.0, 2.0, 3.0, 4.0], None, 0));
+        assert_eq!(ds.features.iter().map(|f| f.id).collect::<Vec<_>>(), [1, 2, 3, 4, 5], "numbered on");
+        assert_eq!(
+            asked[1],
+            format!("{}&f=pbf", query.replace("&f=geojson", "") + "&resultOffset=0&resultRecordCount=2&orderByFields=OBJECTID")
+        );
+        assert!(asked[2].contains("resultOffset=2&") && asked[3].contains("resultOffset=4&") && asked.len() == 4, "{asked:?}");
+        assert!(asked[1..].iter().all(|u| query_value(u, "f") == Some("pbf") && query_value(u, "token") == Some("t")), "{asked:?}");
+
+        // `begin` reads the same layer in GeoJSON.
+        let (step, asked) = run(false, 100, &|u: &str| json_page(u).ok_or_else(|| "404".to_string()));
+        assert!(matches!(step, Step::Done(_, None)), "{step:?}");
+        assert!(asked[1..].iter().all(|u| query_value(u, "f") == Some("geojson")), "{asked:?}");
+
+        // A first page refused as a protocol buffer: GeoJSON pages from the start.
+        let (step, asked) = run(true, 100, &|u: &str| {
+            if query_value(u, "f") == Some("pbf") {
+                Ok(br#"{"error": {"code": 400}}"#.to_vec())
+            } else {
+                json_page(u).ok_or_else(|| "404".to_string())
+            }
+        });
+        let Step::Done(joined, Some(note)) = step else { panic!("{step:?}") };
+        assert!(note.starts_with("its protocol buffer pages couldn't be read (") && note.ends_with("so it is read in GeoJSON"), "{note}");
+        let v: serde_json::Value = serde_json::from_slice(&joined).unwrap();
+        assert_eq!(v["features"].as_array().map(Vec::len), Some(5));
+        assert_eq!(asked.len(), 5, "the description, the refused page, then three in GeoJSON: {asked:?}");
+        assert!(asked[2].contains("resultOffset=0&") && query_value(&asked[2], "f") == Some("geojson"), "{asked:?}");
+
+        // A query that asks for protocol buffers itself is read in GeoJSON pages, when its first
+        // page can't be read as one.
+        let pbf_query = query.replace("f=geojson", "f=pbf");
+        let mut asked = Vec::new();
+        let mut step = begin_with_pbf(&pbf_query, 100);
+        while let Step::Fetch(pages) = step {
+            let u = pages.next_url().to_string();
+            let a = if u == description {
+                Ok(layer.to_vec())
+            } else if query_value(&u, "f") == Some("pbf") {
+                Ok(br#"{"error": {"code": 400}}"#.to_vec())
+            } else {
+                json_page(&u).ok_or_else(|| "404".to_string())
+            };
+            asked.push(u);
+            step = (*pages).land(a);
+        }
+        let Step::Done(joined, Some(note)) = step else { panic!("{step:?}") };
+        assert!(note.starts_with("its protocol buffer pages couldn't be read (") && note.ends_with("so it is read in GeoJSON"), "{note}");
+        let v: serde_json::Value = serde_json::from_slice(&joined).unwrap();
+        assert_eq!(v["features"].as_array().map(Vec::len), Some(5));
+        assert!(asked.len() == 5 && asked[2..].iter().all(|u| query_value(u, "f") == Some("geojson")), "{asked:?}");
+
+        // A first page that can't be fetched: GeoJSON pages from the start too, the whole layer
+        // (the query as it is would hold its first page only).
+        let (step, asked) = run(true, 100, &|u: &str| {
+            if query_value(u, "f") == Some("pbf") { Err("http status: 500".into()) } else { json_page(u).ok_or_else(|| "404".to_string()) }
+        });
+        let Step::Done(joined, Some(note)) = step else { panic!("{step:?}") };
+        assert!(note.starts_with("its protocol buffer pages couldn't be read (") && note.contains("so it is read in GeoJSON"), "{note}");
+        let v: serde_json::Value = serde_json::from_slice(&joined).unwrap();
+        assert_eq!(v["features"].as_array().map(Vec::len), Some(5));
+        assert!(asked.len() == 6 && asked[3..].iter().all(|u| query_value(u, "f") == Some("geojson")), "{asked:?}");
+        assert!(asked[3..].iter().all(|u| query_value(u, "resultRecordCount") == Some("2")), "{asked:?}");
+        assert!(!asked.iter().any(|u| u == query), "{asked:?}");
+        assert!(note.contains("(http status: 500)"), "{note}");
+        // A long reason is said cut.
+        let (step, _) = run(true, 100, &|u: &str| {
+            if query_value(u, "f") == Some("pbf") { Err("x".repeat(1000)) } else { json_page(u).ok_or_else(|| "404".to_string()) }
+        });
+        let Step::Done(_, Some(note)) = step else { panic!("{step:?}") };
+        assert!(note.len() < 300 && note.contains("x…)"), "{note}");
+        // A credential in the reason isn't said (an address's query isn't, nor what follows it).
+        let (step, _) = run(true, 100, &|u: &str| {
+            if query_value(u, "f") == Some("pbf") {
+                Err("timed out: https://x.org/q?token=hidden".into())
+            } else {
+                json_page(u).ok_or_else(|| "404".to_string())
+            }
+        });
+        let Step::Done(_, Some(note)) = step else { panic!("{step:?}") };
+        assert!(!note.contains("hidden") && note.contains("(timed out: https://x.org/q"), "{note}");
+
+        // A later page that fails: the pages read, said.
+        let (step, _) = run(true, 100, &|u: &str| if offset(u) == Some(2) { Err("http status: 500".into()) } else { pbf_server(u) });
+        let Step::Decoded(ds, _, Some(note)) = step else { panic!("{step:?}") };
+        assert_eq!(ids(&ds), [0.0, 1.0]);
+        assert!(note.contains("after feature 2 couldn't be read"), "{note}");
+
+        // A server that ignores the offset: its first page isn't read twice.
+        let (step, _) = run(true, 100, &|u: &str| pbf_server(&u.replace("resultOffset=2&", "resultOffset=0&")));
+        let Step::Decoded(ds, _, Some(note)) = step else { panic!("{step:?}") };
+        assert_eq!(ids(&ds), [0.0, 1.0]);
+        assert!(note.contains("first features again"), "{note}");
+
+        // A page of other fields isn't joined.
+        let (step, _) = run(true, 100, &|u: &str| {
+            if offset(u) == Some(2) { Ok(pbf(&[2, 3], true, "FID")) } else { pbf_server(u) }
+        });
+        let Step::Decoded(ds, _, Some(note)) = step else { panic!("{step:?}") };
+        assert_eq!(ds.features.len(), 2);
+        assert!(note.contains("other fields"), "{note}");
+
+        // The limit cuts it short, with a note.
+        let (step, _) = run(true, 3, &pbf_server);
+        let Step::Decoded(ds, _, Some(note)) = step else { panic!("{step:?}") };
+        assert_eq!(ids(&ds), [0.0, 1.0, 2.0]);
+        assert!(note.contains("first 3 features"), "{note}");
+        // A page cut at the limit: what the features left out lost isn't counted.
+        let z_server = |u: &str| -> Result<Vec<u8>, String> {
+            let o = offset(u).ok_or_else(|| "404".to_string())?;
+            Ok(pbf_z(&(o..(o + 2).min(5)).collect::<Vec<_>>(), o + 2 < 5, "OBJECTID"))
+        };
+        let (step, _) = run(true, 3, &z_server);
+        let Step::Decoded(ds, report, Some(note)) = step else { panic!("{step:?}") };
+        assert_eq!(ids(&ds), [0.0, 1.0, 2.0]);
+        assert!(note.contains("first 3 features"), "{note}");
+        assert_eq!(report.messages, [crate::zm_note(Some(3))]);
+
+        let fresh = || Pages {
+            url: query.into(),
+            doc: serde_json::Value::Null,
+            features: Vec::new(),
+            max: 100,
+            seen: std::collections::HashSet::new(),
+            next: String::new(),
+            from: String::new(),
+            phase: Phase::Offsets { size: 2, order: None, start: None, first: None, pbf: true, smaller: 0, fallback_size: 2 },
+            decoded: None,
+            decoded_bytes: 0,
+            decoded_budget: max_decoded_bytes(),
+            pbf_failed: None,
+            drawing_info: None,
+        };
+        // A page in another coordinate system, or of another geometry type, isn't joined; one
+        // that doesn't say its system is.
+        let page = |ids: &[u64], crs: Option<crate::raster::Crs>, geometry_type: crate::GeometryType| {
+            let mut page = crate::esripbf::read_page(&pbf(ids, true, "OBJECTID"), "query").unwrap();
+            page.dataset.crs = crs;
+            page.dataset.geometry_type = geometry_type;
+            page
+        };
+        let (lonlat, point) = (Some(crate::raster::Crs::LonLat), crate::GeometryType::Point);
+        for (crs, geometry_type, stopped) in [
+            (Some(crate::raster::Crs::WebMercator), point, Some("another coordinate system")),
+            (lonlat, crate::GeometryType::Polyline, Some("another geometry type")),
+            (None, point, None),
+            (lonlat, crate::GeometryType::None, None),
+        ] {
+            let Step::Fetch(first) = fresh().join_page(page(&[0, 1], lonlat, point)) else { panic!("the first page") };
+            match ((*first).join_page(page(&[2, 3], crs, geometry_type)), stopped) {
+                (Step::Decoded(ds, _, Some(note)), Some(what)) => {
+                    assert_eq!(ds.features.len(), 2);
+                    assert!(note.contains(what), "{note}");
+                }
+                (Step::Fetch(p), None) => assert_eq!(p.read(), 4),
+                (other, _) => panic!("{crs:?} {geometry_type:?}: {other:?}"),
+            }
+        }
+        // An empty object id doesn't mark a page: two pages that start with one are both read.
+        let blank = |ids: &[u64]| {
+            let mut p = page(ids, lonlat, point);
+            let i = p.object_id_field.unwrap();
+            p.dataset.features[0].attrs[i] = crate::Value::Null;
+            p
+        };
+        let Step::Fetch(first) = fresh().join_page(blank(&[0, 1])) else { panic!("the first page") };
+        let Step::Fetch(p) = (*first).join_page(blank(&[2, 3])) else { panic!("an empty object id taken for a page sent again") };
+        assert_eq!(p.read(), 4);
+        // A page without object ids sent again is told so, even cut shorter by the limit.
+        let idless = |limit: usize| {
+            let mut p = crate::esripbf::read_page_within(&pbf(&[0, 1], true, "OBJECTID"), "query", limit).unwrap();
+            p.object_id_field = None;
+            p
+        };
+        let Step::Fetch(first) = fresh().join_page(idless(usize::MAX)) else { panic!("the first page") };
+        let Step::Decoded(ds, _, Some(note)) = (*first).join_page(idless(1)) else { panic!("a page sent again, cut, joined") };
+        assert_eq!(ds.features.len(), 2);
+        assert!(note.contains("first features again"), "{note}");
+        // Pages are joined by their fields' names and types: another alias doesn't stop the read.
+        let Step::Fetch(first) = fresh().join_page(page(&[0, 1], lonlat, point)) else { panic!("the first page") };
+        let mut aliased = page(&[2, 3], lonlat, point);
+        aliased.dataset.fields[0].alias = Some("Object id".into());
+        let Step::Fetch(p) = (*first).join_page(aliased) else { panic!("another alias taken for other fields") };
+        assert_eq!(p.read(), 4);
+        // A page that would take the layer past its memory budget isn't joined, and says so; the
+        // first page is kept whatever it takes, and one within the budget is joined.
+        let first = page(&[0, 1], lonlat, point);
+        assert!(first.memory > 0);
+        let budget = first.memory * 3 / 2;
+        let Step::Fetch(mut p) = fresh().join_page(first) else { panic!("the first page") };
+        p.decoded_budget = budget;
+        let Step::Decoded(ds, _, Some(note)) = (*p).join_page(page(&[2, 3], lonlat, point)) else { panic!("past the budget") };
+        assert_eq!(ids(&ds), [0.0, 1.0]);
+        assert!(note.contains("after feature 2 would take the layer past 0 MB of memory"), "{note}");
+        let mut p = fresh();
+        p.decoded_budget = 0;
+        let Step::Fetch(mut p) = p.join_page(page(&[0, 1], lonlat, point)) else { panic!("the first page, over the budget") };
+        p.decoded_budget = usize::MAX;
+        let Step::Fetch(p) = (*p).join_page(page(&[2, 3], lonlat, point)) else { panic!("within the budget") };
+        assert_eq!(p.read(), 4);
+        assert!(p.decoded_bytes > 0);
+        // What the features lost, summed over the pages and said once.
+        let mut pages = fresh();
+        for (ids, more, rings) in [(&[0, 1][..], true, 2), (&[2, 3][..], false, 3)] {
+            let mut page = crate::esripbf::read_page(&pbf(ids, more, "OBJECTID"), "query").unwrap();
+            page.losses.flat_rings = rings;
+            pages = match pages.join_page(page) {
+                Step::Fetch(p) => *p,
+                Step::Decoded(_, report, None) => {
+                    assert_eq!(report.messages, ["5 polygon rings have no area and are left out"]);
+                    break;
+                }
+                other => panic!("{other:?}"),
+            };
+        }
+    }
+
+    /// Protocol buffer pages only when the layer's description lists them and names its page
+    /// size: a layer that names none, or doesn't list them, is read in GeoJSON as before.
+    #[test]
+    fn arcgis_pbf_pages_only_when_listed_with_a_page_size() {
+        let query = "https://x.org/arcgis/rest/services/P/FeatureServer/0/query?where=1%3D1&outFields=*&f=geojson";
+        let description = "https://x.org/arcgis/rest/services/P/FeatureServer/0?f=json";
+        // One page that holds the whole layer.
+        let page = br#"{"type": "FeatureCollection", "features": [{"type": "Feature", "id": 0, "properties": {}}]}"#;
+        for (layer, first) in [
+            // No page size: the query as it is first, in GeoJSON.
+            (r#"{"supportedQueryFormats": "JSON, geoJSON, PBF", "advancedQueryCapabilities": {"supportsPagination": true}}"#, Some(query)),
+            // Protocol buffers not listed: GeoJSON pages from the start.
+            (
+                r#"{"maxRecordCount": 1, "supportedQueryFormats": "JSON, geoJSON", "advancedQueryCapabilities": {"supportsPagination": true}}"#,
+                None,
+            ),
+        ] {
+            let mut asked = Vec::new();
+            let mut step = begin_with_pbf(query, 100);
+            while let Step::Fetch(pages) = step {
+                let u = pages.next_url().to_string();
+                let a = if u == description { Ok(layer.as_bytes().to_vec()) } else { Ok(page.to_vec()) };
+                asked.push(u);
+                step = (*pages).land(a);
+            }
+            assert!(matches!(step, Step::Done(_, None)), "{layer}: {step:?}");
+            assert!(asked.len() == 2 && asked[0] == description, "{layer}: {asked:?}");
+            assert!(query_value(&asked[1], "f") == Some("geojson"), "{layer}: {asked:?}");
+            if let Some(first) = first {
+                assert_eq!(asked[1], first);
+            }
+        }
+    }
+
+    #[test]
+    fn with_format_replaces_the_format_in_any_case_and_keeps_the_fragment() {
+        let q = "https://x.org/FeatureServer/0/query?F=geojson&where=1%3D1&f=json#part";
+        assert_eq!(with_format(q, "pbf"), "https://x.org/FeatureServer/0/query?where=1%3D1&f=pbf#part");
+        assert_eq!(with_format("https://x.org/FeatureServer/0/query", "pbf"), "https://x.org/FeatureServer/0/query?f=pbf");
+        assert_eq!(with_format("https://x.org/q?f=pbf", "geojson"), "https://x.org/q?f=geojson");
+    }
+
+    /// An ArcGIS layer's description first: a layer that pages is read from the start in pages of
+    /// its `maxRecordCount` ordered by its object ids (a page asked for in no order may hold other
+    /// features than the ordered first: Hawaii's zoning did), each from where the last stopped,
+    /// until a page no longer says it was cut off; its query as it is is never fetched. A layer
+    /// naming no page size is fetched as it is, then read again in pages as long as its answer
+    /// when it was cut off. A layer that can't be paged, or whose paging fails before a page is
+    /// read, comes back as it was (with its note).
     #[test]
     fn arcgis_pages_joined_from_offsets() {
         let query = "https://x.org/arcgis/rest/services/P/FeatureServer/0/query?where=1%3D1&outFields=*&f=geojson&token=t";
@@ -4460,18 +5832,43 @@ mod tests {
                 }
             }
         };
-        // The first page in the server's own order: two of the five, not the ordered first two.
-        let unordered = br#"{"type":"FeatureCollection","features":[{"id":3},{"id":0}],"properties":{"exceededTransferLimit":true}}"#;
+        // The description, then the pages: the query as it is (whose first page, in the server's
+        // own order, would be read and thrown away) isn't fetched.
         let mut asked = Vec::new();
         let answer = server(layer(r#", "maxRecordCount": 2"#));
-        let (joined, note) = join_pages(query, unordered.to_vec(), 100, |u| answer(&mut asked, u));
+        let (joined, note) = super::join_pages(query, 100, |u| {
+            assert_ne!(u, query, "the query isn't fetched as it is");
+            answer(&mut asked, u)
+        })
+        .unwrap();
         assert_eq!((ids(&joined), note), (vec![0, 1, 2, 3, 4], None));
+        assert_eq!(asked[0], "https://x.org/arcgis/rest/services/P/FeatureServer/0?f=json&token=t");
         assert_eq!(asked[1], format!("{query}&resultOffset=0&resultRecordCount=2&orderByFields=OBJECTID"));
         assert!(asked[2].contains("resultOffset=2&resultRecordCount=2") && asked[3].contains("resultOffset=4&resultRecordCount=2"));
         assert_eq!(asked.len(), 4);
         let v: serde_json::Value = serde_json::from_slice(&joined).unwrap();
+        assert_eq!(v["type"], "FeatureCollection");
         assert!(v.pointer("/properties/exceededTransferLimit").is_none());
         assert!(partial_note(&joined).is_none());
+        // A layer under its record limit: its description and one page.
+        let mut asked = Vec::new();
+        let answer = server(layer(r#", "maxRecordCount": 5"#));
+        let (joined, note) = super::join_pages(query, 100, |u| answer(&mut asked, u)).unwrap();
+        assert_eq!((ids(&joined), note, asked.len()), (vec![0, 1, 2, 3, 4], None, 2));
+        // Pages that fail before one is read: the query as it is, as it came; an error when that
+        // can't be fetched either.
+        let mut asked = Vec::new();
+        let answer = server(layer(r#", "maxRecordCount": 2"#));
+        let (joined, note) = join_pages(query, page(0, 2), 100, |u| {
+            if u.contains("resultOffset") { Err("http status: 500".into()) } else { answer(&mut asked, u) }
+        });
+        assert_eq!((joined, note, asked.len()), (page(0, 2), None, 1));
+        let answer = server(layer(r#", "maxRecordCount": 2"#));
+        let failed = super::join_pages(query, 100, |u| {
+            if u.contains("resultOffset") || u == query { Err("http status: 500".into()) } else { answer(&mut Vec::new(), u) }
+        });
+        let error = failed.unwrap_err();
+        assert!(error.contains("FeatureServer/0") && error.contains("offset 0") && error.contains("http status: 500"), "{error}");
         // The limit cuts it short, with a note.
         let answer = server(layer(r#", "maxRecordCount": 2"#));
         let (joined, note) = join_pages(query, page(0, 2), 3, |u| answer(&mut Vec::new(), u));
@@ -4524,14 +5921,188 @@ mod tests {
         });
         assert_eq!(ids(&joined), [0, 1]);
         assert!(note.is_some_and(|n| n.contains("after feature 2 couldn't be read (http status: 500)")));
-        // Only an ArcGIS query is asked again, only one that was cut off, and not one that asks
-        // for a window of its own.
+        // Only an ArcGIS query is described and paged, and not one that asks for a window of its
+        // own; one whose layer names no page size, only when it was cut off.
         let unasked = |_: &str| -> Result<Vec<u8>, String> { panic!("no page is asked for") };
         let elsewhere = "https://x.org/collections/a/items?f=json";
         assert_eq!(join_pages(elsewhere, page(0, 2), 100, unasked), (page(0, 2), None));
-        assert_eq!(join_pages(query, page(0, 5), 100, unasked), (page(0, 5), None));
         let window = format!("{query}&resultRecordCount=2");
         assert_eq!(join_pages(&window, page(0, 2), 100, unasked), (page(0, 2), None));
+        let mut asked = Vec::new();
+        let answer = server(layer(""));
+        assert_eq!(join_pages(query, page(0, 5), 100, |u| answer(&mut asked, u)), (page(0, 5), None));
+        assert_eq!(asked.len(), 1);
+        // A limit of none: an empty collection, said.
+        let answer = server(layer(r#", "maxRecordCount": 2"#));
+        let (joined, note) = super::join_pages(query, 0, |u| answer(&mut Vec::new(), u)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&joined).unwrap(),
+            serde_json::json!({"type": "FeatureCollection", "features": []})
+        );
+        assert!(note.is_some_and(|n| n.contains("first 0 features")));
+    }
+
+    /// Large polygon pages may fail even below the advertised record limit. Retry the same
+    /// offset in either format, keep the smaller size, and report the reductions only when used.
+    #[test]
+    fn arcgis_pages_retry_at_smaller_sizes() {
+        use crate::esripbf::tests::page as pbf;
+        let query = "https://x.org/rest/services/P/MapServer/28/query?where=COUNTY%3D1&f=geojson&token=t";
+        let description = br#"{"maxRecordCount":8,"objectIdField":"OBJECTID","supportedQueryFormats":"geoJSON,PBF",
+            "advancedQueryCapabilities":{"supportsPagination":true}}"#;
+        for binary in [false, true] {
+            for fails_at in [None, Some(0), Some(8)] {
+                let mut step = if binary { begin_with_pbf(query, 100) } else { begin(query, 100) };
+                let mut asked = Vec::new();
+                let (ids, note) = loop {
+                    let Step::Fetch(pages) = step else {
+                        break match step {
+                            Step::Done(bytes, note) => {
+                                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                                (v["features"].as_array().unwrap().iter().map(|f| f["id"].as_u64().unwrap()).collect::<Vec<_>>(), note)
+                            }
+                            Step::Decoded(ds, _, note) => (ds.features.iter().map(|f| f.attrs[0].as_f64().unwrap() as u64).collect(), note),
+                            other => panic!("{other:?}"),
+                        };
+                    };
+                    if pages.describing() {
+                        step = pages.land(Ok(description.to_vec()));
+                        continue;
+                    }
+                    let url = pages.next_url();
+                    assert_eq!(query_value(url, "where"), Some("COUNTY%3D1"));
+                    assert_eq!(query_value(url, "token"), Some("t"));
+                    assert_eq!(query_value(url, "orderByFields"), Some("OBJECTID"));
+                    let offset = query_value(url, "resultOffset").unwrap().parse::<u64>().unwrap();
+                    let size = query_value(url, "resultRecordCount").unwrap().parse::<u64>().unwrap();
+                    asked.push((offset, size));
+                    let answer = if fails_at.is_some_and(|at| offset >= at) && size > 2 {
+                        Err(if size == 8 {
+                            if fails_at == Some(8) { "timeout: global" } else { "http status: 500" }
+                        } else {
+                            "Connection reset by peer"
+                        }
+                        .into())
+                    } else {
+                        let end = (offset + size).min(13);
+                        let ids = (offset..end).collect::<Vec<_>>();
+                        Ok(if binary {
+                            pbf(&ids, end < 13, "OBJECTID")
+                        } else {
+                            serde_json::to_vec(&serde_json::json!({"type":"FeatureCollection", "exceededTransferLimit": end < 13,
+                                "features": ids.iter().map(|id| serde_json::json!({"type":"Feature","id":id,"properties":{}})).collect::<Vec<_>>() })).unwrap()
+                        })
+                    };
+                    step = pages.land(answer);
+                };
+                assert_eq!(ids, (0..13).collect::<Vec<_>>(), "{binary}, {fails_at:?}: {asked:?}");
+                if let Some(at) = fails_at {
+                    assert!(asked.windows(3).any(|w| w == [(at, 8), (at, 4), (at, 2)]), "{asked:?}");
+                    let note = note.unwrap();
+                    assert!(note.contains("2") && note.contains("smaller pages"), "{note}");
+                } else {
+                    assert_eq!(note, None);
+                }
+            }
+        }
+    }
+
+    /// Persistent failures stop at one feature, while authorization, cancellation and exhausted
+    /// budgets never shrink a page. Kept features still report the failed layer and offset.
+    #[test]
+    fn arcgis_retries_are_bounded_and_do_not_retry_read_limits() {
+        let query = "https://x.org/rest/services/P/MapServer/28/query?where=1%3D1&f=geojson";
+        let description = br#"{"maxRecordCount":8,"advancedQueryCapabilities":{"supportsPagination":true}}"#;
+        let first = br#"{"type":"FeatureCollection","exceededTransferLimit":true,"features":[{"id":0},{"id":1}]}"#;
+        for (error, sizes) in [
+            ("http status: 503", vec![8, 4, 2, 1]),
+            ("envelope", vec![8, 4, 2, 1]),
+            ("HTTP 403", vec![8]),
+            ("http status: 503 (retry after 30 s)", vec![8]),
+            ("cancelled while it was read", vec![8]),
+            ("the pages timed out", vec![8]),
+            ("the pages are larger than RustGIS downloads", vec![8]),
+        ] {
+            let mut asked = Vec::new();
+            let (bytes, note) = super::join_pages(query, 100, |url| {
+                if !url.contains("/query") {
+                    return Ok(description.to_vec());
+                }
+                let offset = query_value(url, "resultOffset").unwrap().parse::<usize>().unwrap();
+                if offset == 0 {
+                    return Ok(first.to_vec());
+                }
+                assert_eq!(offset, 2);
+                asked.push(query_value(url, "resultRecordCount").unwrap().parse::<usize>().unwrap());
+                if error == "envelope" { Ok(br#"{"error":{"code":500,"message":"query failed"}}"#.to_vec()) } else { Err(error.into()) }
+            })
+            .unwrap();
+            assert_eq!(asked, sizes, "{error}");
+            let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(doc["features"].as_array().unwrap().len(), 2);
+            let note = note.unwrap();
+            assert!(note.contains("MapServer/28") && note.contains("offset 2"), "{note}");
+            assert_eq!(note.contains("smaller pages"), sizes.len() > 1, "{note}");
+        }
+    }
+
+    #[test]
+    fn a_layer_address_says_which_service_to_list() {
+        let root = "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer";
+        let error = parse(&format!("{root}/21?f=json"), br#"{"currentVersion":11,"id":21,"name":"Flood"}"#).unwrap_err();
+        assert!(error.contains(root) && error.contains("service.layers") && error.contains("21"), "{error}");
+    }
+
+    /// An ArcGIS layer's description gives how it is drawn (its `drawingInfo`) once, to be taken
+    /// before its features are read; one without it gives nothing to say, and one that couldn't be
+    /// read, or with a `drawingInfo` that isn't an object, says why (#2080, #2152).
+    #[test]
+    fn an_arcgis_description_gives_its_drawing_info_once() {
+        let q = "https://x.org/a/MapServer/3/query?where=1%3D1&f=geojson";
+        let drawing = serde_json::json!({"renderer": {"type": "simple"}, "transparency": 20});
+        let unread = |why: &str| {
+            Some(Err(format!("its service's symbology, which RustGIS couldn't read ({why}), drawn with RustGIS's single symbol")))
+        };
+        let json = |v: serde_json::Value| Ok(v.to_string().into_bytes());
+        for (description, expected) in [
+            (json(serde_json::json!({"currentVersion": 11, "drawingInfo": drawing})), Some(Ok(drawing.clone()))),
+            (json(serde_json::json!({"currentVersion": 11, "drawingInfo": "simple"})), unread("not an object")),
+            (json(serde_json::json!({"currentVersion": 11, "drawingInfo": null})), None),
+            (json(serde_json::json!({"currentVersion": 11})), None),
+            (json(serde_json::json!({"error": {"code": 498, "message": "Invalid token."}})), unread("service error: 498: Invalid token.")),
+            (Ok(b"<html>busy</html>".to_vec()), unread("not JSON")),
+            (json(serde_json::json!([1])), unread("not an object")),
+            // The service's error, however long, as a description may be.
+            (
+                json(serde_json::json!({"error": {"code": 500, "message": "Failed.", "details": ["x".repeat(EDGE)]}})),
+                unread("service error: 500: Failed."),
+            ),
+            // An address in the error isn't repeated: its path may hold a key.
+            (Err("https://x.org/key/s3cr3t/a/MapServer/3: http status: 502".to_string()), unread("its description couldn't be fetched")),
+            (Err("timeout: service page".to_string()), unread("timeout: service page")),
+        ] {
+            let Step::Fetch(mut pages) = begin(q, 100) else { panic!("the description is fetched first") };
+            assert!(pages.describing());
+            assert_eq!(pages.take_drawing_info(), None, "nothing to say before it is read");
+            // Whatever it holds, the features are read next, as they are when it couldn't be read.
+            let Step::Fetch(mut pages) = pages.land(description) else { panic!("then the features") };
+            assert!(!pages.describing());
+            assert_eq!(pages.take_drawing_info(), expected);
+            assert_eq!(pages.take_drawing_info(), None, "only once");
+        }
+        let Step::Fetch(pages) = begin(q, 100) else { panic!("the description is fetched first") };
+        let Step::Fetch(pages) = pages.land(Err("timed out".into())) else { panic!("then the features") };
+        assert_eq!(pages.next_url(), q);
+        // A query asking for a window of its own skips the description, and says so from the start;
+        // another service's address has nothing to say.
+        for window in ["resultOffset=10", "resultRecordCount=5"] {
+            let Step::Fetch(mut pages) = begin(&format!("{q}&{window}"), 100) else { panic!("its features are fetched") };
+            assert!(!pages.describing());
+            let said = pages.take_drawing_info().and_then(Result::err).unwrap_or_default();
+            assert!(said.contains("resultOffset or resultRecordCount"), "{said}");
+        }
+        let Step::Fetch(mut pages) = begin("https://x.org/collections/a/items?f=json", 100) else { panic!("its features are fetched") };
+        assert_eq!(pages.take_drawing_info(), None);
     }
 
     /// The addresses an ArcGIS layer is paged with: its description's (with the token), each page's
@@ -4743,6 +6314,33 @@ mod tests {
             let (_, _, w) = warp::Warp::parse(&template.replace("{z}/{x}/{y}", "0/0/0")).unwrap();
             let warp::Grid::Tiles(ms) = &w.grid else { panic!() };
             assert_eq!((ms[0].left, ms[0].top), at, "{written}");
+        }
+    }
+
+    /// A sublayer's systems, its own added to its parent's first ones, are those its whole list
+    /// gives, so a root's many are worked out once (#1519).
+    #[test]
+    fn a_sublayers_systems_build_on_its_parents_first_ones() {
+        let first = |names: &[String]| -> Vec<(String, u32)> {
+            wms_candidates(names).into_iter().filter(|c| warp::usable(c.1).is_some()).take(warp::MAX_SYSTEMS).map(|c| (c.0, c.1)).collect()
+        };
+        let codes = |r: std::ops::Range<u32>| r.map(|c| format!("EPSG:{c}")).collect::<Vec<_>>();
+        let many = [codes(32601..32671), vec!["EPSG:4326".into(), "EPSG:3857".into()], codes(2000..2100)].concat();
+        let few = vec!["EPSG:4326".to_string(), "EPSG:3857".into()];
+        let owns = [
+            vec!["CRS:84".to_string()],
+            vec!["EPSG:32633".into(), "EPSG:2056".into()],
+            vec!["EPSG:4326 EPSG:31983".into()],
+            codes(32701..32761),
+        ];
+        for root in [&many, &few] {
+            let parent = Systems::with_own(&Systems::default(), root);
+            for own in &owns {
+                let child = Systems::with_own(&parent, own);
+                let whole: Vec<String> = root.iter().chain(own).cloned().collect();
+                assert_eq!(child.first.iter().map(|c| (c.0.clone(), c.1)).collect::<Vec<_>>(), first(&whole), "{own:?}");
+                assert!(child.mercator && !Systems::with_own(&Systems::default(), own).mercator);
+            }
         }
     }
 
@@ -5099,6 +6697,7 @@ mod tests {
         let s = parse("https://gibs.example.org/wmts/1.0.0/WMTSCapabilities.xml", late.as_bytes()).unwrap();
         let t = s.layers[2].time.as_ref().unwrap();
         assert_eq!((t.default.as_str(), t.values.len()), ("2099-01-01", MAX_TIME_VALUES));
+        assert!(t.cut == 100 && s.notes.contains(&long_times_note(1)), "{} {:?}", t.cut, s.notes);
         assert!(checked_time("2024-06-01").is_ok() && checked_time("2024-06-01T10:00:00Z").is_ok());
         assert!(checked_time("default").is_ok() && checked_time("current").is_ok());
         for bad in ["", "..", ".", "../x", "2024-06-01/../..", "a b", "x?y=1", "latest", &"9".repeat(50)] {
@@ -5211,6 +6810,9 @@ mod tests {
         let declared = empty.replace(r#"version="1.3.0""#, r#"version="1.1.1""#).replace("<CRS>", "<SRS>").replace("</CRS>", "</SRS>");
         let s = parse(url, declared.as_bytes()).unwrap();
         assert_eq!(s.layers.iter().find(|l| l.name == "part").unwrap().time.as_ref().map(|t| t.default.as_str()), Some("2020"));
+        // A document within the cap keeps all its times, and says nothing of them.
+        let clean = parse(url, caps.as_bytes()).unwrap();
+        assert!(!clean.notes.iter().any(|n| n.contains("of their times") || n.contains("list more than")));
         // A parent's many times, inherited by a great many layers, aren't kept for each.
         let many: String = (0..1000).map(|i| format!("{},", 1000 + i)).collect();
         let children: String = (0..1500).map(|i| layer(&format!("child{i}"), "")).collect();
@@ -5222,6 +6824,50 @@ mod tests {
         let kept: usize = s.layers.iter().filter_map(|l| l.time.as_ref()).map(|t| t.values.len()).sum();
         assert!(s.layers.len() == 1500 && kept == MAX_DOCUMENT_TIME_VALUES, "{} layers, {kept} values", s.layers.len());
         assert!(s.layers.iter().all(|l| l.time.as_ref().is_some_and(|t| t.default == "1999")));
+        // (They go to the layers listed first, and the others are counted.)
+        let note = format!(
+            "1450 layers keep fewer or none of their times: RustGIS keeps {MAX_DOCUMENT_TIME_VALUES} for one document, and they come after them"
+        );
+        assert!(s.notes.contains(&note), "{:?}", s.notes);
+        assert!(s.layers[..MAX_DOCUMENT_TIME_VALUES / 1000].iter().all(|l| l.time.as_ref().is_some_and(|t| t.values.len() == 1000)));
+        // Layers with dimensions of their own (not inherited): the budget goes in document order,
+        // and the layers after it keep none, counted with the times they lose.
+        let own: String = (0..MAX_DOCUMENT_TIME_VALUES / 1000 + 10)
+            .map(|i| layer(&format!("own{i}"), &dim(r#"default="1999""#, many.trim_end_matches(','))))
+            .collect();
+        let owned = format!(
+            r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms"><Capability><Layer><Title>Root</Title><CRS>EPSG:3857</CRS>{own}</Layer></Capability></WMS_Capabilities>"#
+        );
+        let s = parse(url, owned.as_bytes()).unwrap();
+        let with_values = MAX_DOCUMENT_TIME_VALUES / 1000;
+        assert!(s.layers[..with_values].iter().all(|l| l.time.as_ref().is_some_and(|t| t.values.len() == 1000 && t.cut == 0)));
+        assert!(s.layers[with_values..].iter().all(|l| l.time.as_ref().is_some_and(|t| t.values.is_empty() && t.cut == 1000)));
+        let note = format!(
+            "10 layers keep fewer or none of their times: RustGIS keeps {MAX_DOCUMENT_TIME_VALUES} for one document, and they come after them"
+        );
+        assert!(s.notes.contains(&note), "{:?}", s.notes);
+        // One layer's own list past its cap: the earliest are left out, and the note counts it.
+        let long: String = (0..MAX_TIME_VALUES + 100).map(|i| format!("{},", 1000 + i)).collect();
+        let doc = format!(
+            r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms"><Capability><Layer><Title>Root</Title><CRS>EPSG:3857</CRS>{}</Layer></Capability></WMS_Capabilities>"#,
+            layer("long", &dim(r#"default="2099""#, long.trim_end_matches(',')))
+        );
+        let s = parse(url, doc.as_bytes()).unwrap();
+        let t = s.layers[0].time.as_ref().unwrap();
+        assert_eq!((t.values.len(), t.cut, t.values[0].as_str()), (MAX_TIME_VALUES, 100, "1100"));
+        assert!(s.notes.contains(&long_times_note(1)), "{:?}", s.notes);
+        // So a document with more layers than are listed gives them to the listed ones (#1519).
+        let children: String = (0..MAX_LISTED_LAYERS + 500).map(|i| layer(&format!("child{i}"), "")).collect();
+        let crowd = format!(
+            r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms"><Capability><Layer><Title>Root</Title><CRS>EPSG:3857</CRS>{}{children}</Layer></Capability></WMS_Capabilities>"#,
+            dim(r#"default="1999""#, many.trim_end_matches(','))
+        );
+        let s = parse(url, crowd.as_bytes()).unwrap();
+        let with_values = MAX_DOCUMENT_TIME_VALUES / 1000;
+        assert_eq!(s.listed, Some(MAX_LISTED_LAYERS));
+        assert!(s.layers[..with_values].iter().all(|l| l.time.as_ref().is_some_and(|t| t.values.len() == 1000)), "{:?}", s.layers[0].time);
+        assert!(s.layers[with_values..].iter().all(|l| l.time.as_ref().is_some_and(|t| t.values.is_empty())));
+        assert!(s.notes.iter().any(|n| n.starts_with("2450 layers keep fewer or none of their times")), "{:?}", s.notes);
         // A GetMap address that carries a TIME of its own (or other GetMap parameters) gives the
         // template one TIME, the layer's.
         let carried = caps.replace("https://maps.example.org/wms?", "https://maps.example.org/wms?map=m&amp;TIME=2000&amp;");
@@ -5256,6 +6902,7 @@ mod tests {
             default: default.into(),
             values: values.iter().map(|v| v.to_string()).collect(),
             multiple: false,
+            cut: 0,
         };
         let ms = |t: &str| parse_text(t).unwrap();
         let every = |start: &str, end: &str, unit, interval| SliderSteps::Every { start: ms(start), end: ms(end), unit, interval };
@@ -5351,6 +6998,21 @@ mod tests {
         let s = parse("https://gis.example.org/arcgis/rest/services/P/FeatureServer?token=abc", fs).unwrap();
         let Offer::Features { url } = &s.layers[0].offer else { panic!() };
         assert!(url.ends_with("&token=abc"), "{url}");
+        // A bound service constructs the same requests while retaining only its own login.
+        for address in [
+            "https://gis.example.org/arcgis/rest/services/P/FeatureServer",
+            "https://gis.example.org/arcgis/rest/services/P/FeatureServer?token=abc",
+        ] {
+            let expected = parse(address, fs).unwrap();
+            let bound = crate::login_address::bind("0123456789abcdef", "https://gis.example.org", address).unwrap();
+            let service = parse(&bound, fs).unwrap();
+            let Offer::Features { url } = &service.layers[0].offer else { panic!("features expected") };
+            let offered = crate::login_address::parse(url).unwrap().unwrap();
+            assert_eq!((offered.binding, offered.origin), ("0123456789abcdef", "https://gis.example.org"));
+            let Offer::Features { url: expected } = &expected.layers[0].offer else { panic!("features expected") };
+            assert_eq!(offered.url, expected, "{address}");
+            assert_eq!(service.withheld_addresses, 0, "{address}");
+        }
     }
 
     #[test]
@@ -5412,6 +7074,18 @@ mod tests {
     }
 
     #[test]
+    fn collections_links_count_only_settings_the_selected_link_omits() {
+        let body = br#"{"links":[{"rel":"data","type":"application/json","href":"/catalog?f=json"}]}"#;
+        for (from, count) in
+            [("https://collections.invalid/root?f=json", 0), ("https://collections.invalid/root?f=json&token=RGSYNTH_link", 1)]
+        {
+            let service = parse(from, body).unwrap();
+            assert_eq!(service.collections_url.as_deref(), Some("https://collections.invalid/catalog?f=json"));
+            assert_eq!(service.withheld_addresses, count);
+        }
+    }
+
+    #[test]
     fn ogc_json_format_is_idempotent() {
         let url = capabilities_url("https://example.org/api?f=html&key=a%2Fb&f=json#fragment", Some("ogcapi"));
         assert_eq!(url, "https://example.org/api?f=json&key=a%2Fb");
@@ -5466,7 +7140,8 @@ mod tests {
             {"rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map", "href": "https://x.org/night/map/tiles"}]}"#;
         let s = parse("https://x.org/night/", landing).unwrap();
         assert_eq!(s.kind, "OGC API Tiles");
-        assert_eq!(s.layers[0].offer, Offer::Tiles { template: "https://x.org/night/map/tiles/WebMercatorQuad/{z}/{y}/{x}".into() });
+        assert!(s.layers.is_empty(), "dataset tiles need advertised metadata rather than a guessed path");
+        assert_eq!(s.dataset.as_ref().and_then(|d| d.next()), Some(("https://x.org/night/", "https://x.org/night/map/tiles?f=json")));
         // A landing page advertises the collections document instead of rejecting it.
         assert_eq!(
             parse("https://x.org/a/", br#"{"links": [{"rel": "data", "href": "https://x.org/a/collections"}]}"#)
@@ -5489,6 +7164,25 @@ mod tests {
     }
 
     #[test]
+    fn bound_tiles_keep_query_rules_without_rebinding_after_a_foreign_hop() {
+        let origin = "https://x.org";
+        let bound = crate::login_address::bind("0123456789abcdef", origin, "https://x.org/c").unwrap();
+        let document = br#"{"collections":[{"id":"roads","links":[{"rel":"tilesets-map","href":"https://x.org/c/roads/tiles?token=RGSYNTH_tiles_r15&f=json"}]}]}"#;
+        let service = parse(&bound, document).unwrap();
+        let Offer::Tiles { template } = &service.layers[0].offer else { panic!("tiles expected") };
+        let template = crate::login_address::parse(template).unwrap().unwrap();
+        assert_eq!(template.url, "https://x.org/c/roads/tiles/WebMercatorQuad/{z}/{y}/{x}?token=RGSYNTH_tiles_r15");
+        assert_eq!(service.withheld_addresses, 0);
+        let list = service.layers[0].tilesets.as_deref().unwrap();
+        let foreign = br#"{"links":[{"rel":"item","type":"image/png","href":"https://x.org/back/{tileMatrix}/{tileRow}/{tileCol}.png"}]}"#;
+        let resolution = resolve_tiles(list, "https://foreign-r15.example.invalid/tiles", foreign, false).unwrap();
+        let TilesStep::Template(url) = resolution.step else { panic!("template expected") };
+        assert_eq!(url, "https://x.org/back/{z}/{y}/{x}.png");
+        assert!(crate::login_address::parse(&url).unwrap().is_none());
+        assert_eq!(resolution.withheld_addresses, 1);
+    }
+
+    #[test]
     fn ogc_api_advertised_tile_templates() {
         let list = "https://x.org/c/roads/tiles?token=abc&f=json";
         // A list whose WebMercatorQuad tileset (named otherwise, as CubeWerx's `smerc`) points to
@@ -5497,35 +7191,81 @@ mod tests {
             {"tileMatrixSetURI": "http://www.opengis.net/def/tilematrixset/OGC/1.0/WorldCRS84Quad", "links": [{"rel": "self", "href": "crs84"}]},
             {"dataType": "vector", "tileMatrixSetURI": "http://www.opengis.net/def/tilematrixset/OGC/1.0/WebMercatorQuad", "links": [{"rel": "self", "href": "https://x.org/c/roads/tiles/smerc"}]}]}"#;
         assert_eq!(
-            resolve_tiles(list, list, sets, true),
-            Some(TilesStep::Next("https://x.org/c/roads/tiles/smerc?token=abc&f=json".into()))
+            resolve_tiles(list, list, sets, true).map(|r| r.step),
+            Some(TilesStep::Next("https://x.org/c/roads/tiles/smerc?f=json".into()))
         );
-        assert_eq!(resolve_tiles(list, list, sets, false), None, "no map tileset in WebMercatorQuad");
-        // The tileset's item links: MVT for vector tiles, PNG first for map tiles, the token kept.
+        assert_eq!(resolve_tiles(list, list, sets, false).map(|r| r.step), None, "no map tileset in WebMercatorQuad");
+        // The tileset's item links: MVT for vector tiles, PNG first for map tiles, the list's token withheld under F3.
         let tileset = br#"{"links": [
             {"rel": "item", "type": "image/jpeg", "templated": true, "href": "https://x.org/c/roads/tiles/smerc/{tileMatrix}/{tileRow}/{tileCol}.jpg"},
             {"rel": "item", "type": "image/png", "templated": true, "href": "https://x.org/c/roads/tiles/smerc/{tileMatrix}/{tileRow}/{tileCol}.png"},
             {"rel": "item", "type": "application/vnd.mapbox-vector-tile", "templated": true, "href": "smerc/{tileMatrix}/{tileRow}/{tileCol}.mvt"}]}"#;
         let doc = "https://x.org/c/roads/tiles/smerc?token=abc&f=json";
         assert_eq!(
-            resolve_tiles(list, doc, tileset, true),
-            Some(TilesStep::Template("https://x.org/c/roads/tiles/smerc/{z}/{y}/{x}.mvt?token=abc".into()))
+            resolve_tiles(list, doc, tileset, true).map(|r| r.step),
+            Some(TilesStep::Template("https://x.org/c/roads/tiles/smerc/{z}/{y}/{x}.mvt".into()))
         );
         assert_eq!(
-            resolve_tiles(list, doc, tileset, false),
-            Some(TilesStep::Template("https://x.org/c/roads/tiles/smerc/{z}/{y}/{x}.png?token=abc".into()))
+            resolve_tiles(list, doc, tileset, false).map(|r| r.step),
+            Some(TilesStep::Template("https://x.org/c/roads/tiles/smerc/{z}/{y}/{x}.png".into()))
         );
+        // A PNG link cannot turn a declared coverage (or unknown type) into a map offer.
+        for kind in ["map", "vector", "coverage", "unknown"] {
+            let mut declared: serde_json::Value = serde_json::from_slice(tileset).unwrap();
+            declared["dataType"] = serde_json::json!(kind);
+            declared["tileMatrixSetId"] = serde_json::json!("WebMercatorQuad");
+            for document in [declared.clone(), serde_json::json!({"tilesets":[declared]})] {
+                let body = document.to_string();
+                for vector in [false, true] {
+                    assert_eq!(
+                        resolve_tiles(list, doc, body.as_bytes(), vector).is_some(),
+                        kind == if vector { "vector" } else { "map" },
+                        "{kind}, vector={vector}: {document}"
+                    );
+                }
+            }
+        }
         // A list that carries its tilesets' item links needs no second document.
         let inline = br#"{"tilesets": [{"tileMatrixSetId": "WebMercatorQuad", "links": [
             {"rel": "item", "type": "image/png", "href": "https://x.org/t/{tileMatrix}/{tileRow}/{tileCol}"}]}]}"#;
-        assert_eq!(resolve_tiles(list, list, inline, false), Some(TilesStep::Template("https://x.org/t/{z}/{y}/{x}?token=abc".into())));
+        assert_eq!(
+            resolve_tiles(list, list, inline, false).map(|r| r.step),
+            Some(TilesStep::Template("https://x.org/t/{z}/{y}/{x}".into()))
+        );
         // A template with other variables, or no web address, isn't taken.
         for bad in [
             br#"{"links": [{"rel": "item", "href": "https://x.org/{style}/{tileMatrix}/{tileRow}/{tileCol}"}]}"#.as_slice(),
             br#"{"links": [{"rel": "item", "href": "javascript:{tileMatrix}"}]}"#.as_slice(),
             b"not json",
         ] {
-            assert_eq!(resolve_tiles(list, doc, bad, false), None);
+            assert_eq!(resolve_tiles(list, doc, bad, false).map(|r| r.step), None);
+        }
+        // F3 is independent of origin and directory containment. Destination-owned keys stay;
+        // only the allowlisted collection choice may follow from the list.
+        let list = "https://h.invalid/svc?token=RGSYNTH_list_20261103&k=RGSYNTH_unknown_20261103&collections=roads";
+        for host in ["h.invalid", "elsewhere.invalid"] {
+            let doc = format!(
+                r#"{{"links":[{{"rel":"item","type":"image/png","href":"https://{host}/svc/{{tileMatrix}}/{{tileRow}}/{{tileCol}}?own=destination"}}]}}"#
+            );
+            let resolved = resolve_tiles(list, list, doc.as_bytes(), false).unwrap();
+            assert_eq!(resolved.withheld_addresses, 1);
+            let TilesStep::Template(template) = resolved.step else { panic!("expected template") };
+            assert_eq!(template, format!("https://{host}/svc/{{z}}/{{y}}/{{x}}?own=destination&collections=roads"));
+        }
+        let clean = "https://h.invalid/svc?collections=roads";
+        assert_eq!(resolve_tiles(clean, clean, tileset, false).unwrap().withheld_addresses, 0);
+        // Even a suffix appended by RustGIS must pass the raw-path check. The normal style
+        // stays under its service; an advertised '..' style does not inherit its token.
+        let address = "https://h.invalid/rest/services/a/VectorTileServer?token=RGSYNTH_style_20261103";
+        let bound = crate::login_address::bind("0123456789abcdef", "https://h.invalid", address).unwrap();
+        for (style, withheld) in [("resources/styles", 0), ("../other/styles", 1), ("%2e%2e/other/styles", 1)] {
+            let description = serde_json::json!({"defaultStyles": style});
+            for address in [address, bound.as_str()] {
+                let service = parse(address, description.to_string().as_bytes()).unwrap();
+                assert_eq!(service.withheld_addresses, withheld, "{address}: {style}");
+                let Offer::Style { url } = &service.layers[0].offer else { panic!("expected style") };
+                assert_eq!(url.contains("RGSYNTH_style_20261103"), withheld == 0, "{address}: {style}");
+            }
         }
     }
 
@@ -5590,7 +7330,6 @@ mod tests {
         assert_eq!((s.kind.as_str(), s.title.as_str()), ("WCS", "Soils"));
         assert_eq!(s.layers[0].bbox, Some([-180.0, -56.0, 180.0, 84.0]));
         let Offer::Coverage(c) = &s.layers[0].offer else { panic!("{:?}", s.layers[0].offer) };
-        assert_eq!(c.endpoint, "https://maps.example.org/mapserv?map=/m/soc.map&");
         assert_eq!((c.version.as_str(), c.id.as_str()), ("2.0.1", "soc_mean"));
         assert_eq!(
             describe_coverage_url(c),
@@ -5718,5 +7457,204 @@ mod tests {
         assert!(parse_records("https://c.org/csw", deep.as_bytes()).unwrap_err().contains("deep"));
         let many = format!("<GetRecordsResponse>{}</GetRecordsResponse>", "<Record><title>t</title></Record>".repeat(1000));
         assert_eq!(parse_records("https://c.org/csw", many.as_bytes()).unwrap().records.len(), RECORDS_PAGE as usize * 5);
+    }
+
+    /// Every kind of document is read up to the limit, and what's past it is counted in a note.
+    #[test]
+    fn a_document_past_the_read_limit_says_how_much_it_left_out() {
+        fn many(n: usize, item: impl Fn(usize) -> String) -> String {
+            (0..n).map(item).collect()
+        }
+        fn list(n: usize, item: impl Fn(usize) -> serde_json::Value) -> serde_json::Value {
+            (0..n).map(item).collect()
+        }
+        let wfs = |n| {
+            let types = many(n, |i| format!("<FeatureType><Name>t{i}</Name></FeatureType>"));
+            format!(r#"<WFS_Capabilities version="2.0.0"><FeatureTypeList>{types}</FeatureTypeList></WFS_Capabilities>"#)
+        };
+        // Named layers in an unnamed one, which isn't counted.
+        let wms = |n| {
+            let layers = many(n, |i| format!("<Layer><Name>t{i}</Name></Layer>"));
+            format!(
+                r#"<WMS_Capabilities version="1.3.0"><Capability><Layer><CRS>EPSG:3857</CRS>{layers}</Layer></Capability></WMS_Capabilities>"#
+            )
+        };
+        let wmts = |n| {
+            let layers = many(n, |i| format!("<Layer><ows:Identifier>t{i}</ows:Identifier></Layer>"));
+            format!(
+                r#"<Capabilities xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0"><Contents>{layers}</Contents></Capabilities>"#
+            )
+        };
+        let wcs2 = |n| {
+            let coverages = many(n, |i| format!("<CoverageSummary><CoverageId>c{i}</CoverageId></CoverageSummary>"));
+            format!("<Capabilities><Contents>{coverages}</Contents></Capabilities>")
+        };
+        let wcs1 = |n| {
+            let coverages = many(n, |i| format!("<CoverageOfferingBrief><name>c{i}</name></CoverageOfferingBrief>"));
+            format!("<WCS_Capabilities><ContentMetadata>{coverages}</ContentMetadata></WCS_Capabilities>")
+        };
+        let arcgis = |n| serde_json::json!({"layers": list(n, |i| serde_json::json!({"id": i, "name": format!("l{i}")}))}).to_string();
+        let folders = |n| serde_json::json!({"folders": list(n, |i| serde_json::json!(format!("f{i}")))}).to_string();
+        let services =
+            |n| serde_json::json!({"services": list(n, |i| serde_json::json!({"name": format!("s{i}"), "type": "MapServer"}))}).to_string();
+        let ogc = |n| {
+            let items =
+                |i| serde_json::json!({"id": format!("c{i}"), "links": [{"rel": "items", "href": format!("collections/c{i}/items")}]});
+            serde_json::json!({"collections": list(n, items)}).to_string()
+        };
+        // (A WMTS layer needs a tile matrix set to be kept: only the note is looked at.)
+        // (ArcGIS's lists are read as far as they are listed.)
+        let kinds: [(&str, &str, &dyn Fn(usize) -> String, usize, bool); 9] = [
+            ("feature types", "https://x.org/wfs", &wfs, MAX_READ_LAYERS, true),
+            ("layers", "https://x.org/wms", &wms, MAX_READ_LAYERS, true),
+            ("layers", "https://x.org/wmts", &wmts, MAX_READ_LAYERS, false),
+            ("coverages", "https://x.org/wcs", &wcs2, MAX_READ_LAYERS, true),
+            ("coverages", "https://x.org/wcs", &wcs1, MAX_READ_LAYERS, true),
+            ("layers", "https://x.org/arcgis/rest/services/P/FeatureServer", &arcgis, MAX_LISTED_LAYERS, true),
+            ("folders", "https://x.org/arcgis/rest/services", &folders, MAX_LISTED_LAYERS, true),
+            ("services", "https://x.org/arcgis/rest/services", &services, MAX_LISTED_LAYERS, true),
+            ("collections", "https://x.org/collections", &ogc, MAX_READ_LAYERS, true),
+        ];
+        for (what, url, doc, limit, kept) in kinds {
+            let s = parse(url, doc(limit).as_bytes()).unwrap();
+            assert!(!s.notes.iter().any(|n| n.contains(PAST_READ_LIMIT)), "{url}: {:?}", s.notes);
+            assert_eq!(s.past_read_limit, None, "{url}");
+            assert_eq!(s.layers.len(), if kept { limit } else { 0 }, "{url}");
+            let s = parse(url, doc(limit + 2).as_bytes()).unwrap();
+            let note = format!("{PAST_READ_LIMIT} {limit} {what} from one document: 2 left out");
+            assert!(s.notes.contains(&note), "{url}: {:?}", s.notes);
+            assert_eq!(s.past_read_limit.as_ref(), Some(&note), "{url}");
+            assert_eq!(s.layers.len(), if kept { limit } else { 0 }, "{url}");
+            // What was read past the listing is there to be found, but isn't listed.
+            let cut = kept && limit > MAX_LISTED_LAYERS;
+            assert_eq!(s.listed, cut.then_some(MAX_LISTED_LAYERS), "{url}");
+            assert_eq!(parse(url, doc(MAX_LISTED_LAYERS).as_bytes()).unwrap().listed, None, "{url}");
+        }
+        // A long request address, copied into each layer, lowers how many are read (a 4 KB one not
+        // below the listing).
+        let href = format!("https://x.org/{}?", "a".repeat(4000));
+        let types = many(MAX_READ_LAYERS, |i| format!("<FeatureType><Name>t{i}</Name></FeatureType>"));
+        let long = format!(
+            r#"<WFS_Capabilities version="2.0.0"><OperationsMetadata><Operation name="GetFeature"><DCP><HTTP><Get href="{href}"/></HTTP></DCP></Operation></OperationsMetadata><FeatureTypeList>{types}</FeatureTypeList></WFS_Capabilities>"#
+        );
+        let s = parse("https://x.org/wfs", long.as_bytes()).unwrap();
+        let read = s.layers.len();
+        assert!((MAX_LISTED_LAYERS..MAX_READ_LAYERS).contains(&read), "{read}");
+        let note = format!("{PAST_READ_LIMIT} {read} feature types from one document: {} left out", MAX_READ_LAYERS - read);
+        assert_eq!(s.past_read_limit.as_ref(), Some(&note));
+        assert!(s.notes.iter().any(|n| n.starts_with("each of its layers copies 40")), "{:?}", s.notes);
+        let long_wms = format!(
+            r#"<WMS_Capabilities version="1.3.0"><Capability><Request><GetMap><DCPType><HTTP><Get><OnlineResource href="{href}"/></Get></HTTP></DCPType></GetMap></Request><Layer><CRS>EPSG:3857</CRS>{}</Layer></Capability></WMS_Capabilities>"#,
+            many(MAX_READ_LAYERS, |i| format!("<Layer><Name>t{i}</Name></Layer>"))
+        );
+        let s = parse("https://x.org/wms", long_wms.as_bytes()).unwrap();
+        assert!((MAX_LISTED_LAYERS..MAX_READ_LAYERS).contains(&s.layers.len()), "{}", s.layers.len());
+        assert!(s.notes.iter().any(|n| n.starts_with("each of its layers copies 40")), "{:?}", s.notes);
+        // An OGC API's collections without an items link copy the document's own address, which
+        // nothing bounds: a long one lowers how many are read too, and a short one doesn't.
+        let bare = serde_json::json!({"collections": list(MAX_READ_LAYERS, |i| serde_json::json!({"id": format!("c{i}")}))}).to_string();
+        let s = parse(&format!("https://x.org/{}/collections", "a".repeat(4000)), bare.as_bytes()).unwrap();
+        let read = s.layers.len();
+        assert!((MAX_LISTED_LAYERS..MAX_READ_LAYERS).contains(&read), "{read}");
+        let note = format!("{PAST_READ_LIMIT} {read} collections from one document: {} left out", MAX_READ_LAYERS - read);
+        assert_eq!(s.past_read_limit.as_ref(), Some(&note));
+        assert!(s.notes.iter().any(|n| n.starts_with("each of its layers copies 40")), "{:?}", s.notes);
+        let s = parse("https://x.org/collections", bare.as_bytes()).unwrap();
+        assert_eq!((s.layers.len(), s.past_read_limit), (MAX_READ_LAYERS, None));
+        // An address so long that the listing's copies would pass the budget reads fewer than are
+        // listed (at least one), and the collections are said to be incomplete for a group.
+        let huge = "a".repeat(1 << 20);
+        let few = serde_json::json!({"collections": list(100, |i| serde_json::json!({"id": format!("c{i}")}))}).to_string();
+        let s = parse(&format!("https://x.org/{huge}/collections"), few.as_bytes()).unwrap();
+        let read = s.layers.len();
+        assert!((1..100).contains(&read) && s.incomplete && s.listed.is_none(), "{read}");
+        let note = format!("{PAST_READ_LIMIT} {read} collections from one document: {} left out", 100 - read);
+        assert_eq!(s.past_read_limit.as_ref(), Some(&note));
+        let types = many(100, |i| format!("<FeatureType><Name>t{i}</Name></FeatureType>"));
+        let wfs = format!(
+            r#"<WFS_Capabilities version="2.0.0"><OperationsMetadata><Operation name="GetFeature"><DCP><HTTP><Get href="https://x.org/{huge}?"/></HTTP></DCP></Operation></OperationsMetadata><FeatureTypeList>{types}</FeatureTypeList></WFS_Capabilities>"#
+        );
+        let s = parse("https://x.org/wfs", wfs.as_bytes()).unwrap();
+        assert!((1..100).contains(&s.layers.len()), "{}", s.layers.len());
+        assert!(s.notes.iter().any(|n| n.starts_with("each of its layers copies 10")), "{:?}", s.notes);
+        // A WMS is read in document order: the layers past the limit are its last, and a parent
+        // comes before its sublayers.
+        let s = parse("https://x.org/wms", wms(MAX_READ_LAYERS + 1).as_bytes()).unwrap();
+        assert_eq!(s.layers[0].name, "t0");
+        assert_eq!(s.layers[MAX_READ_LAYERS - 1].name, format!("t{}", MAX_READ_LAYERS - 1));
+        let nested = r#"<WMS_Capabilities version="1.3.0"><Capability><Layer><CRS>EPSG:3857</CRS><Layer><Name>parent</Name><Layer><Name>child</Name></Layer></Layer><Layer><Name>next</Name></Layer></Layer></Capability></WMS_Capabilities>"#;
+        let names: Vec<String> = parse("https://x.org/wms", nested.as_bytes()).unwrap().layers.into_iter().map(|l| l.name).collect();
+        assert_eq!(names, ["parent", "child", "next"]);
+        // Past the limit here are only layers without a name, so nothing that could be added is
+        // left out.
+        let layers =
+            many(MAX_READ_LAYERS, |i| format!("<Layer><Name>t{i}</Name></Layer>")) + &"<Layer><Title>group</Title></Layer>".repeat(2);
+        let doc = format!(
+            r#"<WMS_Capabilities version="1.3.0"><Capability><Layer><CRS>EPSG:3857</CRS>{layers}</Layer></Capability></WMS_Capabilities>"#
+        );
+        let s = parse("https://x.org/wms", doc.as_bytes()).unwrap();
+        assert_eq!(s.layers.len(), MAX_READ_LAYERS);
+        assert!(!s.notes.iter().any(|n| n.contains(PAST_READ_LIMIT)), "{:?}", s.notes);
+        assert_eq!(s.past_read_limit, None);
+        // A note quoting the document can carry the words of this one; it isn't taken for it.
+        let quoted = format!(
+            r#"{{"collections": [{{"id": "{PAST_READ_LIMIT}", "links": [{{"rel": "items", "href": "https://x.org/c/3dtiles"}}]}}]}}"#
+        );
+        let s = parse("https://x.org/collections", quoted.as_bytes()).unwrap();
+        assert!(s.notes.iter().any(|n| n.contains(PAST_READ_LIMIT)), "{:?}", s.notes);
+        assert_eq!(s.past_read_limit, None);
+    }
+
+    /// A document's format lists are one for all its layers: a document may have 100,000 of them.
+    #[test]
+    fn a_documents_format_lists_are_shared_by_its_layers() {
+        let wcs = r#"<Capabilities version="2.0.1"><ServiceMetadata><formatSupported>image/tiff</formatSupported></ServiceMetadata><Contents><CoverageSummary><CoverageId>a</CoverageId></CoverageSummary><CoverageSummary><CoverageId>b</CoverageId></CoverageSummary></Contents></Capabilities>"#;
+        let s = parse("https://x.org/wcs", wcs.as_bytes()).unwrap();
+        let [Offer::Coverage(a), Offer::Coverage(b)] = [&s.layers[0].offer, &s.layers[1].offer] else { panic!("{:?}", s.layers) };
+        assert_eq!(*a.formats, ["image/tiff"]);
+        assert!(std::sync::Arc::ptr_eq(&a.formats, &b.formats));
+        let wms = r#"<WMS_Capabilities version="1.3.0"><Capability><Request><GetFeatureInfo><Format>application/json</Format><DCPType><HTTP><Get><OnlineResource href="https://x.org/wms?"/></Get></HTTP></DCPType></GetFeatureInfo></Request><Layer><CRS>EPSG:3857</CRS><Layer queryable="1"><Name>a</Name></Layer><Layer queryable="1"><Name>b</Name></Layer></Layer></Capability></WMS_Capabilities>"#;
+        let s = parse("https://x.org/wms", wms.as_bytes()).unwrap();
+        let [Some(a), Some(b)] = [&s.layers[0].feature_info, &s.layers[1].feature_info] else { panic!("{:?}", s.layers) };
+        assert_eq!(*a.formats, ["application/json"]);
+        assert!(std::sync::Arc::ptr_eq(&a.formats, &b.formats));
+    }
+
+    /// A coverage whose identifier is too long for an address is counted in a note.
+    #[test]
+    fn a_coverage_with_a_long_identifier_is_said_to_be_left_out() {
+        let long = "c".repeat(501);
+        let v2 = format!(
+            "<Capabilities><Contents><CoverageSummary><CoverageId>{long}</CoverageId></CoverageSummary><CoverageSummary><CoverageId>c</CoverageId></CoverageSummary></Contents></Capabilities>"
+        );
+        let v1 = format!(
+            "<WCS_Capabilities><ContentMetadata><CoverageOfferingBrief><name>{long}</name></CoverageOfferingBrief><CoverageOfferingBrief><name>c</name></CoverageOfferingBrief></ContentMetadata></WCS_Capabilities>"
+        );
+        for doc in [v2, v1] {
+            let s = parse("https://x.org/wcs", doc.as_bytes()).unwrap();
+            assert_eq!(s.layers.len(), 1);
+            assert_eq!(s.notes, ["1 coverages are left out: their identifiers are longer than 500 bytes"]);
+            let clean = doc.replace(&long, "d");
+            assert!(parse("https://x.org/wcs", clean.as_bytes()).unwrap().notes.is_empty());
+        }
+    }
+
+    /// An OGC API past what's listed is read whole, and still marked for those that need it whole.
+    #[test]
+    fn collections_past_the_listing_are_read_and_marked_incomplete() {
+        let doc = |n: usize| {
+            let collections: Vec<_> = (0..n)
+                .map(|i| serde_json::json!({"id": format!("c{i}"), "links": [{"rel": "items", "href": format!("collections/c{i}/items")}]}))
+                .collect();
+            serde_json::json!({"collections": collections}).to_string()
+        };
+        let s = parse("https://x.org/collections", doc(MAX_LISTED_LAYERS).as_bytes()).unwrap();
+        assert!(!s.incomplete);
+        assert_eq!(s.listed, None);
+        let s = parse("https://x.org/collections", doc(MAX_LISTED_LAYERS + 1).as_bytes()).unwrap();
+        assert!(s.incomplete);
+        assert_eq!(s.layers.len(), MAX_LISTED_LAYERS + 1);
+        assert_eq!(s.listed, Some(MAX_LISTED_LAYERS));
+        assert!(!s.notes.iter().any(|n| n.contains(PAST_READ_LIMIT)), "{:?}", s.notes);
     }
 }

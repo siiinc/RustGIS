@@ -1,4 +1,4 @@
-//! Docked panes: Layers and Browser on the left; Geoprocessing, Symbology, History and Details
+//! Docked panes: Layers and Browser on the left; Geoprocessing, Symbology, History and the rest
 //! on the right.
 
 use std::collections::HashMap;
@@ -6,11 +6,14 @@ use std::collections::HashMap;
 use egui::{Align2, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::Session;
 use rustgis_engine::analysis::{ParamKind, tools};
+use rustgis_engine::cmd::layer::hidden_fill_opacity;
 use rustgis_engine::data::GeometryType;
-use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle};
+use rustgis_engine::map::fills::FillLayer;
+use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle, Rock, relief_ambient};
 use rustgis_engine::map::symbology::{
-    ClassRef, ClassStyle, Dash, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_LABEL, MAX_LINE_MARKER_SIZE, MAX_MARKER_INTERVAL,
-    MAX_STROKE_OFFSET, MAX_STROKE_WIDTH, MAX_STROKES, MAX_UNIQUE, MIN_MARKER_INTERVAL, OTHER_VALUES, Placements, normalize_label,
+    ClassRef, ClassStyle, Dash, LegendEntry, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_EXPRESSION_CLASSES, MAX_LABEL,
+    MAX_LINE_MARKER_SIZE, MAX_MARKER_INTERVAL, MAX_STROKE_OFFSET, MAX_STROKE_WIDTH, MAX_STROKES, MIN_MARKER_INTERVAL, OPEN_ABOVE,
+    OPEN_BELOW, OTHER_VALUES, Placements, fmt_num, normalize_label, range_label,
 };
 use rustgis_engine::map::tiles::{TileKind, TileLayer};
 use rustgis_engine::map::{
@@ -57,17 +60,15 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     if app.ui.right != Some(RightPane::TimeSeries) && app.workflow.pick.as_ref().is_some_and(|p| p.purpose == "ts_point") {
         app.workflow.pick = None;
     }
+    // So for the spectral profile's points, which it goes on picking until turned off.
+    if app.ui.right != Some(RightPane::Workflows) && app.workflow.pick.as_ref().is_some_and(|p| p.purpose == crate::spectralui::PURPOSE) {
+        app.workflow.pick = None;
+    }
     // A failed renderer switch waits for a field only while the Symbology pane shows its layer.
     if app.ui.right == Some(RightPane::Symbology) {
         let _ = pending_symbology(app, ui.ctx());
     } else {
         clear_pending_symbology(ui.ctx());
-    }
-    // A Zarr summary or a trend running on its thread lands whatever pane is in view (both are
-    // looked at: `|`, not `||`), and the frames go on while one runs so it's taken when it ends.
-    #[cfg(not(target_arch = "wasm32"))]
-    if crate::workspacepanes::land_summary(app) | crate::analysispane::land_trend(app) {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
     }
     // The pane in view always has its tab, however it was set.
     if let Some(right) = app.ui.right
@@ -82,11 +83,11 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         let room = ui.available_width();
         let max = (room - MIN_MAP_WIDTH).max(RIGHT_PANE_MAX.min(room)).max(260.0);
         // The Web Data pane's searches and lists want room, and the Notebook opens on half of
-        // it (at least 320 where the room allows), beside the map: each keeps its own width.
+        // it (at least 320 where the room allows), beside the map: each keeps its own width. Every
+        // other pane shares one, so switching tabs among them never moves the pane's edge (#2416).
         let (id, width) = match right {
             RightPane::WebData => ("right_pane_web", 440.0),
             RightPane::Notebook => ("right_pane_notebook", (room / 2.0).max(320.0).min(max)),
-            RightPane::DiagnosticLog => ("right_pane_diagnostic_log", 480.0),
             _ => ("right_pane", 320.0),
         };
         let pane = egui::Panel::right(id).resizable(true).default_size(width).size_range(260.0..=max).frame(frame).show(ui, |ui| {
@@ -116,6 +117,8 @@ pub(crate) fn close_pane_of(app: &mut RustGisApp, id: &str) -> bool {
     if !id.starts_with("ui.pane.") {
         return false;
     }
+    // Details is the Layer Properties pane on its Source tab (#1803): closing it closes that pane.
+    let id = if id == "ui.pane.details" { "ui.pane.layerProperties" } else { id };
     if let Some((pane, ..)) = LEFT_PANES.iter().find(|p| p.3 == id) {
         if app.ui.left == Some(*pane) {
             app.ui.left = None;
@@ -132,7 +135,6 @@ fn right_title(pane: RightPane) -> (&'static str, &'static str) {
         RightPane::Geoprocessing => ("Tools", "ui.pane.geoprocessing"),
         RightPane::Symbology => ("Symbology", "ui.pane.symbology"),
         RightPane::History => ("History", "ui.pane.history"),
-        RightPane::Details => ("Details", "ui.pane.details"),
         RightPane::Editing => ("Editing", "ui.pane.editing"),
         RightPane::Design => ("Data Design", "ui.pane.design"),
         RightPane::Workflows => ("Workflows", "ui.pane.workflows"),
@@ -142,7 +144,7 @@ fn right_title(pane: RightPane) -> (&'static str, &'static str) {
         RightPane::Profile => ("Profile", "ui.pane.profile"),
         RightPane::TimeSeries => ("Time Series", "ui.pane.timeSeries"),
         RightPane::Diagnostics => ("Diagnostic Monitor", "ui.pane.diagnostics"),
-        RightPane::DiagnosticLog => ("Diagnostics", "ui.pane.diagnosticLog"),
+        RightPane::DiagnosticLog => ("Messages", "ui.pane.diagnosticLog"),
         RightPane::Infographics => ("Infographics", "ui.pane.infographics"),
         RightPane::Report => ("Report", "ui.pane.report"),
         RightPane::Presentation => ("Presentation", "ui.pane.presentation"),
@@ -154,6 +156,7 @@ fn right_title(pane: RightPane) -> (&'static str, &'static str) {
         RightPane::Bookmarks => ("Bookmarks", "ui.pane.bookmarks"),
         RightPane::Format => ("Format", "ui.pane.format"),
         RightPane::Labeling => ("Labeling", "ui.pane.labeling"),
+        RightPane::LayerProperties => ("Layer Properties", "ui.pane.layerProperties"),
         // Its tab says which service it shows (see `right_name`).
         RightPane::WebData => ("Web Data", "ui.pane.webData"),
         // Its tab says whose panel it is (see `right_name`).
@@ -166,6 +169,8 @@ fn right_name(app: &RustGisApp, pane: RightPane) -> String {
     match pane {
         RightPane::Plugin => crate::pluginpanel::title(app),
         RightPane::WebData => tl!(web_data_title(app)).to_string(),
+        // Its tab names the layer it shows (#1803).
+        RightPane::LayerProperties => crate::layerprops::tab_name(app),
         _ => tl!(right_title(pane).0).to_string(),
     }
 }
@@ -196,7 +201,6 @@ fn right_pane(app: &mut RustGisApp, ui: &mut Ui, right: RightPane, t: &Tokens) {
             RightPane::Geoprocessing => geoprocessing(app, ui, t),
             RightPane::Symbology => symbology(app, ui, t),
             RightPane::History => history(app, ui, t),
-            RightPane::Details => details(app, ui, t),
             RightPane::Editing => crate::editpanes::editing(app, ui, t),
             RightPane::Design => crate::editpanes::design(app, ui, t),
             RightPane::Workflows => crate::analysispane::workflows(app, ui, t),
@@ -215,6 +219,7 @@ fn right_pane(app: &mut RustGisApp, ui: &mut Ui, right: RightPane, t: &Tokens) {
             RightPane::Bookmarks => crate::bookmarkpane::show(app, ui, t),
             RightPane::Format => crate::graphicformat::show(app, ui, t),
             RightPane::Labeling => crate::labelpane::show(app, ui, t),
+            RightPane::LayerProperties => crate::layerprops::show(app, ui, t),
             RightPane::Plugin => crate::pluginpanel::show(app, ui, t),
             RightPane::WebData => web_data(app, ui),
         });
@@ -223,7 +228,7 @@ fn right_pane(app: &mut RustGisApp, ui: &mut Ui, right: RightPane, t: &Tokens) {
 
 /// The Web Data services shown in the Web Data pane, by the `ui.dialog` name that opens them, and
 /// their titles.
-const WEB_DATA: [(&str, &str); 16] = [
+const WEB_DATA: [(&str, &str); 17] = [
     ("opendata", "Search Open Data"),
     ("stac", "STAC Search"),
     ("dataCubes", "Data Cubes"),
@@ -238,6 +243,7 @@ const WEB_DATA: [(&str, &str); 16] = [
     ("femaNfhl", "FEMA NFHL"),
     ("fieldsOfTheWorld", "Fields of the World"),
     ("earthaccess", "NASA Earthaccess"),
+    ("copernicus", "Copernicus Data Space"),
     ("nldi", "USGS NLDI"),
     ("embeddings", "Satellite Embeddings"),
 ];
@@ -272,6 +278,7 @@ fn web_data(app: &mut RustGisApp, ui: &mut Ui) {
         "femaNfhl" => crate::webdataui::fema_nfhl(app, ui),
         "fieldsOfTheWorld" => crate::webdataui::fields_of_the_world(app, ui),
         "earthaccess" => crate::earthaccessui::pane(app, ui),
+        "copernicus" => crate::copernicusui::pane(app, ui),
         "nldi" => crate::nldiui::pane(app, ui),
         "embeddings" => crate::embeddingsui::pane(app, ui),
         _ => crate::opendataui::dialog(app, ui),
@@ -487,12 +494,76 @@ fn glyph(p: &egui::Painter, at: egui::Pos2, g: Glyph, px: f32, c: egui::Color32)
     p.text(at, Align2::CENTER_CENTER, g.ch, egui::FontId::new(px, family), c);
 }
 
-/// Paints a symbol patch for a layer of geometry type `g`.
-pub fn patch(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType) {
+/// What a patch draws over its symbol, as the map does (#2490): a line's stacked strokes (a
+/// point's marks), whether they are drawn in levels, and a polygon's stacked fills. Empty, the
+/// symbol alone.
+#[derive(Clone, Copy, Default)]
+pub struct Stack<'a> {
+    pub strokes: &'a [LineStroke],
+    pub fills: &'a [FillLayer],
+    pub levels: bool,
+}
+
+impl<'a> Stack<'a> {
+    /// What layer `l` draws a row with: the row's own `strokes` and `fills` (a class's), else the
+    /// layer's, as the map finds them for a feature. A graphics layer's symbols are plain.
+    pub fn of(l: &'a Layer, strokes: &'a [LineStroke], fills: &'a [FillLayer]) -> Self {
+        if l.graphics {
+            return Stack::default();
+        }
+        Stack {
+            strokes: if strokes.is_empty() { &l.line_strokes } else { strokes },
+            fills: if fills.is_empty() { &l.fill_layers } else { fills },
+            levels: l.stroke_levels,
+        }
+    }
+}
+
+/// Paints a symbol patch for a layer of geometry type `g`, with its stack.
+pub fn patch(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType, stack: Stack) {
+    patch_sized(p, r, s, g, None, stack);
+}
+
+/// The one scale layer `l`'s size rows `sized` share, so the largest symbol, or its marks with
+/// their offsets, fills a patch's box (14 points) and the rows keep comparing.
+fn size_rows_scale(l: &Layer, sized: &[LegendEntry]) -> f32 {
+    let across = |e: &LegendEntry| {
+        let marks = Stack::of(l, &e.strokes, &e.fills).strokes;
+        if marks.is_empty() { e.symbol.size } else { 2.0 * marks_reach(marks, &e.symbol) }
+    };
+    let top = sized.iter().map(across).fold(0.0, f32::max);
+    if top > 14.0 { 14.0 / top } else { 1.0 }
+}
+
+/// [`patch`], its point scaled by `k` for rows whose sizes compare (size legends), else drawn
+/// between 4 and 14 points across. A stack is drawn by the editors' previews, shrunk to fit `r`
+/// (a point's marks at the map's size or the size row's `k` when they fit) and cut to it.
+fn patch_sized(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType, k: Option<f32>, stack: Stack) {
+    let (size, glyph_px) = match k {
+        Some(k) => (s.size * k, s.size * k * 1.4),
+        None => (s.size.clamp(4.0, 14.0), (s.size * 1.4).clamp(8.0, 18.0)),
+    };
+    let half = r.width().min(r.height()) / 2.0;
     match g {
+        GeometryType::Point if !stack.strokes.is_empty() => {
+            // The marks as large as the map draws them (a size row's at its scale), smaller only to fit.
+            let k = k.unwrap_or(1.0).min(half / marks_reach(stack.strokes, s));
+            marks_preview(&p.with_clip_rect(r), r.center(), stack.strokes, s, k);
+        }
+        GeometryType::Polyline if !stack.strokes.is_empty() => {
+            let k = (half / strokes_reach(stack.strokes, s)).min(1.0);
+            strokes_preview(&p.with_clip_rect(r), (r.min.x + 2.0, r.max.x - 2.0), r.center().y, stack.strokes, s, stack.levels, k);
+        }
+        GeometryType::Polygon if !stack.fills.is_empty() => crate::fill_editor::preview(p, r.shrink(2.0), stack.fills, s),
         GeometryType::Point => {
-            let rad = (s.size.clamp(4.0, 14.0)) / 2.0;
+            let rad = size / 2.0;
             let c = r.center();
+            // An image, without the symbol's colours, as on the map; one that doesn't draw is the
+            // circle below, as there.
+            if let Some(image) = crate::markerimages::image(p.ctx(), s.marker) {
+                image.paint(p, c, size);
+                return;
+            }
             match s.marker {
                 Marker::Square => {
                     p.rect_filled(Rect::from_center_size(c, vec2(rad * 1.8, rad * 1.8)), 0.0, c32(s.fill));
@@ -520,7 +591,7 @@ pub fn patch(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType) {
                 // An outline-only character shows in its outline's colour.
                 Marker::Char(g) => {
                     let col = if s.fill.a() == 0 && s.stroke_width > 0.0 { s.stroke } else { s.fill };
-                    glyph(p, c, g, (s.size * 1.4).clamp(8.0, 18.0), c32(col));
+                    glyph(p, c, g, glyph_px, c32(col));
                 }
                 _ => {
                     p.circle_filled(c, rad, c32(s.fill));
@@ -944,7 +1015,7 @@ fn source_name(src: &str) -> SourceName {
         // a path, its %-escapes decoded.
         if scheme == "file" || host.is_empty() {
             let path = if host.eq_ignore_ascii_case("localhost") { rest.find('/').and_then(|i| rest.get(i..)).unwrap_or("") } else { rest };
-            return path_name(&percent_decoded(path));
+            return path_name(&rustgis_engine::data::address::percent_decode(path));
         }
         // Only the host ignores case: a database's name doesn't.
         let db = DATABASE_SCHEMES
@@ -958,30 +1029,6 @@ fn source_name(src: &str) -> SourceName {
     path_name(src)
 }
 
-/// `%XX` escapes in a `file://` path decoded (`My%20Data.gpkg` is `My Data.gpkg`); a `%` not
-/// followed by two hex digits stays as it is.
-fn percent_decoded(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        // Two hex digits exactly (`from_str_radix` alone would take a sign).
-        let digits = b.get(i + 1..i + 3).filter(|h| h.iter().all(u8::is_ascii_hexdigit));
-        let hex = digits.and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
-        match (c, hex) {
-            (b'%', Some(v)) => {
-                out.push(v);
-                i += 3;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// A path as a source group: its last part, with the whole path as hover text.
 fn path_name(path: &str) -> SourceName {
     let name = path.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or(path);
@@ -991,8 +1038,19 @@ fn path_name(path: &str) -> SourceName {
 /// The source a layer was read from (a raster's file, or the dataset's file, address or
 /// database), if any: layers made in the app (samples, drawings, tool outputs) have none.
 fn layer_source(l: &Layer) -> Option<SourceName> {
-    let raster = l.raster.as_ref().and_then(|r| r.path.as_ref().or(r.file_name.as_ref()));
-    raster.or(l.dataset.source.as_ref()).filter(|s| !s.trim().is_empty()).map(|s| source_name(s.as_str()))
+    // A service's downloaded raster keeps the address it came from as its dataset source, not
+    // the file name it was read under: group it by that address, as a feature layer is. A layer
+    // with no raster keeps its dataset source as it is (a database's name, say), and a raster
+    // read from an address is grouped by that address rather than by a dataset's other one.
+    let source = l.dataset.source.as_deref();
+    let raster = l.raster.as_ref().and_then(|r| r.path.as_deref().or(r.file_name.as_deref()));
+    let address = source.filter(|s| is_address(s) && !raster.is_some_and(is_address));
+    address.or(raster).or(source).filter(|s| !s.trim().is_empty()).map(source_name)
+}
+
+/// Whether a source names a web address (`file://` paths are files, not addresses).
+fn is_address(s: &str) -> bool {
+    s.split_once("://").is_some_and(|(scheme, _)| !scheme.eq_ignore_ascii_case("file"))
 }
 
 /// A group's heading in a Layers view, with optional hover text.
@@ -1262,7 +1320,6 @@ fn service_group_row(
 /// Under it, indented, its layers and subgroups (#836) in drawing order; `depth` is its level (1
 /// at the top). With `reorder` the row drags the whole group, and it and its layers' rows join
 /// `rows`, where layers drop (see [`layer_drop`]).
-#[allow(clippy::too_many_arguments)]
 fn layer_group_row(
     app: &mut RustGisApp,
     ui: &mut Ui,
@@ -1322,8 +1379,10 @@ fn layer_group_row(
             let mut tr = group.transparency;
             ui.horizontal(|ui| {
                 let input_label = ui.label(tl!("Transparency"));
-                let r = ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).suffix(" %").integer()).labelled_by(input_label.id);
-                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                let r = ui
+                    .add(egui::Slider::new(&mut tr, 0.0..=100.0).update_while_editing(false).suffix(" %").integer())
+                    .labelled_by(input_label.id);
+                if r.drag_stopped() || (crate::widgets::changed(&r) && !r.dragged()) {
                     let _ = app.run("group.set", json!({"group": group.id, "transparency": tr}));
                 }
             });
@@ -1597,7 +1656,11 @@ fn visibility_box(ui: &Ui, cb: Rect, visible: bool, t: &Tokens) {
 /// shows or hides it; right-click zooms to it (known bounds, an archive or GeoTIFF), sets its
 /// opacity, moves it up or down (not with `reorder` off: the list is filtered), or removes it.
 fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reorder: bool, tile: &TileLayer, t: &Tokens) -> Rect {
-    let shown = if tile.overlay { format!("{} · {}", tile.name, tl!("overlay")) } else { tile.name.clone() };
+    let mut shown = if tile.overlay { format!("{} · {}", tile.name, tl!("overlay")) } else { tile.name.clone() };
+    let disk = disk_note(app, None, Some(i));
+    if let Some((note, _, _)) = disk.as_ref().filter(|(note, _, _)| !note.is_empty()) {
+        shown = format!("{shown}  {note}");
+    }
     let name = row_name(ui, shown.clone(), regular(12.5), ui.available_width() - NAME_X - 8.0);
     let sense = if reorder { Sense::click_and_drag() } else { Sense::click() };
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), name.row_h), sense);
@@ -1649,8 +1712,10 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
     x += 24.0;
     // Unavailable archives are red; otherwise grey when hidden, transparent, or outside the
     // slider's step (the box still shows the choice to show it).
-    let color = if tile.error.is_some() {
+    let color = if tile.error.is_some() || disk.as_ref().is_some_and(|(_, _, tint)| *tint == Some(true)) {
         t.red
+    } else if disk.as_ref().is_some_and(|(_, _, tint)| *tint == Some(false)) {
+        t.amber
     } else if tile.draws() && tile.opacity > 0.0 {
         t.text
     } else {
@@ -1671,8 +1736,13 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
         hover.push('\n');
         hover.push_str(error);
     }
+    if let Some((_, detail, _)) = &disk {
+        hover.push('\n');
+        hover.push_str(detail);
+    }
     let resp = resp.on_hover_text(hover);
     resp.context_menu(|ui| {
+        service_login_menu(app, ui, &tile.connection);
         // Stored bounds, an archive or GeoTIFF say what the layer covers.
         if tile.bounds.is_some() || matches!(tile.kind, TileKind::PmTiles | TileKind::Cog) {
             if ui.button(tl!("Zoom To Layer")).clicked() {
@@ -1684,12 +1754,12 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
         ui.horizontal(|ui| {
             let input_label = ui.label(tl!("Opacity"));
             let mut o = tile.opacity * 100.0;
-            let slider = ui.add(egui::Slider::new(&mut o, 0.0..=100.0).suffix("%")).labelled_by(input_label.id);
-            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+            let slider = ui.add(egui::Slider::new(&mut o, 0.0..=100.0).update_while_editing(false).suffix("%")).labelled_by(input_label.id);
+            if slider.drag_stopped() || (crate::widgets::changed(&slider) && !slider.dragged()) {
                 action = Some(("map.setTiles", json!({"index": i, "opacity": o / 100.0})));
             }
         });
-        ui.menu_button(crate::i18n::fmt("Blend: {mode}", &[("mode", tl_raw!(tile.blend.label()))]), |ui| {
+        crate::widgets::submenu(ui, &crate::i18n::fmt("Blend: {mode}", &[("mode", tl_raw!(tile.blend.label()))]), |ui| {
             for b in rustgis_engine::map::effects::Blend::ALL {
                 if ui.radio(tile.blend == b, tl!(b.label())).clicked() {
                     action = Some(("map.setTiles", json!({"index": i, "blend": b.code()})));
@@ -1697,7 +1767,6 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
                 }
             }
         })
-        .response
         .on_hover_text(tl!("How the layer's colours combine with the tile layers and basemap beneath."));
         // A layer its service draws on request: one picture of the view, or tiles (#1162).
         if tile.on_request() {
@@ -1708,7 +1777,7 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
             } else {
                 tl!("Tiles").to_string()
             };
-            ui.menu_button(crate::i18n::fmt("Draw as: {how}", &[("how", &shown)]), |ui| {
+            crate::widgets::submenu(ui, &crate::i18n::fmt("Draw as: {how}", &[("how", &shown)]), |ui| {
                 if ui.radio(tile.single_image, tl!("Single image")).on_hover_text(tl!("One picture of the view: symbols and labels aren't cut at tile edges, and the service is asked once a view. Drawn in tiles on the globe, on a tilted map, or in a projection the service doesn't offer.")).clicked() {
                     action = Some(("map.setTiles", json!({"index": i, "singleImage": true})));
                     ui.close();
@@ -1726,7 +1795,6 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
                     ui.close();
                 }
             })
-            .response
             .on_hover_text(tl!("Whether the service is asked for one picture of the view or for tiles."));
         }
         ui.separator();
@@ -1738,9 +1806,29 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
             action = Some(("map.setTiles", json!({"index": i, "move": "down"})));
             ui.close();
         }
-        if tile.archive_file().is_some() && ui.button(tl!("Repair Data Source…")).clicked() {
-            action = Some(("ui.dialog", json!({"name": "repairTiles", "index": i})));
+        // Its raster tiles over the view, as a GeoTIFF placed on the ground.
+        // Not a vector archive (one whose source layers its header names).
+        if matches!(tile.kind, TileKind::Raster | TileKind::PmTiles | TileKind::MbTiles)
+            && sources.is_none()
+            && ui.button(tl!("Export Raster…")).clicked()
+        {
+            action = Some(("ui.exportRaster", json!({"tiles": i})));
             ui.close();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if tile.archive_file().is_some() {
+            if ui
+                .button(tl!("Reload Data"))
+                .on_hover_text(tl!("Manually reread this archive from disk without changing its presentation. Undo cannot restore overwritten file contents."))
+                .clicked()
+            {
+                action = Some(("map.reloadTiles", json!({"index": i})));
+                ui.close();
+            }
+            if ui.button(tl!("Repair Data Source…")).clicked() {
+                action = Some(("ui.dialog", json!({"name": "repairTiles", "index": i})));
+                ui.close();
+            }
         }
         if ui.button(tl!("Remove")).clicked() {
             action = Some(("map.removeTiles", json!({"index": i})));
@@ -1834,6 +1922,72 @@ impl RowName {
     }
 }
 
+/// The changed-on-disk note for a layer or tile layer `tile` of the active map (the desktop app
+/// watches linked files: see `diskwatch`), as `diskwatch::row_note` words it.
+fn disk_note(app: &RustGisApp, layer: Option<&Layer>, tile: Option<usize>) -> Option<(String, String, Option<bool>)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if !app.watch_files {
+            return None;
+        }
+        // As the notification decides it: a layer with no linked file (an editable GeoPackage
+        // table) can't be relinked.
+        let (status, repairable) = match (layer, tile) {
+            (Some(l), _) => (crate::diskwatch::layer_status(app, l), l.linked_file().is_some()),
+            (None, Some(i)) => (crate::diskwatch::tiles_status(app, i), true),
+            (None, None) => return None,
+        };
+        crate::diskwatch::row_note(&status, repairable)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (app, layer, tile);
+        None
+    }
+}
+
+/// The note after a layer's name, its details and tint, as [`disk_note`] gives them. A layer read
+/// whole from a Shapefile or GeoJSON file it publishes to (`source.publish`) also says whether it
+/// holds edits the file lacks (`syncmark`), and its file's changes point to Publish to Source,
+/// which refuses to overwrite them, rather than Reload Data, which can't read it again.
+pub(crate) fn layer_note(app: &mut RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<(String, String, Option<bool>)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::diskwatch::Status;
+        if !crate::diskwatch::publishes(l) || crate::diskwatch::reloadable(l) {
+            return disk_note(app, Some(l), None);
+        }
+        let edited = crate::syncmark::edited(app, l, ctx) == Some(true);
+        let status = if app.watch_files { crate::diskwatch::layer_status(app, l) } else { Status::Unchanged };
+        let unpublished = tl!("This layer has edits its file doesn't have yet. Publish to Source writes them to the file.");
+        match (status, edited) {
+            (Status::Changed, true) => Some((
+                tl!("(edits not published, changed on disk)").to_string(),
+                tl!("This layer has edits its file doesn't have, and the file changed on disk since it was read. Publish to Source refuses rather than overwrite that change; Export Features keeps the edits in a new file.").to_string(),
+                Some(false),
+            )),
+            (Status::Changed, false) => Some((
+                tl!("(changed on disk)").to_string(),
+                tl!("Changed on disk: the file may have changed since it was read. Add it again to see the change; Source File State checks it.").to_string(),
+                Some(false),
+            )),
+            (Status::Unchanged | Status::Folder, true) => Some((tl!("(edits not published)").to_string(), unpublished.to_string(), None)),
+            // Missing or unreadable: Publish refuses a file unlike its record, so edits can only be
+            // exported until it's back.
+            (status, edited) => crate::diskwatch::row_note(&status, false).map(|(note, detail, tint)| {
+                let blocked = tl!("This layer has edits its file doesn't have. Publish to Source can't write them until the file is back as it was read; Export Features keeps them in a new file.");
+                let detail = if edited { crate::i18n::fmt("{detail}\n{blocked}", &[("detail", &detail), ("blocked", blocked)]) } else { detail };
+                (note, detail, tint)
+            }),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = ctx;
+        disk_note(app, Some(l), None)
+    }
+}
+
 /// A layer's row and, expanded, its legend; returns the rectangle of both. With `reorder` off
 /// (the list is filtered or children are sorted by name) the row can't be dragged.
 fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: bool, t: &Tokens) -> Rect {
@@ -1847,7 +2001,11 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
         let w = crate::widgets::text_w(ui, &text, regular(10.5)) + 10.0;
         (text, w)
     });
-    let shown = if l.definition_query.is_some() { format!("{}  {}", l.name, tl!("(filtered)")) } else { l.name.clone() };
+    let mut shown = if l.definition_query.is_some() { format!("{}  {}", l.name, tl!("(filtered)")) } else { l.name.clone() };
+    let disk = layer_note(app, l, ui.ctx());
+    if let Some((note, _, _)) = disk.as_ref().filter(|(note, _, _)| !note.is_empty()) {
+        shown = format!("{shown}  {note}");
+    }
     // Every picked row looks alike; the active one has an outline (`active_outline`), not a
     // bolder name, which would read as the only one picked.
     let font = regular(12.5);
@@ -1875,10 +2033,12 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
     // range, what its definition query keeps, so the pane still shows its symbology.
     let vector_legend = match &raster_legend {
         Some(_) => Vec::new(),
-        None => l
-            .shown_legend(scale)
-            .or_else(|| (!l.in_scale_range(scale)).then(|| l.renderer.legend_for(&l.dataset, &l.visible_rows())))
-            .unwrap_or_default(),
+        None => interface_legend(
+            &l.renderer,
+            l.shown_legend(scale)
+                .or_else(|| (!l.in_scale_range(scale)).then(|| l.with_size_legend(l.renderer.legend_for(&l.dataset, &l.visible_rows()))))
+                .unwrap_or_default(),
+        ),
     };
     let has_legend = match &raster_legend {
         Some(rl) => !rl.is_empty(),
@@ -1908,14 +2068,16 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
         };
         icons::paint(ui.painter(), pr, icon, t.icon, t.accent);
     } else {
-        patch(ui.painter(), pr, &l.renderer.base_symbol(), l.geometry_type());
+        patch(ui.painter(), pr, &l.renderer.base_symbol(), l.geometry_type(), Stack::of(l, &[], &[]));
     }
     x += 24.0;
     let out_of_range = !app.session.map().in_scale_range(l, scale);
     let group_hidden = !app.session.map().shows(l) && l.visible;
     let missing = l.raster.as_ref().is_some_and(|r| r.data.is_none()) || l.source.as_ref().is_some_and(|s| s.error.is_some());
-    let color = if missing {
+    let color = if missing || disk.as_ref().is_some_and(|(_, _, tint)| *tint == Some(true)) {
         t.red
+    } else if disk.as_ref().is_some_and(|(_, _, tint)| *tint == Some(false)) {
+        t.amber
     } else if !l.visible || out_of_range || group_hidden {
         t.text_disabled
     } else {
@@ -1951,6 +2113,7 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
                     ("renderer", tl_raw!(rl.style.renderer.label())),
                 ],
             ),
+            None if rl.error.is_none() && rl.in_place => tl!("Reading in place…").to_string(),
             None => crate::i18n::fmt(
                 "The raster's data couldn't be read: {error}",
                 &[("error", rl.error.as_deref().or(rl.path.as_deref()).unwrap_or(""))],
@@ -1964,16 +2127,26 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
                 let format = src.info().map(|i| i.format).unwrap_or("");
                 let total = src.info().and_then(|i| i.count).map(|c| c.to_string()).unwrap_or_else(|| "?".into());
                 match src.sampled() {
-                    Some((n, matched)) => crate::i18n::fmt(
-                        "{type} · {format}, read in place · a sample of {n} of the {matched} features in view (zoom in to see them all) · {renderer}",
-                        &[
+                    Some((n, matched)) => {
+                        let args = [
                             ("type", tl_raw!(l.geometry_type().label())),
                             ("format", format),
                             ("n", &n.to_string()),
                             ("matched", &matched.to_string()),
                             ("renderer", tl_raw!(l.renderer.kind_label())),
-                        ],
-                    ),
+                        ];
+                        if src.sampled_matches() {
+                            crate::i18n::fmt(
+                                "{type} · {format}, read in place · a sample of {n} of the {matched} features in view matching the definition query (zoom in to see them all) · {renderer}",
+                                &args,
+                            )
+                        } else {
+                            crate::i18n::fmt(
+                                "{type} · {format}, read in place · a sample of {n} of the {matched} features in view (zoom in to see them all) · {renderer}",
+                                &args,
+                            )
+                        }
+                    }
                     None => crate::i18n::fmt(
                         "{type} · {format}, read in place · {n} of {total} features in view · {renderer}",
                         &[
@@ -1998,6 +2171,10 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
     };
     // A name cut short shows whole above the details.
     let tip = if elided { format!("{shown}\n{tip}") } else { tip };
+    let tip = match &disk {
+        Some((_, detail, _)) => format!("{tip}\n{detail}"),
+        None => tip,
+    };
     let resp = resp.on_hover_text(tip);
     resp.context_menu(|ui| layer_menu(app, ui, l, reorder));
     // Legend classes.
@@ -2016,11 +2193,15 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
             ui.add_space(74.0);
             ui.label(egui::RichText::new(field).size(11.0).color(t.text_dim));
         });
-        for e in vector_legend.iter().take(40) {
+        // At most 40 classes, then the size rows the legend ends with.
+        let sizes = l.with_size_legend(Vec::new()).len().min(vector_legend.len());
+        let (classes, sized) = vector_legend.split_at(vector_legend.len() - sizes);
+        let k = size_rows_scale(l, sized);
+        for (e, scale) in classes.iter().take(40).map(|e| (e, None)).chain(sized.iter().map(|e| (e, Some(k)))) {
             let (r, response) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
             response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &e.label));
             let pr = Rect::from_center_size(pos2(r.min.x + 84.0, r.center().y), vec2(18.0, 14.0));
-            patch(ui.painter(), pr, &e.symbol, l.geometry_type());
+            patch_sized(ui.painter(), pr, &e.symbol, l.geometry_type(), scale, Stack::of(l, &e.strokes, &e.fills));
             ui.painter().text(pos2(r.min.x + 100.0, r.center().y), Align2::LEFT_CENTER, &e.label, regular(11.5), t.text);
         }
     }
@@ -2035,6 +2216,83 @@ fn new_group(app: &mut RustGisApp, params: Value) {
     let _ = app.run("ui.dialog", json!({"name": "renameGroup"}));
     app.dialogs.layer = id.to_string();
     app.dialogs.text = name;
+}
+
+/// The several layers' Extrusion and Extrusion Base menus (#2160): the picked polygon layers
+/// raised alike by a numeric field every one has, or flattened, and, once all are raised, what
+/// they stand on. Two entries one level deep, as the ribbon's Type and Base menus, rather than
+/// nested menus three deep. One command for them all, so one undo step. Buttons, not radios: their
+/// settings may differ, and the ribbon shows one layer's.
+fn extrusion_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32]) {
+    let m = app.session.map();
+    let polygons: Vec<&Layer> =
+        picked.iter().filter_map(|id| m.layer(*id)).filter(|l| l.geometry_type() == GeometryType::Polygon).collect();
+    let Some((first, rest)) = polygons.split_first() else {
+        for label in ["Extrusion", "Extrusion Base"] {
+            ui.add_enabled(false, egui::Button::new(tl!(label))).on_disabled_hover_text(tl!("None of these layers are polygon layers."));
+        }
+        return;
+    };
+    // The numeric fields every one has, as the first spells them (the command matches each
+    // layer's own spelling).
+    let numeric = |l: &Layer, n: &str| l.dataset.field_index(n).and_then(|i| l.dataset.fields.get(i)).is_some_and(|f| f.ty.is_numeric());
+    let fields: Vec<String> = first
+        .dataset
+        .fields
+        .iter()
+        .filter(|f| f.ty.is_numeric() && rest.iter().all(|l| numeric(l, &f.name)))
+        .map(|f| f.name.clone())
+        .collect();
+    let raised = polygons.iter().all(|l| l.extrusion.is_some());
+    let ids: Vec<u32> = polygons.iter().map(|l| l.id).collect();
+    let run = |app: &mut RustGisApp, ui: &mut Ui, id: &str, mut p: Value| {
+        p["layer"] = json!(ids);
+        let _ = app.run(id, p);
+        ui.close();
+    };
+    // What both menus say first: that the others picked are left out, or that no field is shared.
+    let only = (ids.len() < picked.len()).then(|| {
+        let (n, all) = (ids.len().to_string(), picked.len().to_string());
+        crate::i18n::fmt("Polygon layers only: {n} of the {all} selected", &[("n", &n), ("all", &all)])
+    });
+    let head = |ui: &mut Ui| {
+        if let Some(text) = &only {
+            ui.weak(text.as_str());
+            ui.separator();
+        }
+    };
+    let by = |f: &str| crate::i18n::fmt("By {field}", &[("field", f)]);
+    let no_field = tl!("These layers share no numeric field.");
+    crate::widgets::submenu(ui, tl!("Extrusion"), |ui| {
+        head(ui);
+        if ui.button(tl!("None")).clicked() {
+            run(app, ui, "layer.extrusion", json!({"type": "none"}));
+        }
+        for f in &fields {
+            if ui.button(by(f)).clicked() {
+                run(app, ui, "layer.extrusion", json!({"type": "field", "field": f}));
+            }
+        }
+        if fields.is_empty() {
+            ui.weak(no_field);
+        }
+    });
+    if !raised {
+        ui.add_enabled(false, egui::Button::new(tl!("Extrusion Base")))
+            .on_disabled_hover_text(tl!("Extrude them all first: the base is what their walls stand on."));
+        return;
+    }
+    crate::widgets::submenu(ui, tl!("Extrusion Base"), |ui| {
+        head(ui);
+        if ui.button(tl!("Ground")).clicked() {
+            run(app, ui, "layer.extrusionBase", json!({"field": null, "base": 0}));
+        }
+        for f in &fields {
+            if ui.button(by(f)).clicked() {
+                run(app, ui, "layer.extrusionBase", json!({"field": f}));
+            }
+        }
+    });
 }
 
 /// The menu of several layers picked together: what acts on all of them; what needs one layer is
@@ -2091,7 +2349,7 @@ fn layers_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32], reorder: bool)
             .and_then(|id| m.group_of(*id))
             .map(|g| g.id)
             .filter(|g| picked.iter().all(|id| m.group_of(*id).map(|x| x.id) == Some(*g)));
-        ui.menu_button(tl!("Group"), |ui| {
+        crate::widgets::submenu(ui, tl!("Group"), |ui| {
             if ui.button(tl!("New Group")).clicked() {
                 new_group(app, json!({"layers": picked, "parent": shared}));
                 ui.close();
@@ -2109,6 +2367,7 @@ fn layers_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32], reorder: bool)
             }
         });
     }
+    extrusion_menu(app, ui, picked);
     ui.separator();
     for label in ["Attribute Table", "Symbology"] {
         ui.add_enabled(false, egui::Button::new(tl!(label))).on_disabled_hover_text(tl!("Pick a single layer."));
@@ -2116,6 +2375,19 @@ fn layers_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32], reorder: bool)
     ui.separator();
     if ui.button(tl!("Remove")).clicked() {
         act(app, ui, "layer.remove", Value::Null);
+    }
+}
+
+/// Reopens the login of the saved service a layer records, without guessing from its address.
+fn service_login_menu(app: &mut RustGisApp, ui: &mut Ui, connection: &str) {
+    let Some(c) = app.session.connections.find(connection).filter(|c| rustgis_engine::service_logins::is_service(c) && !c.auth.is_empty())
+    else {
+        return;
+    };
+    if ui.button(crate::i18n::fmt("Log In to {name}…", &[("name", &c.name)])).clicked() {
+        let id = c.id.clone();
+        crate::connectionui::log_in(app, &id);
+        ui.close();
     }
 }
 
@@ -2138,6 +2410,7 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let _ = app.run("ui.refreshService", json!({"layer":l.id}));
         ui.close();
     }
+    service_login_menu(app, ui, &l.connection);
     let login = l.source.as_ref().and_then(|s| {
         let (kind, database) = rustgis_engine::connections::layer_database(s)?;
         let connections: Vec<_> = app.session.connections.matching_database(kind, database).into_iter().cloned().collect();
@@ -2164,6 +2437,7 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
                     key,
                     connections: connections.iter().map(|c| c.id.clone()).collect(),
                     layers: vec![l.id],
+                    tiles: 0,
                     opened,
                     prompted: true,
                 },
@@ -2201,17 +2475,26 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
     if !l.is_raster()
         && ui.button(tl!("Convert To Annotation")).on_hover_text(tl!("Convert this layer's labels into an annotation layer.")).clicked()
     {
-        if let Err(e) = app.run("labels.convert", json!({"layer": l.id})) {
+        if let Err(e) = app.run_by_user("labels.convert", json!({"layer": l.id})) {
             app.session.notify(e, true);
         }
         ui.close();
     }
     if l.is_streamed() && ui.button(tl!("Load All Features")).clicked() {
+        // Read on a thread of its own in the desktop app (see `readjob`).
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = crate::readjob::run(app, "layer.loadAll", json!({"layer": l.id}));
+        #[cfg(target_arch = "wasm32")]
         let _ = app.run("layer.loadAll", json!({"layer": l.id}));
         ui.close();
     }
     if l.linked_file().is_some() && ui.button(tl!("Repair Data Source…")).clicked() {
         let _ = app.run("ui.dialog", json!({"name": "repairSource", "layer": l.id}));
+        ui.close();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::reloaddata::supported(l) && ui.button(tl!("Reload Data")).on_hover_text(tl!(crate::reloaddata::HELP)).clicked() {
+        let _ = app.run("ui.reloadData", json!({"layer": l.id}));
         ui.close();
     }
     ui.separator();
@@ -2251,12 +2534,9 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         ui.close();
     }
     ui.separator();
+    // F2 too (`keymap::DEFAULTS`).
     if ui.button(tl!("Rename…")).clicked() {
         let _ = app.run("ui.dialog", json!({"name": "renameLayer"}));
-        ui.close();
-    }
-    if !l.is_raster() && ui.button(tl!("Define Projection…")).clicked() {
-        let _ = app.run("ui.dialog", json!({"name": "defineProjection"}));
         ui.close();
     }
     // Layer groups (#413): a service's collections stay in their service group.
@@ -2264,7 +2544,7 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let m = app.session.map();
         let groups: Vec<(u32, String)> = m.groups.iter().map(|g| (g.id, group_path(m, g.id))).collect();
         let current = m.group_of(l.id).map(|g| g.id);
-        ui.menu_button(tl!("Group"), |ui| {
+        crate::widgets::submenu(ui, tl!("Group"), |ui| {
             // In the layer's group, if it has one (#836).
             if ui.button(tl!("New Group")).clicked() {
                 new_group(app, json!({"layers": [l.id], "parent": current}));
@@ -2292,24 +2572,8 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
             ui.close();
         }
     } else {
-        if ui.button(tl!("Definition Query…")).clicked() {
-            let _ = app.run("ui.dialog", json!({"name": "definitionQuery"}));
-            ui.close();
-        }
-        if l.time.is_some() {
-            if ui.button(tl!("Unbind From Time Slider")).clicked() {
-                let _ = app.run("time.unbind", json!({"layer": l.id}));
-                ui.close();
-            }
-        } else if ui
-            .add_enabled(!rustgis_engine::map::time::time_fields(&l.dataset).is_empty(), egui::Button::new(tl!("Bind To Time Slider")))
-            .on_disabled_hover_text(tl!("No field of this layer holds dates."))
-            .clicked()
-        {
-            app.time.hidden = false;
-            let _ = app.run("time.bind", json!({"layer": l.id}));
-            ui.close();
-        }
+        // The definition query, the time slider binding and Define Projection… are on the Query,
+        // Time and Source tabs of Properties… (#1803).
         if ui.button(tl!("Export Features…")).clicked() {
             let _ = app.run("ui.exportLayer", Value::Null);
             ui.close();
@@ -2320,11 +2584,20 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let _ = app.run("layer.remove", json!({"layer": l.id}));
         ui.close();
     }
+    // Last, as in other desktop GIS (#1803).
+    ui.separator();
+    if ui.button(tl!("Properties…")).clicked() {
+        if let Err(e) = app.run("ui.pane.layerProperties", json!({"layer": l.id})) {
+            app.session.notify(e, true);
+        }
+        ui.close();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Catalog
 
+/// Draws the Browser; toolbox identities use source names so translations can share labels.
 fn catalog(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
@@ -2343,7 +2616,9 @@ fn catalog(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     });
                 }
             });
-            egui::CollapsingHeader::new(egui::RichText::new(tl!("Toolboxes")).font(semibold(12.5))).default_open(true).show(ui, |ui| {
+            let toolboxes =
+                egui::CollapsingHeader::new(egui::RichText::new(tl!("Toolboxes")).font(semibold(12.5))).id_salt("browser_toolboxes");
+            toolboxes.default_open(true).show(ui, |ui| {
                 let mut boxes: Vec<&str> = tools().map(|t| t.toolbox.split(" › ").next().unwrap_or(t.toolbox)).collect();
                 boxes.sort();
                 boxes.dedup();
@@ -2357,7 +2632,7 @@ fn catalog(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     });
                 };
                 for b in boxes {
-                    egui::CollapsingHeader::new(crate::i18n::location(b)).default_open(false).show(ui, |ui| {
+                    egui::CollapsingHeader::new(crate::i18n::location(b)).id_salt(("toolbox", b)).default_open(false).show(ui, |ui| {
                         let in_box: Vec<&rustgis_engine::analysis::ToolSpec> =
                             tools().filter(|x| x.toolbox.split(" › ").next() == Some(b)).collect();
                         // A large toolbox (the GeoLibre suite) opens one level at a time:
@@ -2555,6 +2830,12 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "json",
                         "csv",
                         "tsv",
+                        "txt",
+                        "dat",
+                        "csv.gz",
+                        "tsv.gz",
+                        "txt.gz",
+                        "dat.gz",
                         "shp",
                         "tif",
                         "tiff",
@@ -2568,6 +2849,7 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "rgis",
                         "rgisx",
                         "rgispkg",
+                        "rgisfield",
                         "rgismap",
                         "rgismpk",
                         "rgislyr",
@@ -2673,6 +2955,13 @@ pub struct GpForm {
     pub confirm_uninstall: bool,
     /// Why the last uninstall failed (apart from `last`, which a tool run sets too).
     pub uninstall_error: Option<String>,
+    /// GeoLibre tool translations downloading (#2224): the language, and the tools they name
+    /// (or why they couldn't be had) once the download is done.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub language_download: Option<(&'static str, crate::Slot<Result<usize, String>>)>,
+    /// Why the last download or removal of tool translations failed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub language_error: Option<String>,
 }
 
 /// A plugin tool running on a thread of its own.
@@ -2702,7 +2991,8 @@ fn start_tool_run(app: &mut RustGisApp, tool: &'static str, params: &Value, ctx:
     match rustgis_engine::cmd::gp::tool_start(&mut app.session, tool, params) {
         Ok(run) => {
             let slot = crate::Slot::default();
-            let control = rustgis_engine::analysis::control::Control::new();
+            // Cancel stops it, so it takes no work cap.
+            let control = rustgis_engine::analysis::control::Control::stoppable();
             let (out, ctl, ctx) = (slot.clone(), control.clone(), ctx.clone());
             let id = run.id;
             let spawned = std::thread::Builder::new().name(tool.into()).spawn(move || {
@@ -2744,7 +3034,7 @@ pub fn poll_tool_run(app: &mut RustGisApp, ctx: &egui::Context) {
     };
     let (id, tool) = (job.id, job.tool);
     app.gp.tool_run = None;
-    let r = rustgis_engine::cmd::gp::tool_complete(&mut app.session, id, done).and_then(|_| app.run("gp.finish", json!({"id": id})));
+    let r = rustgis_engine::cmd::gp::tool_complete(&mut app.session, id, done).and_then(|_| app.finish_gp(id));
     finished(app, tool, r);
 }
 
@@ -2795,7 +3085,7 @@ pub fn poll_plugin_run(app: &mut RustGisApp, ctx: &egui::Context) {
     };
     let (id, tool) = (job.id, job.tool);
     app.gp.plugin_run = None;
-    let r = rustgis_engine::cmd::gp::plugin_complete(&mut app.session, id, result).and_then(|_| app.run("gp.finish", json!({"id": id})));
+    let r = rustgis_engine::cmd::gp::plugin_complete(&mut app.session, id, result).and_then(|_| app.finish_gp(id));
     finished(app, tool, r);
 }
 
@@ -2835,8 +3125,9 @@ pub fn start_geolibre_load(app: &mut RustGisApp) {
     app.gp.web_load = Some(slot);
 }
 
+/// What a slot holds, taken out; a poisoned slot is still read, as its writer fills it anyway.
 fn take<T>(slot: &crate::Slot<T>) -> Option<T> {
-    slot.lock().ok().and_then(|mut s| s.take())
+    slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
 /// Picks up what the browser's GeoLibre runner finished: the tool list, or a tool run.
@@ -2854,7 +3145,7 @@ pub fn poll_geolibre(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     if let Some((id, tool, out)) = app.gp.web_run.as_ref().and_then(|(id, tool, slot)| take(slot).map(|o| (*id, *tool, o))) {
         app.gp.web_run = None;
-        let r = rustgis_engine::cmd::gp::external_complete(&mut app.session, id, out).and_then(|_| app.run("gp.finish", json!({"id": id})));
+        let r = rustgis_engine::cmd::gp::external_complete(&mut app.session, id, out).and_then(|_| app.finish_gp(id));
         finished(app, tool, r);
     }
     if app.gp.web_load.is_some() || app.gp.web_run.is_some() {
@@ -2949,8 +3240,20 @@ fn layer_list(form: &mut GpForm, ui: &mut Ui, param: &'static str, cur: &str, of
     }
 }
 
+/// Whether a layer parameter's picker offers no layer (`—`), to leave it out again once one is
+/// picked: when it is optional and names no layer as its default. One that does would run with
+/// that layer when left empty (its default is filled in then), so `—` would show one layer and
+/// run with another (#1517). A built-in tool's `layer` picker offers none (A5 Grid's follows the
+/// active layer).
+fn no_layer_offered(p: &rustgis_engine::analysis::ParamSpec) -> bool {
+    !p.required && serde_json::from_str::<String>(p.default).map_or(true, |n| n.is_empty())
+}
+
 impl GpForm {
-    /// Opens a tool, pre-filling layer parameters from the active layer.
+    /// Opens a tool, pre-filling layer parameters from the active layer. An external tool's
+    /// optional input stays empty until it's picked: it changes what the tool does, as a weight
+    /// or a mask would (#1517). A built-in tool's is filled as before; the form shows A5 Grid's,
+    /// the only one, when its options ask for it (`applies`).
     pub fn open(&mut self, tool: Option<&'static str>, s: &Session) {
         self.tool = tool;
         self.values.clear();
@@ -2960,8 +3263,16 @@ impl GpForm {
         self.last = None;
         let Some(spec) = tool.and_then(rustgis_engine::analysis::tool) else { return };
         let active = s.active_layer.and_then(|id| s.map().layer(id));
+        let external = rustgis_engine::analysis::is_external(spec);
         for p in spec.params {
             let v = match p.kind {
+                ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::PointLayer | ParamKind::RasterLayer | ParamKind::VectorLayer
+                    if external && !p.required =>
+                {
+                    // A layer it names as its default is what a run without one uses (the
+                    // default is filled in then): shown, so the form runs with what it shows.
+                    serde_json::from_str::<String>(p.default).ok().filter(|n| !n.is_empty())
+                }
                 ParamKind::Layer => active.map(|l| l.name.clone()),
                 ParamKind::PolygonLayer => active
                     .filter(|l| l.geometry_type() == GeometryType::Polygon)
@@ -2985,10 +3296,14 @@ impl GpForm {
         }
     }
 
-    /// Puts a standalone table, by its id, in the open tool's first input that takes one.
+    /// Puts a standalone table, by its id, in the open tool's input that takes one: a required
+    /// one before an optional one.
     pub fn pick_table(&mut self, id: u32, s: &Session) {
         let spec = self.tool.and_then(rustgis_engine::analysis::tool);
-        let input = spec.and_then(|t| t.params.iter().find(|p| p.kind == ParamKind::Layer));
+        // Into a required input that takes a table before an optional one, as `first_layer`
+        // orders them.
+        let layers = || spec.into_iter().flat_map(|t| t.params.iter()).filter(|p| p.kind == ParamKind::Layer);
+        let input = layers().find(|p| p.required).or_else(|| layers().next());
         if let (Some(p), Some(t)) = (input, s.project.table(id)) {
             self.values.insert(p.name, t.name.clone());
             self.tables.insert(p.name, id);
@@ -3021,12 +3336,36 @@ impl GpForm {
     }
 }
 
+/// The card that stands for the GeoLibre tools on a phone, which can't run their program.
+fn no_geolibre_here(ui: &mut Ui, t: &Tokens) {
+    ui.add_space(6.0);
+    egui::Frame::NONE.stroke(Stroke::new(1.0, t.border)).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(10)).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(tl!("Whitebox and GeoLibre tools")).font(semibold(13.0)));
+            ui.label(
+                egui::RichText::new(tl!(
+                    "Not on a phone: these tools run as a program of their own, which a phone can't run. Use them in RustGIS on a computer."
+                ))
+                .size(11.5)
+                .color(t.text_dim),
+            );
+        },
+    );
+}
+
 /// Where to get the GeoLibre tools when the runner isn't installed (desktop and CLI builds only).
 fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // Read directly, not through Session::run: a command each frame would bump the session's
     // revision and make the views redraw. The status itself is cached in the runner module.
     let status = rustgis_engine::cmd::gp::geolibre_status();
     if status["supported"] != true {
+        // A phone's build leaves the suite out (its runner is a program, which a phone's apps
+        // can't start): said where the card would be, so the tools aren't simply missing (#1902).
+        if !rustgis_engine::data::RUNS_PROGRAMS && !cfg!(target_arch = "wasm32") {
+            no_geolibre_here(ui, t);
+        }
         return;
     }
     // An install that just finished: use the runner, and remember it.
@@ -3073,6 +3412,7 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 .size(11.5)
                 .color(t.text_dim),
             );
+            geolibre_passed_over(app, ui, t, true);
             ui.add_space(6.0);
             let progress = app.gp.install.as_ref().and_then(|st| st.lock().ok().map(|s| (s.done, s.total)));
             match progress {
@@ -3091,7 +3431,7 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         app.gp.install = Some(st.clone());
                         app.gp.last = None;
                         let ctx = ui.ctx().clone();
-                        std::thread::spawn(move || {
+                        let spawned = std::thread::Builder::new().name("geolibre-install".into()).spawn(move || {
                             let result = rustgis_engine::cmd::gp::install_geolibre(&|done, total| {
                                 if let Ok(mut s) = st.lock() {
                                     s.done = done;
@@ -3103,6 +3443,10 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                             }
                             ctx.request_repaint();
                         });
+                        if let Err(e) = spawned {
+                            app.gp.install = None;
+                            app.gp.last = Some((false, vec![e.to_string()]));
+                        }
                     }
                     ui.add_space(2.0);
                     ui.horizontal_wrapped(|ui| {
@@ -3110,7 +3454,8 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         ui.add(egui::Hyperlink::from_label_and_url(tl!("Download the GeoLibre runner"), download).open_in_new_tab(true));
                         #[cfg(not(target_arch = "wasm32"))]
                         if ui.small_button(tl!("Locate…")).clicked()
-                            && let Some(path) = rfd::FileDialog::new().set_title(tl!("Locate the GeoLibre runner")).pick_file()
+                            && let Some(path) =
+                                crate::filedialog::FileDialog::new().set_title(tl!("Locate the GeoLibre runner")).pick_file()
                         {
                             let path = path.display().to_string();
                             match app.run("gp.setGeolibre", json!({"path": path})) {
@@ -3133,6 +3478,19 @@ fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
         },
     );
+}
+
+/// Why a GeoLibre runner that was found (or remembered from Locate…) isn't used, its version
+/// being outside the range this RustGIS works with: which one and how to fix it, shown on the card
+/// and, while another runner is in use, under the tools' heading. Once: on the card
+/// (`shown_below`), not when the Locate… error drawn below it already says it.
+fn geolibre_passed_over(app: &RustGisApp, ui: &mut Ui, t: &Tokens, shown_below: bool) {
+    let Some(note) = rustgis_engine::cmd::gp::geolibre_passed_over() else { return };
+    if shown_below && matches!(&app.gp.last, Some((false, msgs)) if msgs.contains(&note)) {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(note).size(11.0).color(t.red));
 }
 
 /// Uninstalls the GeoLibre tools (a second press confirms): natively the runner that Install
@@ -3181,6 +3539,74 @@ fn geolibre_uninstall(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             app.gp.uninstall_error = None;
         }
         Err(e) => app.gp.uninstall_error = Some(e),
+    }
+}
+
+/// The GeoLibre tools in the interface's language (#2224): **Translate tools** downloads
+/// GeoLibre's pack for it, on a thread (one request of about 2 MB); **Remove translations**
+/// deletes the kept one. Nothing for English, or a language GeoLibre has no pack for.
+#[cfg(not(target_arch = "wasm32"))]
+fn geolibre_language(app: &mut RustGisApp, ui: &mut Ui) {
+    let lang = crate::i18n::current().code();
+    // One download at a time, whatever the language now: a second one would take the first's
+    // place, and the first's result (or failure) would never be shown.
+    if let Some((_, slot)) = &app.gp.language_download {
+        let done = slot.lock().ok().and_then(|mut r| r.take());
+        match done {
+            // A pack that names none of these tools (made for another runner version) would leave
+            // them in English under Remove translations, without a word.
+            Some(Ok(0)) => {
+                app.gp.language_download = None;
+                app.gp.language_error = Some(
+                    tl!("The downloaded translations name none of these tools: they may be for another GeoLibre version.").to_string(),
+                );
+            }
+            Some(Ok(_)) => {
+                app.gp.language_download = None;
+                app.gp.language_error = None;
+            }
+            Some(Err(e)) => {
+                app.gp.language_download = None;
+                app.gp.language_error = Some(e);
+            }
+            None => {
+                ui.spinner().on_hover_text(tl!("Downloading the tool translations…"));
+                return;
+            }
+        }
+    }
+    if !rustgis_engine::cmd::gp::geolibre_language_available(lang) {
+        return;
+    }
+    if rustgis_engine::cmd::gp::geolibre_language_in_use(lang) {
+        let resp = ui
+            .small_button(egui::RichText::new(tl!("Remove translations")).size(11.0))
+            .on_hover_text(tl!("Show these tools in English again"));
+        if resp.clicked() {
+            app.gp.language_error = app.run("gp.uninstallGeolibreLanguage", json!({"locale": lang})).err();
+        }
+        return;
+    }
+    let tip = crate::i18n::fmt(
+        "Download GeoLibre's translations of these tools into {language} (about 2 MB, from languages.geolibre.app)",
+        &[("language", crate::i18n::current().name())],
+    );
+    if ui.small_button(egui::RichText::new(tl!("Translate tools")).size(11.0)).on_hover_text(tip).clicked() {
+        let slot: crate::Slot<Result<usize, String>> = Default::default();
+        app.gp.language_download = Some((lang, slot.clone()));
+        app.gp.language_error = None;
+        let ctx = ui.ctx().clone();
+        let spawned = std::thread::Builder::new().name("geolibre-language".into()).spawn(move || {
+            let result = rustgis_engine::cmd::gp::install_geolibre_language(lang);
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(result);
+            }
+            ctx.request_repaint();
+        });
+        if let Err(e) = spawned {
+            app.gp.language_download = None;
+            app.gp.language_error = Some(e.to_string());
+        }
     }
 }
 
@@ -3247,11 +3673,31 @@ pub(crate) fn takes_field(kind: ParamKind, d: &rustgis_engine::data::Dataset, i:
     }
 }
 
-/// The tool's first layer parameter, whose fields its field parameters take.
+/// The tool's first layer parameter, whose fields its field parameters take: a required one
+/// before an optional one, which an external tool's form leaves empty (#1517).
 pub(crate) fn first_layer(spec: &rustgis_engine::analysis::ToolSpec) -> Option<&rustgis_engine::analysis::ParamSpec> {
+    let layers = || {
+        spec.params
+            .iter()
+            .filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::PointLayer | ParamKind::VectorLayer))
+    };
+    layers().find(|p| p.required).or_else(|| layers().next())
+}
+
+/// The layer parameter a new output is named after: a required one of any kind, a raster
+/// too (Topo Render's DEM), before `first_layer`. Only the desktop's Save As names one.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn output_layer(spec: &rustgis_engine::analysis::ToolSpec) -> Option<&rustgis_engine::analysis::ParamSpec> {
     spec.params
         .iter()
-        .find(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::PointLayer | ParamKind::VectorLayer))
+        .find(|p| {
+            p.required
+                && matches!(
+                    p.kind,
+                    ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::PointLayer | ParamKind::VectorLayer | ParamKind::RasterLayer
+                )
+        })
+        .or_else(|| first_layer(spec))
 }
 
 /// The most specific `<input>_…` prefix wins; otherwise use the first attribute input.
@@ -3331,6 +3777,22 @@ pub(crate) fn input_table<'a>(session: &'a Session, name: &str) -> Option<&'a ru
     rustgis_engine::project::find_table(tables, name).and_then(|i| tables.get(i))
 }
 
+/// Whether Find Tools shows `tool` for `q`, the search as [`TreeNode::fold`] folds it (lower case,
+/// no accents): its name or summary as shown (translated) or in English, or its id, holds it.
+/// `curvas de nivel` finds `Curvas de nível a partir de raster`, `dissolver` the built-in
+/// Dissolve shown as `Dissolver` (#2224).
+///
+/// [`TreeNode::fold`]: rustgis_engine::plugins::TreeNode::fold
+fn tool_matches(q: &str, tool: &rustgis_engine::analysis::ToolSpec) -> bool {
+    let fold = rustgis_engine::plugins::TreeNode::fold;
+    q.is_empty()
+        || tool.id.to_lowercase().contains(q)
+        || [tool.name, tool.summary].into_iter().any(|en| {
+            let shown = crate::i18n::t_raw(en);
+            fold(en).contains(q) || (shown != en && fold(shown).contains(q))
+        })
+}
+
 fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let Some(spec) = app.gp.tool.and_then(rustgis_engine::analysis::tool) else {
         // Tool finder, under the tool running, if one is.
@@ -3344,10 +3806,8 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         crate::widgets::search_field(ui, &mut app.gp.search, tl!("Find Tools"));
         ui.separator();
         ui.add_space(4.0);
-        let q = app.gp.search.to_lowercase();
-        let matches = |x: &rustgis_engine::analysis::ToolSpec| {
-            q.is_empty() || x.name.to_lowercase().contains(&q) || x.summary.to_lowercase().contains(&q) || x.id.to_lowercase().contains(&q)
-        };
+        let q = rustgis_engine::plugins::TreeNode::fold(&app.gp.search);
+        let matches = |x: &rustgis_engine::analysis::ToolSpec| tool_matches(&q, x);
         let row = |app: &mut RustGisApp, ui: &mut Ui, tool: &'static rustgis_engine::analysis::ToolSpec| {
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::click());
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!(tool.name)));
@@ -3383,11 +3843,23 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if q.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(tl!("GeoLibre")).size(11.0).color(t.text_dim));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| geolibre_uninstall(app, ui, t));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        geolibre_uninstall(app, ui, t);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        geolibre_language(app, ui);
+                    });
                 });
                 if let Some(e) = &app.gp.uninstall_error {
                     ui.label(egui::RichText::new(e).size(11.0).color(t.red));
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(e) = &app.gp.language_error {
+                    ui.label(egui::RichText::new(e).size(11.0).color(t.red));
+                } else if let Some(e) = rustgis_engine::cmd::gp::geolibre_language_error(crate::i18n::current().code()) {
+                    let e = crate::i18n::fmt("The kept tool translations can't be read: {error}", &[("error", &e)]);
+                    ui.label(egui::RichText::new(e).size(11.0).color(t.red));
+                }
+                geolibre_passed_over(app, ui, t, false);
                 // As in GeoLibre's Processing menu: category › subcategory › tools
                 // (`GeoLibre › Terrain › Derivatives`; a tool without a subcategory sits
                 // directly in its category).
@@ -3522,7 +3994,7 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     };
     let plugin_tool = spec.id.starts_with(rustgis_engine::plugins::PREFIX);
     #[cfg(not(target_arch = "wasm32"))]
-    let first_layer = first_layer(spec).map(|p| p.name);
+    let named_after = output_layer(spec).map(|p| p.name);
     // The file parameter whose Browse was pressed: picked once the form is drawn.
     let mut browse_for = None;
     // A parameter that doesn't apply to the options picked (Spatial Join's search distance with
@@ -3545,7 +4017,7 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         let label = ui.label(egui::RichText::new(format!("{}{}", tl!(p.label), if p.required { " *" } else { "" })).size(12.0));
         if !p.help.is_empty() {
-            label.on_hover_text(p.help);
+            label.on_hover_text(tl!(p.help));
         }
         let mut cur = app.gp.values.get(p.name).cloned().unwrap_or_default();
         if let Some(input) = crate::fieldlists::input(p.kind) {
@@ -3575,6 +4047,14 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     .selected_text(shown)
                     .width(ui.available_width() - 4.0)
                     .show_ui(ui, |ui| {
+                        // An external tool's optional layer, once picked, can be left out again.
+                        if rustgis_engine::analysis::is_external(spec)
+                            && no_layer_offered(p)
+                            && ui.selectable_label(cur.is_empty(), "—").clicked()
+                        {
+                            app.gp.values.remove(p.name);
+                            app.gp.tables.remove(p.name);
+                        }
                         for name in layer_names(ParamKind::Layer) {
                             if ui.selectable_label(picked.is_none() && name == cur, &name).clicked() {
                                 app.gp.values.insert(p.name, name);
@@ -3593,7 +4073,13 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 ui.add_space(4.0);
                 continue;
             }
-            ParamKind::PolygonLayer | ParamKind::PointLayer => Some(layer_names(p.kind)),
+            ParamKind::PolygonLayer | ParamKind::PointLayer => {
+                let mut v = layer_names(p.kind);
+                if no_layer_offered(p) {
+                    v.insert(0, String::new());
+                }
+                Some(v)
+            }
             ParamKind::Field | ParamKind::FieldNames | ParamKind::NumericField | ParamKind::CoordinateField => {
                 let target_param = layer_for_param(spec, p.name).map(|p| p.name);
                 let lname = target_param.and_then(|n| app.gp.values.get(n)).cloned().unwrap_or_default();
@@ -3655,7 +4141,7 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             ParamKind::Choice(c) => Some(c.iter().map(|s| s.to_string()).collect()),
             ParamKind::RasterLayer | ParamKind::VectorLayer => {
                 let mut v = layer_names(p.kind);
-                if !p.required {
+                if no_layer_offered(p) {
                     v.insert(0, String::new());
                 }
                 Some(v)
@@ -3750,7 +4236,7 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let name = app.gp.values.get(param).filter(|v| !v.trim().is_empty()).cloned().unwrap_or_else(|| {
-                    format!("{}.{}", first_layer.and_then(|n| app.gp.values.get(n)).map(String::as_str).unwrap_or("output"), ext)
+                    format!("{}.{}", named_after.and_then(|n| app.gp.values.get(n)).map(String::as_str).unwrap_or("output"), ext)
                 });
                 if let Some(path) = crate::dialogs::pick_save(&name, &[ext], tl!(p.label)) {
                     app.gp.values.insert(param, path);
@@ -3775,7 +4261,7 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 if let ParamKind::SaveFile { ext } = p.kind
                     && app.gp.values.get(p.name).is_none_or(|v| v.trim().is_empty())
                 {
-                    let input = first_layer.and_then(|n| app.gp.values.get(n)).map(String::as_str).unwrap_or("output");
+                    let input = named_after.and_then(|n| app.gp.values.get(n)).map(String::as_str).unwrap_or("output");
                     let Some(path) = crate::dialogs::pick_save(&format!("{input}.{ext}"), &[ext], tl!(p.label)) else { return };
                     app.gp.values.insert(p.name, path);
                 }
@@ -3931,7 +4417,7 @@ fn browse_file(app: &mut RustGisApp, tool: &'static str, param: &'static str) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let exts: Vec<&str> = exts.iter().map(String::as_str).collect();
-        let dialog = rfd::FileDialog::new();
+        let dialog = crate::filedialog::FileDialog::new();
         let dialog = if exts.is_empty() { dialog } else { dialog.add_filter(exts.join(", "), &exts).add_filter(tl!("All files"), &["*"]) };
         if let Some(path) = dialog.pick_file() {
             app.gp.files.remove(param);
@@ -4056,7 +4542,8 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let g = l.geometry_type();
     let numeric: Vec<String> = l.dataset.fields.iter().filter(|f| f.ty.is_numeric()).map(|f| f.name.clone()).collect();
     let all: Vec<String> = l.dataset.fields.iter().map(|f| f.name.clone()).collect();
-    ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
+    // The name, with the menus that copy a symbology from or to another layer beside it.
+    crate::symbologycopy::heading(app, ui, &l, t);
     ui.add_space(6.0);
     ui.label(egui::RichText::new(tl!("Primary symbology")).size(11.5).color(t.text_dim));
     let kinds: Vec<(&str, &str)> = if g == GeometryType::Point {
@@ -4170,8 +4657,17 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         ui.add_space(6.0);
     }
     if l.has_geometry(GeometryType::Polygon) && !l.graphics {
-        if ui.button(tl!("No Fill")).on_hover_text(tl!("Draw only polygon outlines, keeping their colors and widths.")).clicked() {
-            let _ = app.run("layer.noFill", Value::Null);
+        let hidden = l.no_fill.is_some();
+        if ui
+            .button(tl!(if hidden { "Restore Fill" } else { "No Fill" }))
+            .on_hover_text(tl!(if hidden {
+                "Restore polygon fills hidden by No Fill, keeping their colors and outlines."
+            } else {
+                "Draw only polygon outlines, keeping their colors and widths."
+            }))
+            .clicked()
+        {
+            let _ = app.run(if hidden { "layer.restoreFill" } else { "layer.noFill" }, Value::Null);
         }
         ui.add_space(6.0);
     }
@@ -4203,7 +4699,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         ui.add_space(6.0);
     }
     match &l.renderer {
-        Renderer::Single(s) => symbol_editor(app, ui, *s, g, t),
+        Renderer::Single(s) => symbol_editor(app, ui, *s, hidden_fill_opacity(&l, None), Stack::of(&l, &[], &[]), g, t),
         Renderer::Unique { field, classes, ramp, expression, .. } => {
             field_combo(app, ui, "Field", if expression.is_some() { tl!("(expression)") } else { field.as_str() }, &all, "unique");
             // Or by an expression's values: blank goes back to the field.
@@ -4212,7 +4708,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let e = if text.is_empty() { Value::Null } else { json!(text) };
                 let _ = app.run("layer.symbology", json!({"type": "unique", "expression": e, "ramp": ramp.name()}));
             }
-            ramp_picker(app, ui, ramp, t);
+            ramp_picker_with(app, ui, ramp, t, !l.graphics);
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(crate::i18n::fmt("{n} classes", &[("n", &classes.len().to_string())])).size(11.5).color(t.text_dim),
@@ -4239,8 +4735,8 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 ui.horizontal(|ui| {
                     let input_label = ui.label(tl!("Classes"));
                     let mut k = asked;
-                    let resp = ui.add(egui::DragValue::new(&mut k).range(1..=12)).labelled_by(input_label.id);
-                    if resp.changed() {
+                    let resp = ui.add(egui::DragValue::new(&mut k).update_while_editing(false).range(1..=12)).labelled_by(input_label.id);
+                    if crate::widgets::changed(&resp) {
                         crate::widgets::one_step_per_press(app, &resp);
                         let _ = app.run(
                             "layer.symbology",
@@ -4249,19 +4745,22 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 });
             }
-            ramp_picker(app, ui, ramp, t);
+            ramp_picker_with(app, ui, ramp, t, !l.graphics);
             ui.add_space(6.0);
             legend_list(app, ui, &l, t);
         }
         Renderer::Proportional { field, base, .. } => {
             field_combo(app, ui, "Field", field, &numeric, "proportional");
-            symbol_editor(app, ui, *base, g, t);
+            symbol_editor(app, ui, *base, hidden_fill_opacity(&l, None), Stack::of(&l, &[], &[]), g, t);
             legend_list(app, ui, &l, t);
         }
     }
     if g == GeometryType::Point && !l.graphics {
         ui.add_space(8.0);
         marker_rotation_row(app, ui, &l);
+        if matches!(l.renderer, Renderer::Unique { .. } | Renderer::Graduated { .. }) {
+            size_by_rows(app, ui, &l);
+        }
     }
     if matches!(g, GeometryType::Polyline | GeometryType::Point) && !l.graphics {
         ui.add_space(8.0);
@@ -4272,19 +4771,16 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         crate::fill_editor::fills_editor(app, ui, &l, t);
     }
     if !l.graphics {
+        ui.add_space(10.0);
+        ui.separator();
+        diagram_section(app, ui, &l, &numeric, t);
         ui.add_space(8.0);
         symbol_by_editor(app, ui, &l, t);
     }
     ui.add_space(10.0);
     ui.separator();
     ui.label(egui::RichText::new(tl!("Layer")).size(11.5).color(t.text_dim));
-    let mut tr = l.transparency;
-    ui.horizontal(|ui| {
-        let input_label = ui.label(tl!("Transparency"));
-        ui.spacing_mut().slider_width = 150.0;
-        let r = ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).suffix(" %").integer()).labelled_by(input_label.id);
-        transparency_drag(app, ui, &r, &l, tr);
-    });
+    transparency_row(app, ui, &l);
     if !l.graphics {
         reference_scale_row(app, ui, &l);
     }
@@ -4294,12 +4790,291 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     }
 }
 
+/// The Symbology pane's Diagram section (#976): a pie or bar chart of several numeric fields
+/// drawn on each feature over its symbol, as ArcGIS Pro's Chart symbology and QGIS's Diagrams
+/// draw. Every change re-runs `layer.diagram` with the whole setting — one undo step, and the
+/// scaled size range is recomputed from the data; `layer.clearDiagram` removes the diagram.
+fn diagram_section(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, numeric: &[String], t: &Tokens) {
+    use rustgis_engine::map::diagram::{CATEGORY_COLORS, MAX_CATEGORIES};
+    use rustgis_engine::map::{DiagramKind, DiagramLabel, DiagramSize};
+
+    // A table has no features to draw a chart on.
+    if l.geometry_type() == GeometryType::None {
+        return;
+    }
+    // The layer.diagram call for `cats` with the rest of `d`'s own settings.
+    let apply = |app: &mut RustGisApp, d: &rustgis_engine::map::DiagramSettings, cats: Vec<Value>| {
+        let fields: Vec<Value> = cats.into_iter().map(|c| json!({"field": c["field"], "color": c["color"]})).collect();
+        let params = json!({
+            "kind": if d.kind == DiagramKind::Pie { "pie" } else { "bar" },
+            "fields": fields,
+            "size": match d.size {
+                DiagramSize::Fixed(s) => json!(s),
+                DiagramSize::Scaled { min_size, max_size, .. } => json!({"from": min_size, "to": max_size}),
+            },
+            "startAngle": d.start_angle,
+            "labels": d.labels.code(),
+            "background": d.background.as_ref().map(|c| json!(c.hex())).unwrap_or(Value::Null),
+            "outline": {"color": d.stroke.hex(), "width": d.stroke_width},
+        });
+        if let Err(error) = app.run("layer.diagram", params) {
+            app.session.notify(error, true);
+        }
+    };
+    // The held drafts are kept per layer of this map of this project: a layer id repeats across maps.
+    let key = crate::labelpane::layer_key(app, l);
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(tl!("Diagram")).size(11.5).color(t.text_dim))
+            .on_hover_text(tl!("A small chart of several numeric fields, drawn on each feature over its symbol"));
+        if l.diagram.is_some()
+            && ui.small_button(tl!("Remove")).clicked()
+            && let Err(error) = app.run("layer.clearDiagram", json!({}))
+        {
+            app.session.notify(error, true);
+        }
+    });
+    let Some(mut d) = l.diagram.clone() else {
+        if numeric.len() < 2 {
+            ui.label(egui::RichText::new(tl!("Needs two or more numeric fields.")).color(t.text_dim));
+            return;
+        }
+        ui.horizontal(|ui| {
+            // A streamed layer's sums are its view's, so a scaled size is refused: it starts fixed.
+            let size = if l.is_streamed() { json!(12.0) } else { Value::Null };
+            if ui.button(tl!("Pie Chart")).clicked()
+                && let Err(error) = app.run("layer.diagram", json!({"kind": "pie", "fields": [numeric[0], numeric[1]], "size": size}))
+            {
+                app.session.notify(error, true);
+            }
+            if ui.button(tl!("Bar Chart")).clicked()
+                && let Err(error) = app.run("layer.diagram", json!({"kind": "bar", "fields": [numeric[0], numeric[1]], "size": size}))
+            {
+                app.session.notify(error, true);
+            }
+        });
+        return;
+    };
+
+    // The chart kind.
+    ui.horizontal(|ui| {
+        ui.label(tl!("Kind"));
+        for (kind, label) in [(DiagramKind::Pie, "Pie"), (DiagramKind::Bar, "Bar")] {
+            if ui.selectable_label(d.kind == kind, tl!(label)).clicked() && d.kind != kind {
+                d.kind = kind;
+                apply(app, &d, d.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect());
+            }
+        }
+    });
+
+    // The categories: a field and its colour each, in draw order.
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(tl!("Fields")).size(11.5).color(t.text_dim));
+    // The categories as edited, and the colour button's response when a colour picker made the
+    // edit (its drag is one undo step).
+    let mut edited: Option<(Vec<Value>, Option<egui::Response>)> = None;
+    for (i, c) in d.categories.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let mut field = c.field.clone();
+            egui::ComboBox::from_id_salt(("diagram_field", i)).selected_text(&field).width(140.0).show_ui(ui, |ui| {
+                for f in numeric {
+                    // A field another row draws is not offered twice (the command refuses it).
+                    let taken = d.categories.iter().enumerate().any(|(j, o)| j != i && o.field.eq_ignore_ascii_case(f));
+                    if ui.add_enabled(!taken, egui::Button::selectable(*f == field, f.as_str())).clicked() {
+                        field = f.clone();
+                    }
+                }
+            });
+            let mut cats: Vec<Value> = d.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect();
+            let mut changed = false;
+            let (resp, picked) = diagram_colour(ui, c.colour);
+            let mut press = None;
+            if let Some(picked) = picked {
+                cats[i]["color"] = json!(picked.hex());
+                changed = true;
+                press = Some(resp);
+            }
+            if field != c.field {
+                cats[i]["field"] = json!(field);
+                changed = true;
+            }
+            if d.categories.len() > 1 && ui.small_button("✕").on_hover_text(tl!("Drop this field")).clicked() {
+                cats.remove(i);
+                changed = true;
+            }
+            if changed {
+                edited = Some((cats, press));
+            }
+        });
+    }
+    if let Some((cats, press)) = edited {
+        if let Some(resp) = press {
+            crate::widgets::one_step_per_press(app, &resp);
+        }
+        apply(app, &d, cats);
+    }
+    if d.categories.len() < MAX_CATEGORIES.min(numeric.len()) && ui.small_button(tl!("＋ Add field")).clicked() {
+        let taken: Vec<&str> = d.categories.iter().map(|c| c.field.as_str()).collect();
+        if let Some(next) = numeric.iter().find(|f| !taken.iter().any(|t| t.eq_ignore_ascii_case(f))) {
+            let i = d.categories.len();
+            let mut cats: Vec<Value> = d.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect();
+            cats.push(json!({"field": next, "color": CATEGORY_COLORS[i % CATEGORY_COLORS.len()].hex()}));
+            apply(app, &d, cats);
+        }
+    }
+
+    // The size: one for every feature, or grown with the categories' sum.
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(tl!("Size"));
+        let scaled = !matches!(d.size, DiagramSize::Fixed(_));
+        egui::ComboBox::from_id_salt("diagram_size_kind")
+            .selected_text(if scaled { tl!("Scaled by sum") } else { tl!("Fixed") })
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(!scaled, tl!("Fixed")).clicked() && scaled {
+                    let mut d2 = d.clone();
+                    d2.size = DiagramSize::Fixed(12.0);
+                    apply(app, &d2, d2.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect());
+                }
+                // A streamed layer holds the view's features only, so its range of sums is unknown.
+                let streamed = l.is_streamed();
+                let scaled_option = ui
+                    .add_enabled(!streamed, egui::Button::selectable(scaled, tl!("Scaled by sum")))
+                    .on_disabled_hover_text(tl!("A streamed layer needs Load All Features first"));
+                if scaled_option.clicked() && !scaled {
+                    let mut d2 = d.clone();
+                    d2.size = DiagramSize::Scaled { min_size: 6.0, max_size: 40.0, min: 0.0, max: 0.0 };
+                    apply(app, &d2, d2.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect());
+                }
+            });
+        let mut changed = false;
+        match d.size {
+            DiagramSize::Fixed(mut s) => {
+                if held_drag(ui, ui.make_persistent_id(("diagram-size", key)), &mut s, 1.0..=200.0, " pt", None) {
+                    d.size = DiagramSize::Fixed(s);
+                    changed = true;
+                }
+            }
+            DiagramSize::Scaled { ref mut min_size, ref mut max_size, .. } => {
+                // Each bound stops at the other, so the pair never crosses (the command refuses that).
+                let (from, to) = (*min_size, *max_size);
+                let lo = held_drag(ui, ui.make_persistent_id(("diagram-size-min", key)), min_size, 1.0..=to, " pt", None);
+                let hi = held_drag(ui, ui.make_persistent_id(("diagram-size-max", key)), max_size, from..=200.0, " pt", None);
+                changed = lo || hi;
+            }
+        }
+        if changed {
+            apply(app, &d, d.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect());
+        }
+    });
+
+    // A pie's first slice can start anywhere on the turn.
+    if d.kind == DiagramKind::Pie {
+        ui.horizontal(|ui| {
+            let mut a = d.start_angle;
+            let input_label = ui.label(tl!("Start angle"));
+            if held_drag(ui, ui.make_persistent_id(("diagram-start-angle", key)), &mut a, 0.0..=360.0, "°", Some(input_label.id)) {
+                d.start_angle = a;
+                apply(app, &d, d.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect());
+            }
+        });
+    }
+
+    // What each slice or bar says beside it: nothing, its value, its percent, or both.
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Labels"));
+        let cur = d.labels;
+        egui::ComboBox::from_id_salt("diagram_labels")
+            .selected_text(tl!(cur.label()))
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                for mode in DiagramLabel::ALL {
+                    if ui.selectable_label(cur == mode, tl!(mode.label())).clicked() && cur != mode {
+                        let mut d2 = d.clone();
+                        d2.labels = mode;
+                        apply(app, &d2, d2.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect());
+                    }
+                }
+            })
+            .response
+            .labelled_by(input_label.id)
+            .on_hover_text(tl!("What each slice or bar says beside it: its value, its share in percent, or both"));
+    });
+
+    // The disc or box behind the chart, and the outline around it all.
+    ui.horizontal(|ui| {
+        let mut on = d.background.is_some();
+        if ui.checkbox(&mut on, tl!("Background")).changed() {
+            d.background = on.then(|| rustgis_engine::map::Rgba::new(255, 255, 255, 204));
+            apply(app, &d, d.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect());
+        } else if let Some(bg) = d.background {
+            let (resp, picked) = diagram_colour(ui, bg);
+            if let Some(picked) = picked {
+                d.background = Some(picked);
+                crate::widgets::one_step_per_press(app, &resp);
+                apply(app, &d, d.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect());
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(tl!("Outline"));
+        let (resp, picked) = diagram_colour(ui, d.stroke);
+        let mut changed = false;
+        if let Some(picked) = picked {
+            d.stroke = picked;
+            changed = true;
+            crate::widgets::one_step_per_press(app, &resp);
+        }
+        let mut w = d.stroke_width;
+        if held_drag(ui, ui.make_persistent_id(("diagram-outline-width", key)), &mut w, 0.0..=8.0, " pt", None) {
+            d.stroke_width = w;
+            changed = true;
+        }
+        if changed {
+            apply(app, &d, d.categories.iter().map(|c| json!({"field": c.field, "color": c.colour.hex()})).collect());
+        }
+    });
+}
+
+/// A colour button in the Diagram section for the stored colour `old`, and the colour picked when
+/// it changed. The picker is built from `old`'s own channels, not a premultiplied Color32, so a
+/// fully transparent colour keeps its colour through an edit; and an opacity-only edit keeps
+/// `old`'s channels, which the picker's rounding would change.
+fn diagram_colour(ui: &mut Ui, old: rustgis_engine::map::Rgba) -> (egui::Response, Option<rustgis_engine::map::Rgba>) {
+    crate::widgets::rgba_button(ui, old)
+}
+
+/// A number dragged or typed in the Diagram section. It is held in the UI's memory while the drag
+/// goes on, and `true` once the drag stops or the field is left, when the number is applied: so a
+/// drag is one undo step, as [`manual_breaks`] holds its bounds. `v` shows the held number.
+fn held_drag(ui: &mut Ui, id: egui::Id, v: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, label: Option<egui::Id>) -> bool {
+    if let Some(held) = ui.data(|d| d.get_temp::<f32>(id)) {
+        *v = held;
+    }
+    let mut r = ui.add(egui::DragValue::new(v).range(range).suffix(suffix));
+    if let Some(label) = label {
+        r = r.labelled_by(label);
+    }
+    if r.changed() {
+        ui.data_mut(|d| d.insert_temp(id, *v));
+    }
+    let done = (r.drag_stopped() || r.lost_focus()) && ui.data(|d| d.get_temp::<f32>(id)).is_some();
+    // A number held from an edit the widget left mid-way (its layer switched away while typing) is
+    // dropped once the widget is drawn again unedited, so the diagram's own number shows.
+    if done || (!r.dragged() && !r.has_focus() && !r.changed()) {
+        ui.data_mut(|d| d.remove_temp::<f32>(id));
+    }
+    done
+}
+
 /// The scales the Reference scale picker offers, besides none and the map's own.
 const REFERENCE_SCALE_CHOICES: [f64; 8] = [5_000.0, 10_000.0, 25_000.0, 50_000.0, 100_000.0, 200_000.0, 500_000.0, 1_000_000.0];
 
-/// The Symbology pane's Reference scale: the scale a layer's symbol and label sizes are set
-/// for, so they grow and shrink with the map (`layer.referenceScale`).
-fn reference_scale_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+/// The Symbology pane's Reference scale, also on the Layer Properties pane's Display tab (#1803):
+/// the scale a layer's symbol and label sizes are set for, so they grow and shrink with the map
+/// (`layer.referenceScale`).
+pub(crate) fn reference_scale_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
     let current = app.session.map().scale().round();
     ui.horizontal(|ui| {
         ui.label(tl!("Reference scale")).on_hover_text(tl!(
@@ -4323,6 +5098,19 @@ fn reference_scale_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
             })
             .response
             .on_hover_text(tl!("Reference scale"));
+    });
+}
+
+/// The layer's Transparency row, as the Symbology pane and the Layer Properties pane's Display tab
+/// (#1803) show it.
+pub(crate) fn transparency_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer) {
+    let mut tr = l.transparency;
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Transparency"));
+        ui.spacing_mut().slider_width = 150.0;
+        let r =
+            ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).update_while_editing(false).suffix(" %").integer()).labelled_by(input_label.id);
+        transparency_drag(app, ui, &r, l, tr);
     });
 }
 
@@ -4373,8 +5161,26 @@ fn field_combo(app: &mut RustGisApp, ui: &mut Ui, label: &str, cur: &str, fields
 }
 
 fn ramp_picker(app: &mut RustGisApp, ui: &mut Ui, cur: &Ramp, t: &Tokens) {
+    ramp_picker_with(app, ui, cur, t, false);
+}
+
+/// The color scheme picker; `invert` adds an Invert Color Ramp button to its heading row, for a
+/// layer whose classes take their colors from the scheme (#1355).
+fn ramp_picker_with(app: &mut RustGisApp, ui: &mut Ui, cur: &Ramp, t: &Tokens, invert: bool) {
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(tl!("Color scheme")).size(11.5).color(t.text_dim));
+    let heading = egui::RichText::new(tl!("Color scheme")).size(11.5).color(t.text_dim);
+    if invert {
+        ui.horizontal(|ui| {
+            ui.label(heading);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(tl!("Invert Color Ramp")).on_hover_text(tl!("Reverse the order of the classes' colors.")).clicked() {
+                    let _ = app.run("layer.invertRamp", json!({}));
+                }
+            });
+        });
+    } else {
+        ui.label(heading);
+    }
     let grid = |app: &mut RustGisApp, ui: &mut Ui, id: &str, ramps: Vec<Ramp>| {
         // Two to a row, in the width left inside the group's indent.
         let w = (ui.available_width() - 8.0) / 2.0;
@@ -4546,17 +5352,21 @@ fn legend_list(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         ui,
         |ui| {
             ui.set_width(ui.available_width());
-            let legend = l.renderer.legend();
-            // Unique Values legends sort their classes by label: row i shows class `order[i]`,
+            let legend = interface_legend(&l.renderer, l.renderer.legend());
+            // Unique Values legends sort their classes (by value or by label): row i shows class `order[i]`,
             // and the rows past them (`<all other values>`) keep their place.
             let order = l.renderer.class_order();
-            // At most MAX_UNIQUE classes (a style import can bring more), then Unique Values'
-            // `<all other values>`, the legend's last row, whatever their number.
-            let rows: Vec<usize> = match &l.renderer {
+            // As many classes as can be drawn from an expression or a QGIS rule style
+            // (MAX_EXPRESSION_CLASSES), then Unique Values' `<all other values>`, the legend's
+            // last row, whatever their number. A categorized style import can bring more: how
+            // many aren't listed is said below the list.
+            let (rows, unlisted): (Vec<usize>, usize) = match &l.renderer {
                 Renderer::Unique { .. } => {
-                    (0..legend.len().saturating_sub(1)).take(MAX_UNIQUE).chain(legend.len().checked_sub(1)).collect()
+                    let classes = legend.len().saturating_sub(1);
+                    let rows = (0..classes).take(MAX_EXPRESSION_CLASSES).chain(legend.len().checked_sub(1)).collect();
+                    (rows, classes.saturating_sub(MAX_EXPRESSION_CLASSES))
                 }
-                _ => (0..legend.len()).take(MAX_UNIQUE + 1).collect(),
+                _ => ((0..legend.len()).take(MAX_EXPRESSION_CLASSES).collect(), legend.len().saturating_sub(MAX_EXPRESSION_CLASSES)),
             };
             let mut seen = std::collections::HashSet::new();
             for i in rows {
@@ -4574,6 +5384,7 @@ fn legend_list(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                         Rect::from_center_size(pos2(r.min.x + 12.0, r.center().y), vec2(18.0, 14.0)),
                         &e.symbol,
                         l.geometry_type(),
+                        Stack::of(l, &e.strokes, &e.fills),
                     );
                     ui.painter().text(pos2(r.min.x + 30.0, r.center().y), Align2::LEFT_CENTER, &e.label, regular(11.5), t.text);
                     continue;
@@ -4587,32 +5398,12 @@ fn legend_list(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     p
                 };
                 ui.horizontal(|ui| {
-                    // Construct hue independently of alpha: Color32 discards hidden RGB at zero.
+                    // A fill No Fill hides shows the opacity Restore Fill gives back, so a colour
+                    // picked here is drawn (#2308).
                     let fill = e.symbol.fill;
-                    let mut hsva = egui::ecolor::Hsva::from_srgb([fill.r(), fill.g(), fill.b()]);
-                    hsva.a = f32::from(fill.a()) / 255.0;
-                    let alpha = hsva.a;
-                    // egui creates the popup from the context, not this Ui's scoped style.
-                    // Borrow linear numeric editing only while a transparent picker is open.
-                    let styles = (fill.a() == 0 && egui::Popup::is_any_open(ui.ctx()))
-                        .then(|| [egui::Theme::Light, egui::Theme::Dark].map(|theme| (theme, ui.ctx().style_of(theme))));
-                    if styles.is_some() {
-                        ui.ctx().global_style_mut(|style| style.visuals.numeric_color_space = egui::style::NumericColorSpace::Linear);
-                    }
-                    let response = egui::color_picker::color_edit_button_hsva(ui, &mut hsva, egui::color_picker::Alpha::OnlyBlend);
-                    if let Some(styles) = styles {
-                        // The popup's numeric-mode button can change both themes; restore both
-                        // immediately so no other picker or later frame inherits the override.
-                        for (theme, style) in styles {
-                            ui.ctx().set_style_of(theme, style);
-                        }
-                    }
-                    let picked = response.on_hover_text(tl!("Class color")).changed().then(|| {
-                        let edited = rustgis_engine::map::Rgba(hsva.to_srgba_unmultiplied());
-                        // The numeric alpha editor also rounds RGB through Color32; an
-                        // opacity-only edit must keep the class's original channels exactly.
-                        if hsva.a != alpha { fill.with_alpha(edited.a()) } else { edited }
-                    });
+                    let fill = hidden_fill_opacity(l, Some(class_ref)).map_or(fill, |a| fill.with_alpha(a));
+                    let (response, picked) = crate::widgets::rgba_button(ui, fill);
+                    response.on_hover_text(tl!("Class color"));
                     if let Some(color) = picked {
                         // Keep FF too: six-digit polygon colours deliberately preserve translucency.
                         let params = with("color", json!(color.hex8()));
@@ -4677,6 +5468,17 @@ fn legend_list(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     }
                 });
             }
+            if unlisted > 0 {
+                let note = if unlisted == 1 {
+                    tl!("1 more class isn't listed: the list's limit doesn't change how it's drawn").to_string()
+                } else {
+                    crate::i18n::fmt(
+                        "{n} more classes aren't listed: the list's limit doesn't change how they're drawn",
+                        &[("n", &unlisted.to_string())],
+                    )
+                };
+                ui.label(egui::RichText::new(note).size(11.5).color(t.text_dim));
+            }
         },
     );
 }
@@ -4685,20 +5487,32 @@ fn legend_list(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
 /// a bound out, and one to split the widest class in two. A bound being dragged or typed is held
 /// here and applied once, when the drag stops or the field is left, so a drag is one undo step.
 fn manual_breaks(app: &mut RustGisApp, ui: &mut Ui, field: &str, breaks: &[f64], min: f64, ramp: &Ramp) {
+    // On a layer read in place the first class takes every value up to its bound and a last class
+    // every value past the bound before it. That last class has no bound to type.
+    let open_top = breaks.last().is_some_and(|v| *v >= OPEN_ABOVE);
     let mut b = breaks.to_vec();
-    let speed = ((b.last().copied().unwrap_or(min) - min).abs() / 200.0).max(1e-9);
+    let typed = b.len().saturating_sub(usize::from(open_top));
+    let lowest = if min <= OPEN_BELOW { b.first().copied().unwrap_or(0.0) } else { min };
+    let highest = typed.checked_sub(1).and_then(|i| b.get(i)).copied().unwrap_or(lowest);
+    // With one bound left there is no span to drag over: its own size sets the pace.
+    let span = match (highest > lowest, lowest == 0.0) {
+        (true, _) => highest - lowest,
+        (false, false) => lowest.abs(),
+        (false, true) => 1.0,
+    };
+    let speed = (span / 200.0).max(1e-9);
     let mut apply = false;
     let mut remove = None;
     let (layer, last) = (app.session.active_layer, b.len().saturating_sub(1));
-    for (i, v) in b.iter_mut().enumerate() {
+    for (i, v) in b.iter_mut().take(typed).enumerate() {
         ui.horizontal(|ui| {
             let id = egui::Id::unique(("manual-break", layer, field, i));
             if let Some(held) = ui.data(|d| d.get_temp::<f64>(id)) {
                 *v = held;
             }
             let input_label = ui.label(crate::i18n::fmt("Class {n} up to", &[("n", &(i + 1).to_string())]));
-            let r = ui.add(egui::DragValue::new(v).speed(speed)).labelled_by(input_label.id);
-            if r.changed() {
+            let r = ui.add(egui::DragValue::new(v).update_while_editing(false).speed(speed)).labelled_by(input_label.id);
+            if crate::widgets::changed(&r) {
                 ui.data_mut(|d| d.insert_temp(id, *v));
             }
             if (r.drag_stopped() || r.lost_focus()) && ui.data(|d| d.get_temp::<f64>(id)).is_some() {
@@ -4706,22 +5520,34 @@ fn manual_breaks(app: &mut RustGisApp, ui: &mut Ui, field: &str, breaks: &[f64],
                 apply = true;
             }
             // The last bound closes the classes at the field's largest value: taking it out would
-            // only bring it back.
-            if i < last && ui.small_button("×").on_hover_text(tl!("Take this bound out")).clicked() {
+            // only bring it back. Before an open last class, any bound can go while one is left.
+            let removable = if open_top { typed > 1 } else { i < last };
+            if removable && ui.small_button("×").on_hover_text(tl!("Take this bound out")).clicked() {
                 remove = Some(i);
             }
         });
+    }
+    // (After the bounds, so a bound being dragged shows here as it moves.)
+    if let Some(top) = typed.checked_sub(1).and_then(|i| b.get(i)).filter(|_| open_top) {
+        let n = (typed + 1).to_string();
+        ui.label(crate::i18n::fmt("Class {n} more than {bound}", &[("n", &n), ("bound", &fmt_num(*top))]));
     }
     if let Some(i) = remove {
         b.remove(i);
         apply = true;
     }
-    if b.len() < 12 && ui.button(tl!("Split the widest class")).clicked() {
-        let lower = |i: usize| if i == 0 { min } else { b[i - 1] };
-        if let Some(i) = (0..b.len()).max_by(|&x, &y| (b[x] - lower(x)).total_cmp(&(b[y] - lower(y)))) {
-            b.insert(i, (lower(i) + b[i]) / 2.0);
-            apply = true;
-        }
+    let lower = |i: usize| i.checked_sub(1).and_then(|j| b.get(j)).copied().unwrap_or(min);
+    // An open class has no width to halve.
+    let widest = (0..b.len())
+        .filter_map(|i| Some((i, lower(i), *b.get(i)?)))
+        .filter(|&(_, lo, hi)| lo > OPEN_BELOW && hi < OPEN_ABOVE)
+        .max_by(|x, y| (x.2 - x.1).total_cmp(&(y.2 - y.1)));
+    if b.len() < 12
+        && let Some((i, lo, hi)) = widest
+        && ui.button(tl!("Split the widest class")).clicked()
+    {
+        b.insert(i, lo.midpoint(hi));
+        apply = true;
     }
     if apply
         && let Err(e) =
@@ -4731,23 +5557,24 @@ fn manual_breaks(app: &mut RustGisApp, ui: &mut Ui, field: &str, breaks: &[f64],
     }
 }
 
-fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, t: &Tokens) {
+/// `hidden`: the opacity of a fill No Fill hides, which its swatch shows ([`hidden_fill_opacity`]).
+fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, hidden: Option<u8>, stack: Stack, g: GeometryType, t: &Tokens) {
     egui::Frame::NONE.fill(t.pane_header).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(44.0, 36.0), Sense::hover());
             ui.painter().rect_filled(r, CornerRadius::same(4), t.ribbon);
-            patch(ui.painter(), r.shrink(6.0), &s, g);
+            patch(ui.painter(), r.shrink(6.0), &s, g, stack);
             ui.label(egui::RichText::new(tl!("Symbol")).font(semibold(12.5)));
         });
         egui::Grid::new("symbol_grid").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
             if g != GeometryType::Polyline {
-                ui.label(tl!("Color"));
-                let mut c = c32(s.fill);
-                let resp = crate::widgets::color_button(ui, &mut c);
-                if resp.changed() {
+                // The same name as the ribbon's Drawing group gives this `layer.color` button.
+                ui.label(tl!("Fill"));
+                let (resp, picked) = crate::widgets::rgba_button(ui, hidden.map_or(s.fill, |a| s.fill.with_alpha(a)));
+                if let Some(c) = picked {
                     crate::widgets::one_step_per_press(app, &resp);
-                    let _ = app.run("layer.color", json!({"color": rgba(c).hex8()}));
+                    let _ = app.run("layer.color", json!({"color": c.hex8()}));
                 }
                 ui.end_row();
             }
@@ -4762,8 +5589,10 @@ fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, 
             ui.end_row();
             let input_label = ui.label(tl!(if g == GeometryType::Polyline { "Line width" } else { "Outline width" }));
             let mut w = s.stroke_width;
-            let resp = ui.add(egui::DragValue::new(&mut w).range(0.0..=12.0).speed(0.05).suffix(" pt")).labelled_by(input_label.id);
-            if resp.changed() {
+            let resp = ui
+                .add(egui::DragValue::new(&mut w).update_while_editing(false).range(0.0..=12.0).speed(0.05).suffix(" pt"))
+                .labelled_by(input_label.id);
+            if crate::widgets::changed(&resp) {
                 crate::widgets::one_step_per_press(app, &resp);
                 let _ = app.run("layer.outline", json!({"width": w}));
             }
@@ -4771,8 +5600,10 @@ fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, 
             if g == GeometryType::Point {
                 let input_label = ui.label(tl!("Size"));
                 let mut sz = s.size;
-                let resp = ui.add(egui::DragValue::new(&mut sz).range(1.0..=60.0).speed(0.1).suffix(" pt")).labelled_by(input_label.id);
-                if resp.changed() {
+                let resp = ui
+                    .add(egui::DragValue::new(&mut sz).update_while_editing(false).range(1.0..=60.0).speed(0.1).suffix(" pt"))
+                    .labelled_by(input_label.id);
+                if crate::widgets::changed(&resp) {
                     crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("layer.marker", json!({"size": sz}));
                 }
@@ -4805,7 +5636,7 @@ fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, 
 }
 
 /// The dash patterns the stroke editor offers, in stroke widths (dash, gap, …).
-const DASH_PRESETS: [(&str, Option<&[f32]>); 5] = [
+pub(crate) const DASH_PRESETS: [(&str, Option<&[f32]>); 5] = [
     ("Solid", None),
     ("Dashed", Some(&[4.0, 2.0])),
     ("Dotted", Some(&[1.0, 2.0])),
@@ -4861,10 +5692,15 @@ fn stroke_json(st: &LineStroke) -> Value {
     })
 }
 
-/// A stroke's markers as `layer.lineStrokes` takes them.
+/// A stroke's markers as `layer.lineStrokes` takes them: an image with its base64, sent again
+/// with every change so the stroke keeps it.
 fn markers_json(m: &LineMarkers) -> Value {
     let glyph = match m.mark {
         LineMark::Marker(Marker::Char(g)) => Some(g),
+        _ => None,
+    };
+    let image = match m.mark {
+        LineMark::Marker(Marker::Picture(p)) => Some(p.base64()),
         _ => None,
     };
     json!({
@@ -4874,6 +5710,7 @@ fn markers_json(m: &LineMarkers) -> Value {
         },
         "char": glyph.map(|g| g.ch.to_string()),
         "font": glyph.map(|g| g.font.as_str()),
+        "image": image,
         "size": m.size,
         "at": m.at.codes(),
         "interval": m.interval,
@@ -4929,6 +5766,21 @@ fn marker_places() -> [(&'static str, Placements); 7] {
 
 /// Sets the layer's stacked strokes, or `class`'s own.
 fn set_strokes(app: &mut RustGisApp, class: Option<&ClassRef>, strokes: &[LineStroke]) {
+    let mut replaced = 0;
+    let strokes: Vec<LineStroke> = strokes
+        .iter()
+        .map(|st| {
+            let markers = st.markers.map(|m| match m.mark {
+                LineMark::Marker(shape) => {
+                    let (shape, lost) = drawn_marker(shape);
+                    replaced += usize::from(lost);
+                    LineMarkers { mark: LineMark::Marker(shape), ..m }
+                }
+                LineMark::Hash => m,
+            });
+            LineStroke { markers, ..*st }
+        })
+        .collect();
     let mut p = json!({"strokes": strokes.iter().map(stroke_json).collect::<Vec<_>>()});
     match class {
         Some(ClassRef::Value(v)) => p["value"] = json!(v),
@@ -4936,7 +5788,68 @@ fn set_strokes(app: &mut RustGisApp, class: Option<&ClassRef>, strokes: &[LineSt
         Some(ClassRef::Other) => p["other"] = json!(true),
         None => {}
     }
-    let _ = app.run("layer.lineStrokes", p);
+    if app.run("layer.lineStrokes", p).is_ok() {
+        notify_image_replaced(app, replaced);
+    }
+}
+
+/// A marker as an editor sends it back: an image that can't be drawn (one a file gave that wasn't
+/// kept, or that doesn't decode) becomes the circle it is drawn as, which the command takes where
+/// it refuses the image. Whether it was replaced.
+pub(crate) fn drawn_marker(m: Marker) -> (Marker, bool) {
+    match m {
+        Marker::Picture(p) if !rustgis_engine::render::picture_marker_draws(p) => (Marker::Circle, true),
+        m => (m, false),
+    }
+}
+
+/// Says how many images an editor couldn't draw and replaced with circles ([`drawn_marker`]) on
+/// the active layer, which the editors set; nothing when there were none.
+pub(crate) fn notify_image_replaced(app: &mut RustGisApp, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let layer = app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| l.name.clone()).unwrap_or_default();
+    let text = crate::i18n::fmt(
+        "Image markers that can't be drawn were replaced by the circles they showed as: {count} on \"{layer}\"",
+        &[("count", &count.to_string()), ("layer", &layer)],
+    );
+    app.session.notify(text, false);
+}
+
+/// Legend rows as the panes show them: a Graduated Colors class open at an end, which the
+/// renderer names in English for layouts and exports, is named in the interface language. The
+/// rows can be a part of the classes, so they are matched by label: not where a label set by hand
+/// reads the same.
+fn interface_legend(r: &Renderer, mut rows: Vec<LegendEntry>) -> Vec<LegendEntry> {
+    let Renderer::Graduated { breaks, min, class_labels, .. } = r else { return rows };
+    let mut lo = *min;
+    let mut open = Vec::new();
+    for (i, &hi) in breaks.iter().enumerate() {
+        if class_labels.contains_key(&i) {
+            lo = hi;
+            continue;
+        }
+        let said = match (lo <= OPEN_BELOW, hi >= OPEN_ABOVE) {
+            (true, true) => Some(tl!("every value").to_string()),
+            (true, false) => Some(crate::i18n::fmt("up to {bound}", &[("bound", &fmt_num(hi))])),
+            (false, true) => Some(crate::i18n::fmt("more than {bound}", &[("bound", &fmt_num(lo))])),
+            (false, false) => None,
+        };
+        let english = range_label(lo, hi);
+        if let Some(said) = said
+            && !class_labels.values().any(|own| *own == english)
+        {
+            open.push((english, said));
+        }
+        lo = hi;
+    }
+    for row in &mut rows {
+        if let Some((_, said)) = open.iter().find(|(english, _)| *english == row.label) {
+            row.label = said.clone();
+        }
+    }
+    rows
 }
 
 /// The classes a line layer's strokes can be set for, with their legend labels and symbols.
@@ -4953,7 +5866,7 @@ pub(crate) fn stroke_classes(r: &Renderer) -> Vec<(ClassRef, String, Symbol)> {
                 .collect()
         }
         Renderer::Graduated { symbols, .. } => {
-            let legend = r.legend();
+            let legend = interface_legend(r, r.legend());
             symbols
                 .iter()
                 .enumerate()
@@ -4965,9 +5878,10 @@ pub(crate) fn stroke_classes(r: &Renderer) -> Vec<(ClassRef, String, Symbol)> {
 }
 
 /// A stroke's markers along the editor's preview line, from `x.0` to `x.1` at `y`, scaled by `k`:
-/// markers as dots (squares as squares), hash marks as ticks, `w` wide. A sketch, not the map's
-/// drawing: other shapes and outlines aren't shown, and inner placements are marked at the middle.
-fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: egui::Color32, w: f32) {
+/// markers as dots (squares as squares, images as themselves, unturned) with their outlines `w`
+/// wide, as on the map, hash marks as ticks (at least half a point). A sketch, not the map's
+/// drawing: other shapes aren't shown, and inner placements are marked at the middle.
+fn marker_preview(p: &egui::Painter, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: egui::Color32, w: f32) {
     let mut xs = Vec::new();
     if m.at.has(Placements::INTERVAL) {
         let step = (m.interval * k).max(4.0);
@@ -4987,19 +5901,41 @@ fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: eg
         xs.push((x.0 + x.1) / 2.0);
     }
     let half = (m.size * k).max(1.0) / 2.0;
+    // An image, looked up once for all its places.
+    let image = if let LineMark::Marker(mark) = m.mark { crate::markerimages::image(p.ctx(), mark) } else { None };
+    // (An outline the map draws: a colour to show and a width.)
+    let outline = m.outline.filter(|o| o.a() > 0 && w > 0.0).map(|o| Stroke::new(w.max(0.5), c32(o)));
     for at in xs {
+        if let Some(image) = &image {
+            image.paint(p, pos2(at, y), 2.0 * half);
+            continue;
+        }
         match m.mark {
             LineMark::Hash => {
                 let (sin, cos) = m.angle.to_radians().sin_cos();
                 let (dx, dy) = (half * sin, half * cos);
-                ui.painter().line_segment([pos2(at - dx, y + dy), pos2(at + dx, y - dy)], Stroke::new(w, c));
+                p.line_segment([pos2(at - dx, y + dy), pos2(at + dx, y - dy)], Stroke::new(w.max(0.5), c));
             }
             LineMark::Marker(Marker::Square) => {
-                ui.painter().rect_filled(Rect::from_center_size(pos2(at, y), vec2(half * 1.8, half * 1.8)), CornerRadius::ZERO, c);
+                let r = Rect::from_center_size(pos2(at, y), vec2(half * 1.8, half * 1.8));
+                p.rect_filled(r, CornerRadius::ZERO, c);
+                if let Some(o) = outline {
+                    p.rect_stroke(r, CornerRadius::ZERO, o, egui::StrokeKind::Middle);
+                }
             }
-            LineMark::Marker(Marker::Char(g)) => glyph(ui.painter(), pos2(at, y), g, (2.0 * half).max(6.0), c),
+            // An outline-only character shows in its outline's colour, as a plain patch's does.
+            LineMark::Marker(Marker::Char(g)) => {
+                let col = match outline {
+                    Some(o) if c.a() == 0 => o.color,
+                    _ => c,
+                };
+                glyph(p, pos2(at, y), g, (2.0 * half).max(6.0), col);
+            }
             LineMark::Marker(_) => {
-                ui.painter().circle_filled(pos2(at, y), half, c);
+                p.circle_filled(pos2(at, y), half, c);
+                if let Some(o) = outline {
+                    p.circle_stroke(pos2(at, y), half, o);
+                }
             }
         }
     }
@@ -5007,7 +5943,6 @@ fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: eg
 
 /// The stroke editor's rows for a stroke of markers or hash marks (`st`, its markers `m`): the
 /// shape, its size, where it goes and how far apart, and whether it turns with the line.
-#[allow(clippy::too_many_arguments)]
 fn marker_rows(
     app: &mut RustGisApp,
     ui: &mut Ui,
@@ -5045,9 +5980,10 @@ fn marker_rows(
     }
     let input_label = ui.label(if m.mark == LineMark::Hash { tl!("Length") } else { tl!("Size") });
     let mut size = m.size;
-    let resp =
-        ui.add(egui::DragValue::new(&mut size).range(0.0..=MAX_LINE_MARKER_SIZE).speed(0.1).suffix(" pt")).labelled_by(input_label.id);
-    if resp.changed() {
+    let resp = ui
+        .add(egui::DragValue::new(&mut size).update_while_editing(false).range(0.0..=MAX_LINE_MARKER_SIZE).speed(0.1).suffix(" pt"))
+        .labelled_by(input_label.id);
+    if crate::widgets::changed(&resp) {
         crate::widgets::one_step_per_press(app, &resp);
         set(app, with(LineMarkers { size, ..m }));
     }
@@ -5056,9 +5992,13 @@ fn marker_rows(
     if points {
         let input_label = ui.label(tl!("Offset right"));
         let mut along = m.offset_along;
-        let drag = egui::DragValue::new(&mut along).range(-MAX_STROKE_OFFSET..=MAX_STROKE_OFFSET).speed(0.05).suffix(" pt");
+        let drag = egui::DragValue::new(&mut along)
+            .update_while_editing(false)
+            .range(-MAX_STROKE_OFFSET..=MAX_STROKE_OFFSET)
+            .speed(0.05)
+            .suffix(" pt");
         let resp = ui.add(drag).on_hover_text(tl!("Shifts the mark right of the point (left when negative)")).labelled_by(input_label.id);
-        if resp.changed() {
+        if crate::widgets::changed(&resp) {
             crate::widgets::one_step_per_press(app, &resp);
             set(app, with(LineMarkers { offset_along: along, ..m }));
         }
@@ -5083,9 +6023,13 @@ fn marker_rows(
         if m.at.has(Placements::INTERVAL) {
             let input_label = ui.label(tl!("Interval"));
             let mut interval = m.interval;
-            let drag = egui::DragValue::new(&mut interval).range(MIN_MARKER_INTERVAL..=MAX_MARKER_INTERVAL).speed(0.2).suffix(" pt");
+            let drag = egui::DragValue::new(&mut interval)
+                .update_while_editing(false)
+                .range(MIN_MARKER_INTERVAL..=MAX_MARKER_INTERVAL)
+                .speed(0.2)
+                .suffix(" pt");
             let resp = ui.add(drag).on_hover_text(tl!("The distance between two marks along the line")).labelled_by(input_label.id);
-            if resp.changed() {
+            if crate::widgets::changed(&resp) {
                 crate::widgets::one_step_per_press(app, &resp);
                 set(app, with(LineMarkers { interval, ..m }));
             }
@@ -5095,10 +6039,10 @@ fn marker_rows(
     ui.label(tl!("Angle"));
     ui.horizontal(|ui| {
         let mut angle = m.angle;
-        let drag = egui::DragValue::new(&mut angle).range(0.0..=359.9).speed(1.0).suffix("°");
+        let drag = egui::DragValue::new(&mut angle).update_while_editing(false).range(0.0..=359.9).speed(1.0).suffix("°");
         let tip = if m.mark == LineMark::Hash { tl!("0° crosses the line square") } else { tl!("Turned further, clockwise") };
         let resp = ui.add(drag).on_hover_text(tip);
-        if resp.changed() {
+        if crate::widgets::changed(&resp) {
             crate::widgets::one_step_per_press(app, &resp);
             set(app, with(LineMarkers { angle, ..m }));
         }
@@ -5123,22 +6067,93 @@ fn symbol_mark(s: &Symbol) -> LineStroke {
     LineStroke { markers: Some(m), ..LineStroke::default() }
 }
 
-/// A point layer's marks at the middle of `r`, bottom first, shifted as they are on the map (their
-/// offsets turned with their angles).
-fn marks_preview(ui: &Ui, r: Rect, strokes: &[LineStroke], base: &Symbol) {
-    let shown: Vec<LineStroke> = if strokes.is_empty() { vec![symbol_mark(base)] } else { strokes.to_vec() };
-    let reach = shown.iter().filter_map(|st| st.markers.map(|m| m.offset_along.hypot(st.offset) + m.size / 2.0)).fold(1.0_f32, f32::max);
-    let k = (18.0 / reach).min(1.0);
-    for st in &shown {
+/// How far stroke `st`'s marker reaches from its middle, in points: its half size, and half its
+/// outline's width when it draws one (the stroke's width, else `base`'s).
+fn mark_reach(st: &LineStroke, m: &LineMarkers, base: &Symbol) -> f32 {
+    let outline = if m.outline.is_some_and(|o| o.a() > 0) { st.resolve(base).1.max(0.0) } else { 0.0 };
+    (m.size + outline) / 2.0
+}
+
+/// How far a point's marks reach from it, in points (at least 1): their offsets and
+/// [`mark_reach`]es.
+fn marks_reach(marks: &[LineStroke], base: &Symbol) -> f32 {
+    marks.iter().filter_map(|st| st.markers.map(|m| m.offset_along.hypot(st.offset) + mark_reach(st, &m, base))).fold(1.0_f32, f32::max)
+}
+
+/// A point layer's `marks` round `centre`, bottom first, scaled by `k`, shifted as they are on the
+/// map (their offsets turned with their angles).
+fn marks_preview(p: &egui::Painter, centre: egui::Pos2, marks: &[LineStroke], base: &Symbol, k: f32) {
+    for st in marks {
         let Some(m) = st.markers else { continue };
         let (c, w) = st.resolve(base);
         // A mark of no colour of its own takes the symbol's fill.
         let c = if st.color.is_none() { base.fill } else { c };
         let (sin, cos) = m.angle.to_radians().sin_cos();
         let (ox, oy) = (m.offset_along * k, st.offset * k);
-        let at = r.center() + vec2(ox * cos - oy * sin, ox * sin + oy * cos);
+        let at = centre + vec2(ox * cos - oy * sin, ox * sin + oy * cos);
         let one = LineMarkers { at: Placements::FIRST, ..m };
-        marker_preview(ui, &one, (at.x, at.x), at.y, k, c32(c), (w * k).max(0.5));
+        marker_preview(p, &one, (at.x, at.x), at.y, k, c32(c), w * k);
+    }
+}
+
+/// How far a line's stacked `strokes` reach either side of it, in points (at least 1): their
+/// offsets and half widths (a marker's [`mark_reach`]).
+fn strokes_reach(strokes: &[LineStroke], base: &Symbol) -> f32 {
+    let reach = |st: &LineStroke| (st.resolve(base).1 / 2.0).max(st.markers.map_or(0.0, |m| mark_reach(st, &m, base)));
+    strokes.iter().map(|st| st.offset.abs() + reach(st)).fold(1.0_f32, f32::max)
+}
+
+/// A line's stacked `strokes` along a straight line from `x.0` to `x.1` at `y`, bottom first,
+/// scaled by `k`: a positive offset shows below it. In `levels`, a stroke shows over the lower
+/// levels' (ties keep their stack order), as the map has it.
+fn strokes_preview(p: &egui::Painter, (x0, x1): (f32, f32), y: f32, strokes: &[LineStroke], base: &Symbol, levels: bool, k: f32) {
+    let mut ordered: Vec<(u8, LineStroke)> =
+        strokes.iter().enumerate().map(|(i, st)| (if levels { st.level_at(i) } else { 0 }, *st)).collect();
+    ordered.sort_by_key(|(level, _)| *level);
+    let cap_pad = |st: &LineStroke, w: f32| if st.cap == LineCap::Butt { 0.0 } else { w / 2.0 };
+    for (_, st) in &ordered {
+        let (c, w) = st.resolve(base);
+        let y = y + st.offset * k;
+        if let Some(m) = &st.markers {
+            // (Along a line, as on the map, hash marks of no width aren't drawn.)
+            if !matches!(m.mark, LineMark::Hash) || w > 0.0 {
+                marker_preview(p, m, (x0, x1), y, k, c32(c), w * k);
+            }
+            continue;
+        }
+        // A line of no width isn't drawn on the map; one under half a point shows at half.
+        if w.is_nan() || w <= 0.0 {
+            continue;
+        }
+        let w = (w * k).max(0.5);
+        let pad = cap_pad(st, w);
+        // The dashes along the preview, scaled as the strokes are. Solid when the map draws the
+        // pattern solid: under a pixel a round on this screen, at the pattern's own size.
+        let steps: Vec<f32> = st.dash.map(|d| d.even_steps().iter().map(|v| v * k).collect()).unwrap_or_default();
+        let mut runs = Vec::new();
+        if st.dash.is_some_and(|d| d.period() * p.ctx().pixels_per_point() >= 1.0) && steps.iter().sum::<f32>() > 0.0 {
+            let (mut x, mut on) = (x0, true);
+            for step in steps.iter().cycle().take(4096) {
+                if x >= x1 {
+                    break;
+                }
+                let end = (x + step).min(x1);
+                if on {
+                    runs.push((x, end));
+                }
+                (x, on) = (end, !on);
+            }
+        } else {
+            runs.push((x0, x1));
+        }
+        for (from, to) in runs {
+            if st.cap == LineCap::Round {
+                p.circle_filled(pos2(from, y), w / 2.0, c32(c));
+                p.circle_filled(pos2(to, y), w / 2.0, c32(c));
+            }
+            let (a, b) = if st.cap == LineCap::Square { (from - pad, to + pad) } else { (from, to) };
+            p.line_segment([pos2(a, y), pos2(b, y)], Stroke::new(w, c32(c)));
+        }
     }
 }
 
@@ -5175,6 +6190,152 @@ fn marker_rotation_row(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
             {
                 let _ = app.run("layer.markerRotation", json!({"field": r.field, "counterclockwise": ccw}));
             }
+        }
+    });
+}
+
+/// The field a classified point layer's markers are sized by (`layer.sizeBy`), beside its classes'
+/// colours: none, or one of its number fields, with the values and sizes at the two ends and how
+/// the size grows between them.
+fn size_by_rows(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::map::Layer) {
+    use rustgis_engine::map::symbol_by::{MAX_SIZE, SizeBy, SizeScaling};
+    let cur = l.size_by.as_ref();
+    let pending_id = egui::Id::unique(("size_by_pending", l.instance_id()));
+    let mut pending = ui.data_mut(|d| d.get_temp::<(Option<SizeBy>, SizeBy)>(pending_id));
+    // A command, undo or a completed worker supersedes a draft based on the old mapping.
+    if pending.as_ref().is_some_and(|(base, _)| base.as_ref() != cur) {
+        pending = None;
+    }
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Size by"));
+        let selected = pending.as_ref().map(|(_, by)| by.clone()).or_else(|| cur.cloned());
+        let shown = selected.as_ref().map_or_else(|| tl!("None").to_string(), |s| s.field.clone());
+        egui::ComboBox::from_id_salt(("size_by", l.id))
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(selected.is_none(), tl!("None")).clicked() {
+                    pending = None;
+                    if cur.is_some() {
+                        let _ = app.run("layer.sizeBy", json!({"layer": l.id, "field": null}));
+                    }
+                }
+                for f in l.dataset.fields.iter().filter(|f| f.ty.is_numeric()) {
+                    let on = pending.as_ref().map(|(_, by)| by).or(cur).is_some_and(|s| s.field == f.name);
+                    if ui.selectable_label(on, &f.name).clicked() && !on {
+                        pending = if cur.is_some_and(|by| by.field == f.name) {
+                            None
+                        } else {
+                            Some((
+                                cur.cloned(),
+                                SizeBy {
+                                    field: f.name.clone(),
+                                    min: 0.0,
+                                    max: 100.0,
+                                    min_size: cur.map_or(4.0, |by| by.min_size),
+                                    max_size: cur.map_or(24.0, |by| by.max_size),
+                                    scaling: cur.map_or(SizeScaling::Area, |by| by.scaling),
+                                },
+                            ))
+                        };
+                    }
+                }
+            })
+            .response
+            .on_hover_text(tl!("Size each point by a number field, keeping its class's colours"))
+            .labelled_by(input_label.id);
+    });
+    let is_pending = pending.is_some();
+    let Some(mut by) = pending.as_ref().map(|(_, by)| by.clone()).or_else(|| cur.cloned()) else {
+        ui.data_mut(|d| d.remove::<(Option<SizeBy>, SizeBy)>(pending_id));
+        return;
+    };
+    let field = by.field.clone();
+    let set = |app: &mut RustGisApp, resp: &egui::Response, p: Value| {
+        if !is_pending && crate::widgets::changed(resp) {
+            crate::widgets::one_step_per_press(app, resp);
+            let mut params = json!({"layer": l.id, "field": field});
+            if let (Some(params), Some(p)) = (params.as_object_mut(), p.as_object()) {
+                params.extend(p.clone());
+            }
+            let _ = app.run("layer.sizeBy", params);
+        }
+    };
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Values"));
+        let resp = ui.add(egui::DragValue::new(&mut by.min).update_while_editing(false).speed(0.1)).labelled_by(input_label.id);
+        set(app, &resp, json!({"min": by.min}));
+        ui.label(tl!("to"));
+        let resp = ui.add(egui::DragValue::new(&mut by.max).update_while_editing(false).speed(0.1)).labelled_by(input_label.id);
+        set(app, &resp, json!({"max": by.max}));
+    });
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Sizes"));
+        let resp = ui
+            .add(egui::DragValue::new(&mut by.min_size).update_while_editing(false).range(0.0..=MAX_SIZE).suffix(" pt"))
+            .labelled_by(input_label.id);
+        set(app, &resp, json!({"minSize": by.min_size}));
+        ui.label(tl!("to"));
+        let resp = ui
+            .add(egui::DragValue::new(&mut by.max_size).update_while_editing(false).range(0.0..=MAX_SIZE).suffix(" pt"))
+            .labelled_by(input_label.id);
+        set(app, &resp, json!({"maxSize": by.max_size}));
+    });
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Scaling"));
+        let name = |k: SizeScaling| match k {
+            SizeScaling::Area => tl!("By area"),
+            SizeScaling::Radius => tl!("By radius"),
+        };
+        egui::ComboBox::from_id_salt(("size_by_scaling", l.id))
+            .selected_text(name(by.scaling))
+            .show_ui(ui, |ui| {
+                for k in [SizeScaling::Area, SizeScaling::Radius] {
+                    if ui.selectable_label(by.scaling == k, name(k)).clicked() && by.scaling != k {
+                        if is_pending {
+                            by.scaling = k;
+                        } else {
+                            let _ = app.run("layer.sizeBy", json!({"layer": l.id, "field": by.field, "scaling": k.code()}));
+                        }
+                    }
+                }
+            })
+            .response
+            .on_hover_text(tl!("By area: a value twice another draws a marker of about twice the area. By radius: twice the size."))
+            .labelled_by(input_label.id);
+    });
+    let mut keep_pending = is_pending;
+    if is_pending {
+        ui.horizontal(|ui| {
+            // Once asked, the scan is under way with its own Cancel (the status bar's): the draft
+            // closes, so its Cancel can't look like it stops the scan.
+            if ui.button(tl!("Use field range")).clicked()
+                && app
+                    .run(
+                        "layer.sizeBy",
+                        json!({"layer": l.id, "field": by.field,
+                        "minSize": by.min_size, "maxSize": by.max_size, "scaling": by.scaling.code()}),
+                    )
+                    .is_ok()
+            {
+                keep_pending = false;
+            }
+            if ui.add_enabled(by.min.is_finite() && by.max.is_finite() && by.max > by.min, egui::Button::new(tl!("Apply"))).clicked() {
+                let _ = app.run(
+                    "layer.sizeBy",
+                    json!({"layer": l.id, "field": by.field, "min": by.min, "max": by.max,
+                    "minSize": by.min_size, "maxSize": by.max_size, "scaling": by.scaling.code()}),
+                );
+            }
+            if ui.button(tl!("Cancel")).clicked() {
+                keep_pending = false;
+            }
+        });
+    }
+    ui.data_mut(|d| {
+        if keep_pending {
+            d.insert_temp(pending_id, (cur.cloned(), by));
+        } else {
+            d.remove::<(Option<SizeBy>, SizeBy)>(pending_id);
         }
     });
 }
@@ -5222,10 +6383,10 @@ fn symbol_by_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::map::
     });
 }
 
-/// One By Expression box: `label`, then the expression set (`cur`), checked against `ds` as it is
-/// typed. Gives the text to apply (blank: none) when the box loses focus with one that reads and
-/// differs from `cur`; one that doesn't read shows why, and stays in its box unapplied until it is
-/// fixed or Escape drops it.
+/// One By Expression box: `label`, then the expression set (`cur`), with the suggestions of
+/// [`crate::exprcomplete::expr_edit`] and checked against `ds` as it is typed. Gives the text to
+/// apply (blank: none) when the box loses focus with one that reads and differs from `cur`; one
+/// that doesn't read shows why, and stays in its box unapplied until it is fixed or Escape drops it.
 pub(crate) fn expression_box(
     ui: &mut Ui,
     id: egui::Id,
@@ -5264,20 +6425,19 @@ pub(crate) fn expression_box(
                     ui.label(label)
                 })
                 .inner;
-            ui.add(
-                egui::TextEdit::singleline(&mut buf)
-                    .id(id)
-                    .hint_text(tl!("None"))
+            // Suggestions as it's typed: the fields, functions, variables and keywords (#1240).
+            crate::exprcomplete::expr_edit(ui, id, &mut buf, Some(ds), |e| {
+                e.hint_text(tl!("None"))
                     .char_limit(rustgis_engine::data::query::MAX_LEN)
                     .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY),
-            )
+                    .desired_width(f32::INFINITY)
+            })
             .labelled_by(input_label.id)
         })
         .inner;
-    // Checked here, as Calculate Field checks it, only while it differs from what is set.
+    // Check syntax and fields while typing; the applying command validates area values once.
     let text = buf.trim();
-    let error = (text != cur.trim() && !text.is_empty()).then(|| rustgis_engine::data::query::parse(text, ds).err()).flatten();
+    let error = (text != cur.trim() && !text.is_empty()).then(|| rustgis_engine::data::query::parse_fields(text, ds).err()).flatten();
     let mut apply = None;
     if r.lost_focus() {
         ui.data_mut(|d| d.remove::<(String, String)>(typing));
@@ -5294,7 +6454,9 @@ pub(crate) fn expression_box(
     } else if r.has_focus() {
         ui.data_mut(|d| d.insert_temp(typing, (cur.clone(), buf.clone())));
     }
-    if let Some(e) = error.filter(|_| focused || r.lost_focus() || kept.is_some()) {
+    // Not while a word is still being chosen from the list (`pop_`, with `pop_est` offered).
+    let shown = (focused || r.lost_focus() || kept.is_some()) && !crate::exprcomplete::offering(ui, id);
+    if let Some(e) = error.filter(|_| shown) {
         ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", &e)])).small().color(t.red));
     }
     apply
@@ -5380,58 +6542,12 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
         let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
         ui.painter().rect_filled(r, CornerRadius::same(4), t.ribbon);
         if points {
-            marks_preview(ui, r, &strokes, &base);
-        }
-        let mut preview: Vec<LineStroke> = if strokes.is_empty() { vec![LineStroke::default()] } else { strokes.clone() };
-        // In levels, a stroke shows over the lower levels' (ties keep their stack order), as the map has it.
-        if l.stroke_levels {
-            let mut levelled: Vec<(u8, LineStroke)> = preview.iter().enumerate().map(|(i, st)| (st.level_at(i), *st)).collect();
-            levelled.sort_by_key(|(level, _)| *level);
-            preview = levelled.into_iter().map(|(_, st)| st).collect();
-        }
-        let reach = preview
-            .iter()
-            .map(|st| st.offset.abs() + st.resolve(&base).1.max(st.markers.map_or(0.0, |m| m.size)) / 2.0)
-            .fold(1.0_f32, f32::max);
-        let k = (18.0 / reach).min(1.0);
-        let (x0, x1) = (r.min.x + 14.0, r.max.x - 14.0);
-        let cap_pad = |st: &LineStroke, w: f32| if st.cap == LineCap::Butt { 0.0 } else { w / 2.0 };
-        for st in preview.iter().filter(|_| !points) {
-            let (c, w) = st.resolve(&base);
-            let w = (w * k).max(0.5);
-            let y = r.center().y + st.offset * k;
-            if let Some(m) = &st.markers {
-                marker_preview(ui, m, (x0, x1), y, k, c32(c), w);
-                continue;
-            }
-            let pad = cap_pad(st, w);
-            // The dashes along the preview, scaled as the strokes are. Solid when the map draws the
-            // pattern solid: under a pixel a round on this screen, at the pattern's own size.
-            let steps: Vec<f32> = st.dash.map(|d| d.even_steps().iter().map(|v| v * k).collect()).unwrap_or_default();
-            let mut runs = Vec::new();
-            if st.dash.is_some_and(|d| d.period() * ui.ctx().pixels_per_point() >= 1.0) && steps.iter().sum::<f32>() > 0.0 {
-                let (mut x, mut on) = (x0, true);
-                for step in steps.iter().cycle().take(4096) {
-                    if x >= x1 {
-                        break;
-                    }
-                    let end = (x + step).min(x1);
-                    if on {
-                        runs.push((x, end));
-                    }
-                    (x, on) = (end, !on);
-                }
-            } else {
-                runs.push((x0, x1));
-            }
-            for (from, to) in runs {
-                if st.cap == LineCap::Round {
-                    ui.painter().circle_filled(pos2(from, y), w / 2.0, c32(c));
-                    ui.painter().circle_filled(pos2(to, y), w / 2.0, c32(c));
-                }
-                let (a, b) = if st.cap == LineCap::Square { (from - pad, to + pad) } else { (from, to) };
-                ui.painter().line_segment([pos2(a, y), pos2(b, y)], Stroke::new(w, c32(c)));
-            }
+            let marks = if strokes.is_empty() { vec![symbol_mark(&base)] } else { strokes.clone() };
+            marks_preview(ui.painter(), r.center(), &marks, &base, (18.0 / marks_reach(&marks, &base)).min(1.0));
+        } else {
+            let line = if strokes.is_empty() { vec![LineStroke::default()] } else { strokes.clone() };
+            let k = (18.0 / strokes_reach(&line, &base)).min(1.0);
+            strokes_preview(ui.painter(), (r.min.x + 14.0, r.max.x - 14.0), r.center().y, &line, &base, l.stroke_levels, k);
         }
         // The line's direction.
         let (ay, ax) = (r.max.y - 6.0, r.max.x - 8.0);
@@ -5546,9 +6662,10 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
                 ui.label(tl!("Width"));
                 ui.horizontal(|ui| {
                     let mut ww = w;
-                    let drag = egui::DragValue::new(&mut ww).range(0.0..=MAX_STROKE_WIDTH).speed(0.05).suffix(" pt");
+                    let drag =
+                        egui::DragValue::new(&mut ww).update_while_editing(false).range(0.0..=MAX_STROKE_WIDTH).speed(0.05).suffix(" pt");
                     let resp = ui.add_enabled(st.width.is_some(), drag).on_hover_text(tl!("Width"));
-                    if resp.changed() {
+                    if crate::widgets::changed(&resp) {
                         crate::widgets::one_step_per_press(app, &resp);
                         set(app, LineStroke { width: Some(ww), ..st });
                     }
@@ -5560,14 +6677,18 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
                 ui.end_row();
                 ui.label(if points { tl!("Offset down") } else { tl!("Offset") });
                 let mut off = st.offset;
-                let drag = egui::DragValue::new(&mut off).range(-MAX_STROKE_OFFSET..=MAX_STROKE_OFFSET).speed(0.05).suffix(" pt");
+                let drag = egui::DragValue::new(&mut off)
+                    .update_while_editing(false)
+                    .range(-MAX_STROKE_OFFSET..=MAX_STROKE_OFFSET)
+                    .speed(0.05)
+                    .suffix(" pt");
                 let tip = if points {
                     tl!("Shifts the mark below the point (above when negative)")
                 } else {
                     tl!("Shifts the stroke sideways: positive to the right of the line's direction, negative to the left")
                 };
                 let resp = ui.add(drag).on_hover_text(tip);
-                if resp.changed() {
+                if crate::widgets::changed(&resp) {
                     crate::widgets::one_step_per_press(app, &resp);
                     set(app, LineStroke { offset: off, ..st });
                 }
@@ -5657,9 +6778,12 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
                     ui.horizontal(|ui| {
                         let mut lv = st.level_at(i);
                         let resp = ui
-                            .add_enabled(st.level.is_some(), egui::DragValue::new(&mut lv).range(0..=255).speed(0.1))
+                            .add_enabled(
+                                st.level.is_some(),
+                                egui::DragValue::new(&mut lv).update_while_editing(false).range(0..=255).speed(0.1),
+                            )
                             .on_hover_text(tl!("Level"));
-                        if resp.changed() {
+                        if crate::widgets::changed(&resp) {
                             crate::widgets::one_step_per_press(app, &resp);
                             set(app, LineStroke { level: Some(lv), ..st });
                         }
@@ -5690,9 +6814,12 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
 }
 
 // ---------------------------------------------------------------------------------------------
-// History and Details
+// History, and what the Source tab shows of a layer
 
-fn history(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+pub(crate) fn history(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    if crate::sessionlog::tabs(app, ui, t) {
+        return crate::sessionlog::pane(app, ui, t);
+    }
     let hist = app.session.project.gp_history.clone();
     if hist.is_empty() {
         ui.label(egui::RichText::new(tl!("Tools you run appear here.")).color(t.text_dim));
@@ -5804,14 +6931,10 @@ fn save_history_script(app: &mut RustGisApp) {
     }
 }
 
-/// Shows the selected layer's source metadata alongside its internal longitude/latitude extent.
-fn details(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
-    let Some(l) = app.session.active_layer.and_then(|id| app.session.map().layer(id)) else {
-        ui.label(egui::RichText::new(tl!("Select a layer in the Layers pane.")).color(t.text_dim));
-        return;
-    };
+/// What the Layer Properties pane's Source tab (#1803) shows of a layer: its geometry, counts,
+/// source, coordinate system, extent and fields, or a raster's own details.
+pub(crate) fn source_details(ui: &mut Ui, l: &Layer, t: &Tokens) {
     let e = l.extent();
-    ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
     if let Some(rl) = &l.raster {
         raster_details(ui, rl, t);
         return;
@@ -5823,7 +6946,8 @@ fn details(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             ("Fields", l.dataset.fields.len().to_string()),
             ("Selected", l.selection.len().to_string()),
             ("Symbology", tl!(l.renderer.kind_label()).to_string()),
-            ("Source", l.dataset.source.clone().unwrap_or_else(|| tl!("In project").into())),
+            // A web or database address without its keys, tokens or password.
+            ("Source", l.dataset.source.as_deref().map_or_else(|| tl!("In project").into(), rustgis_engine::sources::redact)),
             ("Source coordinate system", l.dataset.crs.map(|c| c.label()).unwrap_or_else(|| "EPSG:4326".into())),
             ("West", format!("{:.4}°", e.min_x)),
             ("East", format!("{:.4}°", e.max_x)),
@@ -5906,20 +7030,36 @@ fn raster_legend_rows(ui: &mut Ui, entries: &[RasterLegend], indent: f32, t: &To
 
 fn raster_details(ui: &mut Ui, rl: &rustgis_engine::map::RasterLayer, t: &Tokens) {
     let Some(d) = &rl.data else {
-        ui.label(egui::RichText::new(tl!("The raster's data couldn't be read.")).color(t.red));
+        // Read in place, its overview is on its way until it lands, or fails (said why).
+        match &rl.error {
+            None if rl.in_place => {
+                ui.label(egui::RichText::new(tl!("Reading in place…")).color(t.text_dim));
+            }
+            error => {
+                ui.label(egui::RichText::new(tl!("The raster's data couldn't be read.")).color(t.red));
+                if let Some(e) = error {
+                    ui.label(egui::RichText::new(e).size(11.0));
+                }
+            }
+        }
         if let Some(p) = &rl.path {
             ui.label(egui::RichText::new(p).monospace().size(11.0));
         }
         return;
     };
     let e = d.extent();
-    let (cx, cy) = d.cell_size();
     let unit = if d.crs.is_geographic() { "°" } else { " m" };
+    // Read in place, the map draws the full image: its size and cell size, not the overview's.
+    let full = d.overview.filter(|_| rl.in_place);
+    let (w, h) = full.unwrap_or((d.width, d.height));
+    let (cx, cy) = d.cell_size();
+    let (cx, cy) = (cx * f64::from(d.width) / f64::from(w.max(1)), cy * f64::from(d.height) / f64::from(h.max(1)));
+    let f = rustgis_engine::map::symbology::fmt_num;
     let mut rows = vec![
-        ("Size", format!("{} × {}", d.width, d.height)),
+        ("Size", format!("{w} × {h}")),
         ("Bands", d.band_count().to_string()),
         ("Pixel type", d.data_type.clone()),
-        ("Cell size", format!("{} × {}{unit}", rustgis_engine::map::symbology::fmt_num(cx), rustgis_engine::map::symbology::fmt_num(cy))),
+        ("Cell size", format!("{} × {}{unit}", f(cx), f(cy))),
         ("Coordinate system", d.crs.label()),
         ("NoData", d.nodata.map(|v| v.to_string()).unwrap_or_else(|| "—".into())),
         ("Symbology", tl!(rl.style.renderer.label()).to_string()),
@@ -5930,8 +7070,23 @@ fn raster_details(ui: &mut Ui, rl: &rustgis_engine::map::RasterLayer, t: &Tokens
         ("South", format!("{:.4}°", e.min_y)),
         ("North", format!("{:.4}°", e.max_y)),
     ];
-    if let Some((w, h)) = d.overview {
-        rows.insert(1, ("Full size", format!("{w} × {h}")));
+    match d.overview {
+        // Read in place: the overview is what the layer holds.
+        Some(_) if rl.in_place => {
+            rows.insert(
+                1,
+                (
+                    "Read",
+                    crate::i18n::fmt(
+                        "In place, holding a {w} × {h} overview",
+                        &[("w", &d.width.to_string()), ("h", &d.height.to_string())],
+                    ),
+                ),
+            );
+        }
+        Some((fw, fh)) => rows.insert(1, ("Full size", format!("{fw} × {fh}"))),
+        None if rl.in_place => rows.insert(1, ("Read", tl!("In place").to_string())),
+        None => {}
     }
     let value_w = (ui.available_width() - 140.0).max(80.0);
     egui::Grid::new("raster_details").num_columns(2).striped(true).max_col_width(value_w).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
@@ -5972,14 +7127,24 @@ fn rgb_stretch_bounds(app: &mut RustGisApp, ui: &mut Ui, layer: impl std::hash::
     for (name, pair) in [tl!("Red"), tl!("Green"), tl!("Blue")].into_iter().zip(edit.iter_mut()) {
         let [mut lo, mut hi] = *pair;
         let speed = ((hi - lo).abs() / 200.0).clamp(1e-6, 1e6);
+        let typed_from = [lo, hi];
         ui.horizontal(|ui| {
             ui.add_sized([44.0, 18.0], egui::Label::new(name));
             let input_label = ui.label(tl!("Min"));
-            let a = ui.add(egui::DragValue::new(&mut lo).speed(speed)).labelled_by(input_label.id);
+            let a = ui.add(egui::DragValue::new(&mut lo).update_while_editing(false).speed(speed)).labelled_by(input_label.id);
             let input_label = ui.label(tl!("Max"));
-            let b = ui.add(egui::DragValue::new(&mut hi).speed(speed)).labelled_by(input_label.id);
-            done |= a.drag_stopped() || b.drag_stopped() || ((a.changed() || b.changed()) && !a.dragged() && !b.dragged());
-            changed |= a.changed() || b.changed();
+            let b = ui.add(egui::DragValue::new(&mut hi).update_while_editing(false).speed(speed)).labelled_by(input_label.id);
+            // Escape drops a number typed (`widgets::escaped`).
+            if crate::widgets::escaped(&a) {
+                lo = typed_from[0];
+            }
+            if crate::widgets::escaped(&b) {
+                hi = typed_from[1];
+            }
+            done |= a.drag_stopped()
+                || b.drag_stopped()
+                || ((crate::widgets::changed(&a) || crate::widgets::changed(&b)) && !a.dragged() && !b.dragged());
+            changed |= crate::widgets::changed(&a) || crate::widgets::changed(&b);
         });
         if !(lo.is_finite() && hi.is_finite() && lo < hi) {
             ui.label(egui::RichText::new(tl!("Min must be less than Max")).size(11.5).color(t.red));
@@ -5997,10 +7162,15 @@ fn rgb_stretch_bounds(app: &mut RustGisApp, ui: &mut Ui, layer: impl std::hash::
 }
 
 fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
-    ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
+    crate::symbologycopy::heading(app, ui, l, t);
     let Some(rl) = l.raster.clone() else { return };
     let Some(d) = rl.data.clone() else {
-        ui.label(egui::RichText::new(tl!("The raster's data couldn't be read.")).color(t.red));
+        // Read in place, its overview is on its way until it lands, or fails (as Details says).
+        if rl.error.is_none() && rl.in_place {
+            ui.label(egui::RichText::new(tl!("Reading in place…")).color(t.text_dim));
+        } else {
+            ui.label(egui::RichText::new(tl!("The raster's data couldn't be read.")).color(t.red));
+        }
         return;
     };
     let style = rl.style.clone();
@@ -6119,8 +7289,8 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
             ui.horizontal(|ui| {
                 let input_label = ui.label(tl!("Classes"));
                 let mut kk = k;
-                let resp = ui.add(egui::DragValue::new(&mut kk).range(1..=32)).labelled_by(input_label.id);
-                if resp.changed() {
+                let resp = ui.add(egui::DragValue::new(&mut kk).update_while_editing(false).range(1..=32)).labelled_by(input_label.id);
+                if crate::widgets::changed(&resp) {
                     crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("raster.symbology", json!({"type": "classify", "method": format!("{m:?}"), "classes": kk, "ramp": r}));
                 }
@@ -6137,40 +7307,83 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         RasterRenderer::Colormap => {
             ui.label(egui::RichText::new(tl!("Colors from the raster's own color table.")).size(11.5).color(t.text_dim));
         }
-        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor } => {
-            let (az, alt, zf, rp) = (*azimuth, *altitude, *z_factor, ramp.as_ref().map(|r| r.name().to_string()));
-            let relief = move |band: usize, az: f64, alt: f64, zf: f64| {
-                let mut p = json!({"type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf});
+        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky, fill, rock, ambient, balanced } => {
+            let (az, alt, zf, sh, sk, fl) = (*azimuth, *altitude, *z_factor, *shadow, *sky, *fill);
+            let am = relief_ambient(*ambient, *balanced);
+            let rp = ramp.as_ref().map(|r| r.name().to_string());
+            let relief = move |band: usize, az: f64, alt: f64, zf: f64, sh: f64| {
+                let mut p = json!({
+                    "type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh, "sky": sk, "fill": fl
+                });
                 match &rp {
                     Some(r) => p["ramp"] = json!(r),
                     None => p["grey"] = json!(true),
                 }
                 p
             };
-            band_combo(app, ui, "Band", *band, &|i| ("raster.symbology".into(), relief(i, az, alt, zf)));
+            band_combo(app, ui, "Band", *band, &|i| ("raster.symbology".into(), relief(i, az, alt, zf, sh)));
             egui::Grid::new("relief").num_columns(2).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
-                for (label, v, range, speed, which) in
-                    [("Azimuth", az, 0.0..=360.0, 1.0, 0), ("Altitude", alt, 0.0..=90.0, 0.5, 1), ("Z factor", zf, 0.001..=1000.0, 0.01, 2)]
-                {
+                for (label, v, range, speed, which) in [
+                    ("Azimuth", az, 0.0..=360.0, 1.0, 0),
+                    ("Altitude", alt, 0.0..=90.0, 0.5, 1),
+                    ("Z factor", zf, 0.001..=1000.0, 0.01, 2),
+                    ("Cast shadows", sh, 0.0..=1.0, 0.01, 3),
+                    ("Sky visibility", sk, 0.0..=1.0, 0.01, 4),
+                    ("Fill light", fl, 0.0..=1.0, 0.01, 5),
+                    ("Ambient", am, 0.0..=1.0, 0.01, 6),
+                ] {
                     let input_label = ui.label(tl!(label));
                     let mut x = v;
                     // Kept across a drag until it is let go (#607).
                     let drag = Dragged::lend(ui, egui::Id::unique(("relief_drag", l.id, which)), &mut x);
-                    let r = ui.add(egui::DragValue::new(&mut x).range(range).speed(speed).max_decimals(3)).labelled_by(input_label.id);
+                    let r = ui
+                        .add(egui::DragValue::new(&mut x).update_while_editing(false).range(range).speed(speed).max_decimals(3))
+                        .labelled_by(input_label.id);
+                    let r = match which {
+                        3 => r.on_hover_text(tl!("How dark the shadows the terrain casts are, from 0 (none) to 1, for the sun set above")),
+                        4 => r.on_hover_text(tl!(
+                            "How much the sky each cell sees, over the terrain around it, scales its ambient light, from 0 (not at all) to 1"
+                        )),
+                        5 => r.on_hover_text(tl!(
+                            "A light from the side opposite the sun that lightens the slopes turned toward it, from 0 (none) to 1"
+                        )),
+                        6 => r.on_hover_text(tl!("The share of the colour a slope turned fully from the sun keeps, from 0 to 1")),
+                        _ => r,
+                    };
                     if drag.settled(ui, &r, &mut x) && x != v {
-                        let (a, b, c) = match which {
-                            0 => (x, alt, zf),
-                            1 => (az, x, zf),
-                            _ => (az, alt, x),
+                        let (a, b, c, d) = match which {
+                            0 => (x, alt, zf, sh),
+                            1 => (az, x, zf, sh),
+                            2 => (az, alt, x, sh),
+                            3 => (az, alt, zf, x),
+                            _ => (az, alt, zf, sh),
                         };
-                        let _ = app.run("raster.symbology", relief(*band, a, b, c));
+                        let mut p = relief(*band, a, b, c, d);
+                        match which {
+                            4 => p["sky"] = json!(x),
+                            5 => p["fill"] = json!(x),
+                            6 => p["ambient"] = json!(x),
+                            _ => {}
+                        }
+                        let _ = app.run("raster.symbology", p);
                     }
                     ui.end_row();
                 }
             });
+            let mut on = *balanced;
+            if ui
+                .checkbox(&mut on, tl!("Balanced light"))
+                .on_hover_text(tl!("Flat ground keeps the ramp's colour and slopes facing the sun brighten"))
+                .changed()
+            {
+                let mut p = relief(*band, az, alt, zf, sh);
+                p["balanced"] = json!(on);
+                let _ = app.run("raster.symbology", p);
+            }
+            rock_on_slopes(app, ui, l.id, *rock, relief(*band, az, alt, zf, sh));
             let mut tint = ramp.is_some();
             if ui.checkbox(&mut tint, tl!("Tint by elevation")).changed() {
-                let mut p = relief(*band, az, alt, zf);
+                let mut p = relief(*band, az, alt, zf, sh);
                 if tint {
                     p["ramp"] = json!("Terrain");
                     p["grey"] = json!(false);
@@ -6208,11 +7421,15 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     // Each kept across a drag until it is let go (#607); both are sent together.
                     let input_label = ui.label(tl!("Min %"));
                     let drag = Dragged::lend(ui, egui::Id::unique(("percent_clip_drag", l.id, "low")), &mut lo);
-                    let a = ui.add(egui::DragValue::new(&mut lo).range(0.0..=49.0).speed(0.1).max_decimals(2)).labelled_by(input_label.id);
+                    let a = ui
+                        .add(egui::DragValue::new(&mut lo).update_while_editing(false).range(0.0..=49.0).speed(0.1).max_decimals(2))
+                        .labelled_by(input_label.id);
                     let low_settled = drag.settled(ui, &a, &mut lo);
                     let input_label = ui.label(tl!("Max %"));
                     let drag = Dragged::lend(ui, egui::Id::unique(("percent_clip_drag", l.id, "high")), &mut hi);
-                    let b = ui.add(egui::DragValue::new(&mut hi).range(0.0..=49.0).speed(0.1).max_decimals(2)).labelled_by(input_label.id);
+                    let b = ui
+                        .add(egui::DragValue::new(&mut hi).update_while_editing(false).range(0.0..=49.0).speed(0.1).max_decimals(2))
+                        .labelled_by(input_label.id);
                     let high_settled = drag.settled(ui, &b, &mut hi);
                     if (low_settled || high_settled) && (lo != low || hi != high) {
                         let _ = app.run("raster.stretch", json!({"type": "percentClip", "low": lo, "high": hi}));
@@ -6238,16 +7455,26 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                 let pending = ui.data(|d| d.get_temp::<([f64; 2], [f64; 2])>(key)).filter(|(base, _)| *base == [min, max]);
                 let [mut lo, mut hi] = pending.map_or([min, max], |(_, edit)| edit);
                 let speed = ((max - min).abs() / 200.0).clamp(1e-6, 1e6);
+                let typed_from = [lo, hi];
                 ui.horizontal(|ui| {
                     let input_label = ui.label(tl!("Min"));
-                    let a = ui.add(egui::DragValue::new(&mut lo).speed(speed)).labelled_by(input_label.id);
+                    let a = ui.add(egui::DragValue::new(&mut lo).update_while_editing(false).speed(speed)).labelled_by(input_label.id);
                     let input_label = ui.label(tl!("Max"));
-                    let b = ui.add(egui::DragValue::new(&mut hi).speed(speed)).labelled_by(input_label.id);
-                    let done = a.drag_stopped() || b.drag_stopped() || ((a.changed() || b.changed()) && !a.dragged() && !b.dragged());
+                    let b = ui.add(egui::DragValue::new(&mut hi).update_while_editing(false).speed(speed)).labelled_by(input_label.id);
+                    // Escape drops a number typed (`widgets::escaped`).
+                    if crate::widgets::escaped(&a) {
+                        lo = typed_from[0];
+                    }
+                    if crate::widgets::escaped(&b) {
+                        hi = typed_from[1];
+                    }
+                    let done = a.drag_stopped()
+                        || b.drag_stopped()
+                        || ((crate::widgets::changed(&a) || crate::widgets::changed(&b)) && !a.dragged() && !b.dragged());
                     if lo.is_finite() && hi.is_finite() && lo < hi && done {
                         ui.data_mut(|d| d.remove::<([f64; 2], [f64; 2])>(key));
                         let _ = app.run("raster.stretch", json!({"type": "custom", "min": lo, "max": hi}));
-                    } else if a.changed() || b.changed() {
+                    } else if crate::widgets::changed(&a) || crate::widgets::changed(&b) {
                         ui.data_mut(|d| d.insert_temp(key, ([min, max], [lo, hi])));
                     }
                 });
@@ -6261,7 +7488,9 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     let input_label = ui.label(tl!("Deviations"));
                     // Kept across a drag until it is let go (#607).
                     let drag = Dragged::lend(ui, egui::Id::unique(("deviations_drag", l.id)), &mut nn);
-                    let a = ui.add(egui::DragValue::new(&mut nn).range(0.1..=10.0).speed(0.05).max_decimals(2)).labelled_by(input_label.id);
+                    let a = ui
+                        .add(egui::DragValue::new(&mut nn).update_while_editing(false).range(0.1..=10.0).speed(0.05).max_decimals(2))
+                        .labelled_by(input_label.id);
                     if drag.settled(ui, &a, &mut nn) && nn != n {
                         let _ = app.run("raster.stretch", json!({"type": "standardDeviation", "n": nn}));
                     }
@@ -6304,12 +7533,50 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
     ui.add_space(10.0);
     ui.separator();
     ui.label(egui::RichText::new(tl!("Layer")).size(11.5).color(t.text_dim));
-    let mut tr = l.transparency;
-    ui.horizontal(|ui| {
-        let input_label = ui.label(tl!("Transparency"));
-        ui.spacing_mut().slider_width = 150.0;
-        let r = ui.add(egui::Slider::new(&mut tr, 0.0..=100.0).suffix(" %").integer()).labelled_by(input_label.id);
-        transparency_drag(app, ui, &r, l, tr);
+    transparency_row(app, ui, l);
+}
+
+/// Shaded Relief's Rock on steep slopes (#1913): a check box and, when it is on, the slopes in
+/// degrees the rock colour starts and ends at and the colour. `relief` is the layer's Shaded
+/// Relief as `raster.symbology` takes it, to which the rock is added.
+fn rock_on_slopes(app: &mut RustGisApp, ui: &mut Ui, layer: u32, rock: Option<Rock>, relief: Value) {
+    let send = |app: &mut RustGisApp, rock: Value| {
+        let mut p = relief.clone();
+        p["rock"] = rock;
+        let _ = app.run("raster.symbology", p);
+    };
+    let mut on = rock.is_some();
+    if ui
+        .checkbox(&mut on, tl!("Rock on steep slopes"))
+        .on_hover_text(tl!("Tints steep ground toward a rock colour before the light shades it, by the ground's own slope"))
+        .changed()
+    {
+        send(app, if on { json!({}) } else { json!(false) });
+    }
+    let Some(rock) = rock else { return };
+    egui::Grid::new(("relief_rock", layer)).num_columns(2).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+        for (label, v, which) in [("From", rock.from, 0), ("To", rock.to, 1)] {
+            let input_label = ui.label(tl!(label));
+            let mut x = v;
+            // Kept across a drag until it is let go (#607).
+            let drag = Dragged::lend(ui, egui::Id::unique(("relief_rock_drag", layer, which)), &mut x);
+            let r = ui
+                .add(egui::DragValue::new(&mut x).update_while_editing(false).range(0.0..=90.0).speed(0.5).max_decimals(1).suffix("°"))
+                .labelled_by(input_label.id);
+            if drag.settled(ui, &r, &mut x) && x != v {
+                // The other end moves along rather than cross it.
+                let (from, to) =
+                    if which == 0 { (x.min(89.0), rock.to.max(x.min(89.0) + 1.0)) } else { (rock.from.min(x.max(1.0) - 1.0), x.max(1.0)) };
+                send(app, json!({"from": from, "to": to}));
+            }
+            ui.end_row();
+        }
+        let input_label = ui.label(tl!("Color"));
+        let mut c = egui::Color32::from_rgb(rock.color.r(), rock.color.g(), rock.color.b());
+        if crate::widgets::color_button(ui, &mut c).labelled_by(input_label.id).changed() {
+            send(app, json!({"color": rustgis_engine::map::Rgba::rgb(c.r(), c.g(), c.b()).hex()}));
+        }
+        ui.end_row();
     });
 }
 
@@ -6390,17 +7657,27 @@ fn raster_masking(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, d: &rustgis_engi
                 let [mut lo, mut hi] = pending.map_or([min, max], |(_, edit)| edit);
                 let span = if min.is_finite() && max.is_finite() { (max - min).abs() } else { 100.0 };
                 let speed = (span / 200.0).clamp(1e-6, 1e6);
+                let typed_from = [lo, hi];
                 ui.horizontal(|ui| {
                     let input_label = ui.label(tl!("Min"));
-                    let a = ui.add(egui::DragValue::new(&mut lo).speed(speed)).labelled_by(input_label.id);
+                    let a = ui.add(egui::DragValue::new(&mut lo).update_while_editing(false).speed(speed)).labelled_by(input_label.id);
                     let input_label = ui.label(tl!("Max"));
-                    let b = ui.add(egui::DragValue::new(&mut hi).speed(speed)).labelled_by(input_label.id);
-                    let done = a.drag_stopped() || b.drag_stopped() || ((a.changed() || b.changed()) && !a.dragged() && !b.dragged());
+                    let b = ui.add(egui::DragValue::new(&mut hi).update_while_editing(false).speed(speed)).labelled_by(input_label.id);
+                    // Escape drops a number typed (`widgets::escaped`).
+                    if crate::widgets::escaped(&a) {
+                        lo = typed_from[0];
+                    }
+                    if crate::widgets::escaped(&b) {
+                        hi = typed_from[1];
+                    }
+                    let done = a.drag_stopped()
+                        || b.drag_stopped()
+                        || ((crate::widgets::changed(&a) || crate::widgets::changed(&b)) && !a.dragged() && !b.dragged());
                     if lo <= hi && done {
                         ui.data_mut(|d| d.remove::<([f64; 2], [f64; 2])>(key));
                         let bound = |v: f64| if v.is_finite() { json!(v) } else { Value::Null };
                         let _ = app.run("raster.mask", json!({"min": bound(lo), "max": bound(hi)}));
-                    } else if a.changed() || b.changed() {
+                    } else if crate::widgets::changed(&a) || crate::widgets::changed(&b) {
                         ui.data_mut(|d| d.insert_temp(key, ([min, max], [lo, hi])));
                     }
                 });
@@ -6464,6 +7741,326 @@ pub(crate) fn layout_menu(app: &mut RustGisApp, ui: &mut Ui, n: &str) {
 mod tests {
     use super::*;
 
+    /// A point layer given an image by `layer.marker` shows it in its patch (the Layers row and the
+    /// symbol editor's swatch), and a stroke's image marker shows on the stroke editor's line, not
+    /// circles (#2266).
+    #[test]
+    fn a_picture_marker_shows_in_its_patch() {
+        let png =
+            "iVBORw0KGgoAAAANSUhEUgAAABgAAAAMCAYAAAB4MH11AAAAIElEQVR4nGO4ICPznxQsE3OBJMwwasGoBaMWjFpAGAMALk9r//PjorkAAAAASUVORK5CYII=";
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.marker", json!({"layer": "Cities", "image": png, "size": 14})).unwrap();
+        let l = app.session.map().layer_by_name("Cities").unwrap();
+        let (s, g) = (l.renderer.base_symbol(), l.geometry_type());
+        let ctx = egui::Context::default();
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(18.0, 14.0));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| patch(ui.painter(), r, &s, g, Stack::default()));
+        // The image alone: one mesh on its own texture (not the font atlas's), and no circle.
+        let image = |c: &egui::epaint::ClippedShape| matches!(&c.shape, egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default());
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes.iter().all(image));
+        // On the stroke editor's line: once at its middle, once more at each end.
+        let one = LineMarkers { mark: LineMark::Marker(s.marker), size: 12.0, at: Placements::MIDDLE, ..LineMarkers::default() };
+        let ends = LineMarkers { at: Placements::VERTICES, ..one };
+        for (m, n) in [(one, 1), (ends, 2)] {
+            let line = |ui: &mut Ui| marker_preview(ui.painter(), &m, (0.0, 80.0), 7.0, 1.0, egui::Color32::RED, 1.0);
+            let shapes = ctx.run_ui(egui::RawInput::default(), line).shapes;
+            assert_eq!((shapes.len(), shapes.iter().all(image)), (n, true), "{:?}", m.at);
+        }
+        // (Its texture's upload isn't handed to a renderer here.)
+        out.textures_delta.clear();
+    }
+
+    /// The shapes a patch paints in an 18×14 box for layer `name`'s symbol, with its stack or
+    /// without, its point scaled by `k` as a size row's.
+    fn patch_shapes(app: &RustGisApp, name: &str, stacked: bool, k: Option<f32>) -> Vec<egui::epaint::ClippedShape> {
+        let l = app.session.map().layer_by_name(name).unwrap();
+        let stack = if stacked { Stack::of(l, &[], &[]) } else { Stack::default() };
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(18.0, 14.0));
+        let draw = |ui: &mut Ui| patch_sized(ui.painter(), r, &l.renderer.base_symbol(), l.geometry_type(), k, stack);
+        let mut out = egui::Context::default().run_ui(egui::RawInput::default(), draw);
+        // (The font atlas's upload isn't handed to a renderer here.)
+        out.textures_delta.clear();
+        out.shapes
+    }
+
+    /// The colours `shapes` paint with, in order: fills, then outlines.
+    fn inks(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        use egui::Shape;
+        shapes
+            .iter()
+            .flat_map(|c| match &c.shape {
+                Shape::LineSegment { stroke, .. } => vec![stroke.color],
+                Shape::Rect(r) => vec![r.fill, r.stroke.color],
+                Shape::Circle(c) => vec![c.fill, c.stroke.color],
+                Shape::Path(p) => vec![p.fill],
+                _ => Vec::new(),
+            })
+            .filter(|c| c.a() > 0)
+            .collect()
+    }
+
+    /// A row's patch shows the stack the map draws its features with, cut to its box (#2490): a
+    /// line's casing and dashed core, a polygon's fills under its outline, a point's marks (a size
+    /// row's at its scale). A layer with none keeps the patch it had.
+    #[test]
+    fn a_patch_shows_its_layers_stack() {
+        let (black, red, green) = (egui::Color32::BLACK, egui::Color32::from_rgb(255, 0, 0), egui::Color32::from_rgb(0, 200, 0));
+        let mut app = RustGisApp::with_sample();
+        for name in ["Rivers", "Lakes", "Cities"] {
+            assert_eq!(patch_shapes(&app, name, true, None), patch_shapes(&app, name, false, None), "{name} has no stack");
+        }
+        let strokes = json!([{"color": "#000000", "width": 6}, {"color": "#FF0000", "width": 2, "dash": [2, 2], "cap": "flat"}]);
+        app.run("layer.lineStrokes", json!({"layer": "Rivers", "strokes": strokes})).unwrap();
+        let fills = json!([{"color": "#00C800"}, {"color": "#000000", "pattern": "hatch", "spacing": 3}]);
+        app.run("layer.fillLayers", json!({"layer": "Lakes", "fills": fills})).unwrap();
+        app.run(
+            "layer.lineStrokes",
+            json!({"layer": "Cities", "strokes": [{"color": "#FF0000", "markers": {"mark": "circle", "size": 10}}]}),
+        )
+        .unwrap();
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(18.0, 14.0));
+        let map = app.session.map();
+        let symbol = |name: &str| map.layer_by_name(name).unwrap().renderer.base_symbol();
+
+        let line = patch_shapes(&app, "Rivers", true, None);
+        let ink = inks(&line);
+        assert_eq!(ink.first(), Some(&black), "the casing first");
+        assert!(ink.iter().filter(|c| **c == red).count() > 2, "the core's dashes over it");
+        assert!(!ink.contains(&c32(symbol("Rivers").stroke)), "not the symbol's single line");
+        assert!(line.iter().all(|c| r.contains_rect(c.clip_rect)), "cut to the box");
+
+        let polygon = inks(&patch_shapes(&app, "Lakes", true, None));
+        assert_eq!(polygon.first(), Some(&green), "the fill");
+        assert!(polygon.contains(&black), "the hatch over it");
+        assert_eq!(polygon.last(), Some(&c32(symbol("Lakes").stroke)), "the outline over both");
+
+        let across = |k| {
+            let shapes = patch_shapes(&app, "Cities", true, k);
+            assert!(!inks(&shapes).contains(&c32(symbol("Cities").fill)), "the mark, not the symbol's marker");
+            shapes.iter().find_map(|c| {
+                matches!(&c.shape, egui::Shape::Circle(dot) if dot.fill == red).then(|| c.shape.visual_bounding_rect().width())
+            })
+        };
+        assert_eq!(across(None), Some(10.0), "the mark as large as the map draws it");
+        assert_eq!(across(Some(0.5)), Some(5.0), "a size row's at its scale");
+
+        // Size rows share the scale that fits the largest: its symbol, or its marks when larger.
+        let cities = map.layer_by_name("Cities").unwrap();
+        let row = |size: f32, mark: f32| LegendEntry {
+            label: String::new(),
+            symbol: Symbol { size, ..symbol("Cities") },
+            strokes: vec![LineStroke { markers: Some(LineMarkers { size: mark, ..LineMarkers::default() }), ..LineStroke::default() }],
+            fills: Vec::new(),
+            fallback: false,
+        };
+        assert_eq!(size_rows_scale(cities, &[row(10.0, 4.0), row(20.0, 7.0)]), 1.0, "marks that fit as drawn");
+        assert_eq!(size_rows_scale(cities, &[row(10.0, 14.0), row(20.0, 28.0)]), 0.5, "the largest marks, not the symbol");
+
+        // As the map: an outline-only mark shows its outline, and a line of no width isn't drawn.
+        let blue = egui::Color32::from_rgb(0, 0, 255);
+        let hollow = json!([{"color": "#00000000", "width": 2, "markers": {"mark": "square", "size": 10, "outline": "#0000FF"}}]);
+        app.run("layer.lineStrokes", json!({"layer": "Cities", "strokes": hollow})).unwrap();
+        assert!(inks(&patch_shapes(&app, "Cities", true, None)).contains(&blue), "the hollow square's outline");
+        let unseen = json!([{"color": "#000000", "width": 6}, {"color": "#0000FF", "width": 0}]);
+        app.run("layer.lineStrokes", json!({"layer": "Rivers", "strokes": unseen})).unwrap();
+        assert!(!inks(&patch_shapes(&app, "Rivers", true, None)).contains(&blue), "no line of no width");
+        let ticks = json!([{"color": "#0000FF", "width": 0, "markers": {"mark": "hash", "size": 6}}]);
+        app.run("layer.lineStrokes", json!({"layer": "Rivers", "strokes": ticks})).unwrap();
+        assert!(!inks(&patch_shapes(&app, "Rivers", true, None)).contains(&blue), "no hash marks of no width along a line");
+        // A wide outline counts in the fit: the whole mark stays in the box.
+        let ringed = json!([{"color": "#FF0000", "width": 8, "markers": {"mark": "circle", "size": 10, "outline": "#0000FF"}}]);
+        app.run("layer.lineStrokes", json!({"layer": "Cities", "strokes": ringed})).unwrap();
+        let shapes = patch_shapes(&app, "Cities", true, None);
+        assert!(inks(&shapes).contains(&blue), "the outline");
+        assert!(shapes.iter().all(|c| r.expand(0.01).contains_rect(c.shape.visual_bounding_rect())), "inside the box, outline and all");
+    }
+
+    /// The stroke and fill editors send an image back with every change, so it is kept; one that
+    /// can't be drawn (a file's, not kept or not an image) becomes the circle it showed as, which
+    /// is said, rather than every change being refused (#2266).
+    #[test]
+    fn the_editors_keep_an_image_and_replace_one_that_cannot_be_drawn() {
+        use base64::Engine;
+        use rustgis_engine::map::Picture;
+        use rustgis_engine::map::fills::{FillLayer, FillPattern};
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(6, 3, image::Rgba([10, 120, 230, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let image = Marker::Picture(Picture::new(&base64::engine::general_purpose::STANDARD.encode(&png)));
+        let broken = Marker::Picture(Picture::new("bm90IGFuIGltYWdl"));
+        let dropped = Marker::Picture(Picture::read(&"A".repeat(rustgis_engine::map::symbology::MAX_PICTURE_BYTES + 4)));
+        assert!(matches!(dropped, Marker::Picture(p) if p.is_dropped()));
+        let mut app = RustGisApp::with_sample();
+        // The notices of replaced images since `mark`, one per change, with how many and where.
+        let said = |app: &RustGisApp, mark| -> Vec<String> {
+            app.session
+                .notices_since(mark)
+                .iter()
+                .filter(|n| n.text.contains("replaced by the circles") && !n.error)
+                .map(|n| n.text.clone())
+                .collect()
+        };
+        let marks = |shape| LineMarkers { mark: LineMark::Marker(shape), size: 9.0, ..LineMarkers::default() };
+        let stroke = |shape| LineStroke { markers: Some(marks(shape)), ..LineStroke::default() };
+        for layer in ["Rivers", "Cities"] {
+            app.session.active_layer = app.session.map().layer_by_name(layer).map(|l| l.id);
+            let strokes = |app: &RustGisApp| app.session.map().layer_by_name(layer).unwrap().line_strokes.clone();
+            let mark = app.session.notice_mark();
+            set_strokes(&mut app, None, &[stroke(image)]);
+            assert_eq!(strokes(&app), [stroke(image)], "{layer}: kept");
+            assert!(said(&app, mark).is_empty());
+            let mark = app.session.notice_mark();
+            set_strokes(&mut app, None, &[stroke(broken), stroke(dropped), stroke(image)]);
+            assert_eq!(strokes(&app), [stroke(Marker::Circle), stroke(Marker::Circle), stroke(image)], "{layer}");
+            assert_eq!(
+                said(&app, mark),
+                [format!("Image markers that can't be drawn were replaced by the circles they showed as: 2 on \"{layer}\"")]
+            );
+        }
+        app.session.active_layer = app.session.map().layer_by_name("Countries").map(|l| l.id);
+        let dots = |marker| FillLayer {
+            color: None,
+            pattern: FillPattern::Dots {
+                marker,
+                size: 5.0,
+                outline: None,
+                outline_width: 0.0,
+                spacing: [9.0, 9.0],
+                displacement: [0.0, 0.0],
+                offset: [0.0, 0.0],
+            },
+        };
+        let fills = |app: &RustGisApp| app.session.map().layer_by_name("Countries").unwrap().fill_layers.clone();
+        crate::fill_editor::set_fills(&mut app, None, &[dots(image)]);
+        assert_eq!(fills(&app), [dots(image)]);
+        let mark = app.session.notice_mark();
+        crate::fill_editor::set_fills(&mut app, None, &[dots(broken), dots(image)]);
+        assert_eq!(fills(&app), [dots(Marker::Circle), dots(image)]);
+        assert_eq!(said(&app, mark), ["Image markers that can't be drawn were replaced by the circles they showed as: 1 on \"Countries\""]);
+    }
+
+    /// Find Tools finds a tool by what it shows in the interface's language as well as by its
+    /// English name and id, without minding case or accents (#2224).
+    #[test]
+    fn find_tools_matches_the_shown_name_without_accents() {
+        let dissolve = rustgis_engine::analysis::tool("dissolve").expect("the built-in Dissolve");
+        let kernel = rustgis_engine::analysis::tool("kernelDensity").expect("the built-in Kernel Density");
+        let fold = rustgis_engine::plugins::TreeNode::fold;
+        crate::i18n::set_current(crate::i18n::Lang::from_code("pt").expect("Portuguese"));
+        let shown = crate::i18n::t_raw(dissolve.name);
+        assert_ne!(shown, dissolve.name, "the test needs Dissolve translated into Portuguese");
+        assert!(tool_matches(&fold(shown), dissolve), "{shown}");
+        assert!(tool_matches(&fold("DISSOLVE"), dissolve), "the English name still finds it");
+        assert!(tool_matches(&fold("dissolve"), dissolve) && tool_matches("", dissolve));
+        let shown = crate::i18n::t_raw(kernel.name);
+        let plain: String = fold(shown);
+        assert!(tool_matches(&plain, kernel), "{shown} without its accents or case");
+        assert!(!tool_matches(&fold("curvas de nivel"), dissolve));
+        crate::i18n::set_current(crate::i18n::Lang::EN);
+        assert!(!tool_matches(
+            &fold(crate::i18n::Lang::from_code("pt").map(|pt| crate::i18n::tr_raw(pt, dissolve.name)).unwrap_or("")),
+            dissolve
+        ));
+    }
+
+    /// An external tool's optional layer inputs stay empty until they're picked, and its required
+    /// ones start at the active layer; a built-in tool's optional one still follows it (#1517).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_form_leaves_an_external_tool_s_optional_layers_empty() {
+        // Its suite is registered for the whole process: in its own, so that a test counting the
+        // tools (`tool_ids_are_offered_for_gp_runs_tool`) doesn't see it come in between reads.
+        if crate::isolate_account_test("panes::tests::the_form_leaves_an_external_tool_s_optional_layers_empty") {
+            return;
+        }
+        use rustgis_engine::analysis::{ParamSpec as P, ToolSpec, external_placeholder, register_external};
+        const fn layer(name: &'static str, kind: ParamKind, required: bool) -> P {
+            P { name, label: name, kind, required, default: "", help: "" }
+        }
+        const PARAMS: &[P] = &[
+            layer("layer", ParamKind::Layer, false),
+            layer("needed", ParamKind::Layer, true),
+            layer("neededVector", ParamKind::VectorLayer, true),
+            layer("raster", ParamKind::RasterLayer, false),
+            layer("vector", ParamKind::VectorLayer, false),
+            layer("polygon", ParamKind::PolygonLayer, false),
+            layer("point", ParamKind::PointLayer, false),
+            P { name: "named", label: "named", kind: ParamKind::VectorLayer, required: false, default: "\"Countries\"", help: "" },
+            P { name: "text", label: "text", kind: ParamKind::Text, required: false, default: "\"soft\"", help: "" },
+        ];
+        const RASTER: &[P] = &[layer("mask", ParamKind::VectorLayer, false), layer("dem", ParamKind::RasterLayer, true)];
+        register_external(
+            "formTest",
+            || {
+                let tool = |id, params| ToolSpec { id, name: id, toolbox: "Form test", summary: "", params, run: external_placeholder };
+                vec![tool("formTest:optional", PARAMS), tool("formTest:raster", RASTER)]
+            },
+            |_, _, _| Err("not run".into()),
+        );
+        let mut app = RustGisApp::with_sample();
+        app.session.active_layer = app.session.map().layer_by_name("Cities").map(|l| l.id);
+
+        app.run("ui.gp.open", json!({"tool": "formTest:optional"})).unwrap();
+        assert_eq!(app.gp.tool, Some("formTest:optional"));
+        let filled = |app: &RustGisApp, name: &str| app.gp.values.get(name).cloned();
+        assert_eq!(filled(&app, "needed").as_deref(), Some("Cities"));
+        assert_eq!(filled(&app, "neededVector").as_deref(), Some("Cities"));
+        for name in ["layer", "raster", "vector", "polygon", "point"] {
+            assert_eq!(filled(&app, name), None, "{name}");
+        }
+        assert_eq!(filled(&app, "text").as_deref(), Some("soft"));
+        assert_eq!(filled(&app, "named").as_deref(), Some("Countries"), "the default a run would use");
+        // Its picker offers no `—`, which would run with that default too; another optional one does.
+        let offered: Vec<bool> = ["named", "vector", "raster", "polygon", "point", "layer", "neededVector", "needed"]
+            .iter()
+            .map(|n| no_layer_offered(PARAMS.iter().find(|p| p.name == *n).unwrap()))
+            .collect();
+        assert_eq!(offered, [false, true, true, true, true, true, false, false]);
+        // Its fields and a new output's name come from the required layer, which is filled, not
+        // the optional one before it, which is empty.
+        let spec = rustgis_engine::analysis::tool("formTest:optional").unwrap();
+        assert_eq!(first_layer(spec).map(|p| p.name), Some("needed"));
+        assert_eq!(layer_for_param(spec, "field").map(|p| p.name), Some("needed"));
+        assert_eq!(layer_for_param(spec, "layer_field").map(|p| p.name), Some("layer"), "its own prefix still wins");
+        assert_eq!(output_layer(spec).map(|p| p.name), Some("needed"));
+        // A required raster names the output, over an optional layer before it.
+        let raster = rustgis_engine::analysis::tool("formTest:raster").unwrap();
+        assert_eq!(output_layer(raster).map(|p| p.name), Some("dem"));
+        // A standalone table opened with it goes into the required input, whose fields its
+        // field parameters take.
+        let table = app.session.project.add_table(rustgis_engine::data::Dataset::new(
+            "Addresses",
+            rustgis_engine::data::GeometryType::None,
+            vec![],
+        ));
+        app.run("ui.gp.open", json!({"tool": "formTest:optional", "table": table})).unwrap();
+        assert_eq!((filled(&app, "needed").as_deref(), app.gp.tables.get("needed")), (Some("Addresses"), Some(&table)));
+        assert_eq!(filled(&app, "layer"), None);
+
+        app.run("ui.gp.open", json!({"tool": "a5Grid"})).unwrap();
+        assert_eq!(filled(&app, "input").as_deref(), Some("Cities"));
+    }
+
+    /// A slot poisoned by a panicking writer that filled it anyway is still read, or the pane
+    /// waiting on it would wait forever.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_poisoned_slot_is_still_taken() {
+        let slot: crate::Slot<u32> = crate::Slot::default();
+        let writer = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let mut held = writer.lock().unwrap();
+            *held = Some(7);
+            panic!("the writer fails after filling the slot");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+        assert_eq!(take(&slot), Some(7));
+        assert_eq!(take(&slot), None, "taken once");
+    }
+
     /// Run starts a built-in tool on a thread of its own: the pane shows it running, with Cancel,
     /// and its result lands as gp.run's would, with its layer and history.
     #[cfg(not(target_arch = "wasm32"))]
@@ -6496,7 +8093,7 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while h.state().gp.tool_run.is_some() {
             assert!(std::time::Instant::now() < end, "the run never landed");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10)); // test-wait: legacy polling for the background tool
             h.step();
         }
         let app = h.state();
@@ -6688,10 +8285,72 @@ mod tests {
         h.step();
     }
 
+    /// #1321: double-clicking a layer opens its Symbology pane even at 4 frames a second (CPU
+    /// rendering of a large map), where egui's default 0.3 s missed the second click.
+    #[test]
+    fn double_clicking_a_layer_opens_symbology_at_a_slow_frame_rate() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.ui.right_open.clear();
+        app.ui.right = None;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).with_step_dt(0.25).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        h.get_by_label("Rivers").click();
+        h.step();
+        h.get_by_label("Rivers").click();
+        h.run_steps(3);
+        assert_eq!(h.state().session.active_layer, h.state().session.map().layer_by_name("Rivers").map(|l| l.id));
+        assert_eq!(h.state().ui.right, Some(RightPane::Symbology));
+        // The delay follows the frames: the Windows default when they are fast, up to 1.2 s.
+        assert_eq!(crate::double_click_delay(1.0 / 60.0), 0.5);
+        assert!((crate::double_click_delay(0.33) - 0.96).abs() < 1e-6);
+        assert_eq!(crate::double_click_delay(2.0), 1.2);
+    }
+
+    /// #1321: the frame that takes the first click can be the first slow one. egui reads the delay
+    /// when the next frame begins, so the delay has to follow the frame that just ended: 0.3 s of
+    /// work gives at least 0.9 s, where the fast frames before it gave 0.5 s.
+    #[test]
+    fn a_double_click_counts_across_the_first_slow_frame() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.ui.right_open.clear();
+        app.ui.right = None;
+        let slow = std::rc::Rc::new(std::cell::Cell::new(false));
+        let frame = slow.clone();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                if frame.get() {
+                    std::thread::sleep(std::time::Duration::from_millis(300)); // test-wait: simulate a slow frame between double-clicks
+                }
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        let at = h.get_by_label("Rivers").rect().center();
+        slow.set(true);
+        crate::click_in_one_frame(&mut h, at, 1.0 / 60.0);
+        slow.set(false);
+        crate::click_in_one_frame(&mut h, at, 0.7);
+        h.run_steps(3);
+        assert_eq!(h.state().ui.right, Some(RightPane::Symbology));
+    }
+
     /// #808: a web tile layer is listed at its place among the map's layers, moves past them
     /// from its menu, and is dragged to another place.
     #[test]
     fn a_tile_layer_is_listed_and_moved_among_the_layers() {
+        let _turn = crate::fetching::turn();
         use egui_kittest::kittest::Queryable;
         let mut app = RustGisApp::with_sample();
         for c in ["Cities", "Countries"] {
@@ -6741,6 +8400,7 @@ mod tests {
     fn a_vector_archives_source_layers_open_under_it() {
         use egui_kittest::kittest::{NodeT, Queryable};
         use rustgis_engine::render::rustgis_tiles::{mvt, pmtiles};
+        let _turn = crate::fetching::turn();
         let new = pmtiles::NewArchive {
             tile_type: pmtiles::TileType::Mvt,
             gzipped_tiles: false,
@@ -6762,7 +8422,7 @@ mod tests {
             if rustgis_engine::render::tile_source_layers(&app.session.map().tiles[0]).is_some() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10)); // test-wait: legacy polling for archive source layers
         }
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
             |ui, app: &mut RustGisApp| {
@@ -6815,6 +8475,7 @@ mod tests {
     /// mode identifies it), and clicking a layer's row picks that instead.
     #[test]
     fn a_tile_layers_row_is_picked_with_a_click() {
+        let _turn = crate::fetching::turn();
         use egui_kittest::kittest::Queryable;
         let mut app = RustGisApp::with_sample();
         app.run("map.addTiles", json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
@@ -7064,6 +8725,39 @@ mod tests {
         assert_eq!(source_name("file://user@localhost/x.gpkg").label, "x.gpkg");
     }
 
+    /// A service's downloaded raster groups under the address it came from, not the file name its
+    /// download was read under; a local raster still groups by its file.
+    #[test]
+    fn a_service_rasters_source_is_its_address() {
+        use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let raster = || {
+            let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+            Raster::new("soil", 1, 1, vec![vec![1.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap()
+        };
+        let mut ds = rustgis_engine::data::Dataset::new("Soil carbon", rustgis_engine::data::GeometryType::None, Vec::new());
+        ds.source = Some("https://user:secret@h/wcs?SERVICE=WCS&COVERAGEID=soc&token=K".into());
+        let mut l = Layer::new(7, ds);
+        l.raster = Some(rustgis_engine::map::RasterLayer::from_bytes(raster(), "coverage.tif", Vec::new()));
+        let src = layer_source(&l).unwrap();
+        assert_eq!(src.label, "h");
+        assert!(!src.key.contains("secret") && !src.hover.contains("secret"));
+        // A local file is grouped by its path, as before.
+        let mut local = Layer::new(8, rustgis_engine::data::Dataset::new("Local", rustgis_engine::data::GeometryType::None, Vec::new()));
+        local.raster = Some(rustgis_engine::map::RasterLayer::from_path(raster(), r"C:\GIS\soil.tif"));
+        assert_eq!(layer_source(&local).unwrap().label, "soil.tif");
+        // A raster read from an address is grouped by that address, not by another address its
+        // dataset names.
+        let mut remote = Layer::new(10, rustgis_engine::data::Dataset::new("Hill", rustgis_engine::data::GeometryType::None, Vec::new()));
+        remote.dataset.source = Some("https://catalog.example/items?f=json".into());
+        remote.raster = Some(rustgis_engine::map::RasterLayer::from_path(raster(), "https://files.example/hill.tif"));
+        assert_eq!(layer_source(&remote).unwrap().label, "files.example");
+        // A layer with no raster keeps its dataset source, even one that names no address scheme
+        // (a database connection kept by name).
+        let mut db = rustgis_engine::data::Dataset::new("Roads", rustgis_engine::data::GeometryType::Polyline, Vec::new());
+        db.source = Some("osm".into());
+        assert_eq!(layer_source(&Layer::new(9, db)).unwrap().label, "osm");
+    }
+
     /// #353: a row wider than the left pane (a long folder path in the Browser, a long favourite in
     /// Data Sources) widened the pane to its 480 px cap, and it stayed that wide on every pane.
     /// The pane keeps the width it was given; the row is cut off at its edge.
@@ -7170,6 +8864,50 @@ mod tests {
         assert!(l.fill_layers.iter().all(|f| !f.draws(l.symbol(2).fill)));
         assert!(!l.fill_layers.is_empty());
         assert!(h.query_by_label("Add Fill").is_some());
+        h.get_by_label("Restore Fill").click();
+        h.run_steps(2);
+        let s = &h.state().session;
+        let l = s.map().layer(s.active_layer.unwrap()).unwrap();
+        assert!(l.no_fill.is_none());
+        assert!(l.fill_layers.is_empty());
+        assert!(l.symbol(2).fill.a() > 0);
+        assert!(h.query_by_label("No Fill").is_some());
+    }
+
+    /// A size field with no usable automatic range still exposes bounds and can be applied,
+    /// without changing the layer until Apply is clicked.
+    #[test]
+    fn size_fields_with_constant_or_missing_values_can_be_configured() {
+        use egui_kittest::kittest::Queryable;
+        for value in [rustgis_engine::data::Value::Float(5.0), rustgis_engine::data::Value::Null] {
+            let mut app = RustGisApp::with_sample();
+            let id = layer(&app, "Cities");
+            app.run("layer.symbology", json!({"layer": id, "type": "unique", "field": "name"})).unwrap();
+            let l = app.session.map_mut().layer_mut(id).unwrap();
+            let field = l.dataset.field_index("pop_max").unwrap();
+            for feature in l.dataset.features.iter_mut() {
+                feature.attrs[field] = value.clone();
+            }
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 400.0)).with_max_steps(64).build_ui_state(
+                move |ui, app: &mut RustGisApp| {
+                    let l = app.session.map().layer(id).unwrap().clone();
+                    size_by_rows(app, ui, &l);
+                },
+                app,
+            );
+            h.run_steps(3);
+            h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("None")).unwrap().click();
+            h.run_steps(3);
+            h.get_by_label("pop_max").click();
+            h.run_steps(3);
+            let bounds: Vec<_> = h.query_all_by_label("Values").filter_map(|n| n.value()).collect();
+            assert_eq!(bounds, ["0.0", "100.0"]);
+            assert!(h.state().session.map().layer(id).unwrap().size_by.is_none());
+            h.get_by_label("Apply").click();
+            h.run_steps(3);
+            let by = h.state().session.map().layer(id).unwrap().size_by.as_ref().unwrap();
+            assert_eq!((by.field.as_str(), by.min, by.max), ("pop_max", 0.0, 100.0));
+        }
     }
 
     fn symbology_retry_harness() -> egui_kittest::Harness<'static, RustGisApp> {
@@ -7235,6 +8973,56 @@ mod tests {
         assert!(h.query_all_by_role(Role::ComboBox).any(|n| n.value().as_deref() == Some("(expression)")));
     }
 
+    /// A By Expression box (symbols, Unique Values, labels) offers the fields as it's typed (#1240):
+    /// a word still being chosen isn't said to be invalid, a click in the list writes the field and
+    /// keeps the focus, so nothing half typed is applied, and leaving the box applies what's
+    /// written.
+    #[test]
+    fn an_expression_box_completes_before_it_applies() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Dataset, Field, FieldType};
+        let ds = Dataset::new("t", GeometryType::Polygon, vec![Field::new("pop_est", FieldType::Integer)]);
+        let id = egui::Id::unique("expression_box_test");
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(480.0, 360.0)).allow_missing_glyphs().build_ui_state(
+            move |ui, applied: &mut Vec<String>| {
+                let t = Tokens::get(ui.ctx());
+                if let Some(text) = expression_box(ui, id, "Size", None, &ds, &t) {
+                    applied.push(text);
+                }
+                // Somewhere else to click.
+                let _ = ui.button("Elsewhere");
+            },
+            Vec::new(),
+        );
+        h.run();
+        h.ctx.memory_mut(|m| m.request_focus(id));
+        h.run();
+        h.event(egui::Event::Text("pop_".into()));
+        h.run();
+        assert!(h.query_by_label_contains("Invalid:").is_none(), "a word being chosen isn't an error yet");
+        let at = h.get_by_role_and_label(Role::Button, "pop_est").rect().center();
+        h.event(egui::Event::PointerMoved(at));
+        h.step();
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+        h.step();
+        h.step();
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        h.run();
+        assert!(h.ctx.memory(|m| m.has_focus(id)), "the box keeps the focus");
+        assert!(h.state().is_empty(), "nothing applied while the field is picked");
+        h.event(egui::Event::Text(" / 1000".into()));
+        h.run();
+        h.get_by_label("Elsewhere").click();
+        h.run();
+        assert_eq!(h.state(), &["pop_est / 1000".to_string()], "applied on leaving the box");
+    }
+
     /// A different populated field fixes classification without changing the query or styling on failure.
     #[test]
     fn failed_symbology_switch_retries_another_numeric_field() {
@@ -7267,6 +9055,71 @@ mod tests {
         assert_eq!(breaks.last(), Some(&20.0), "only the rows kept by the query are classified");
         assert_eq!(h.state().session.undo_depth(), undo + 1);
         assert!(h.query_all_by_label("Choose a field to apply this renderer:").next().is_none());
+    }
+
+    /// Manual classes on a layer read in place end in an open class (#2497): it has no bound to
+    /// edit, and Split the widest class halves only a class with two bounds.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_open_manual_class_has_no_bound_to_edit_or_split() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V, raster::Crs, source::gpkg};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("buildings.gpkg");
+        let mut data = Dataset::new("buildings", GeometryType::Point, vec![Field::new("height", FieldType::Double)]);
+        for h in [2.0, 12.0, 40.0] {
+            data.push(Some(Geometry::Point(Coord::new(h, 0.0))), vec![V::Float(h)]);
+        }
+        gpkg::write_in(&data, &path, Crs::LonLat).unwrap();
+        let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
+        let id = app.run("layer.addData", json!({"path": &path, "stream": true})).unwrap()["layer"].as_u64().unwrap() as u32;
+        app.run("layer.symbology", json!({"type": "graduated", "field": "height", "breaks": [4, 25]})).unwrap();
+        app.ui.open_right(RightPane::Symbology);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        let breaks = |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.map().layer(id).unwrap().renderer {
+            Renderer::Graduated { breaks, .. } => breaks.clone(),
+            r => panic!("{r:?}"),
+        };
+        assert_eq!(breaks(&h), [4.0, 25.0, OPEN_ABOVE]);
+        for shown in ["Class 1 up to", "Class 2 up to", "Class 3 more than 25"] {
+            assert!(h.query_by_label(shown).is_some(), "no {shown}");
+        }
+        assert!(h.query_by_label("Class 3 up to").is_none(), "the open class has a bound to edit");
+        h.get_by_label("Split the widest class").click();
+        h.run_steps(3);
+        assert_eq!(breaks(&h), [4.0, 14.5, 25.0, OPEN_ABOVE]);
+    }
+
+    /// The panes name open classes through the catalog; closed classes and other renderers keep
+    /// the renderer's labels.
+    #[test]
+    fn open_classes_are_named_in_the_interface_language() {
+        use rustgis_engine::data::{Dataset, Field, FieldType};
+        let g = GeometryType::Polygon;
+        let d = Dataset::new("t", g, vec![Field::new("height", FieldType::Double)]);
+        let r = Renderer::graduated_manual_open(&d, "height", &[4.0, 25.0], Ramp::Ember, Symbol::default_for(g, 0)).unwrap();
+        let labels = |rows: Vec<LegendEntry>| rows.into_iter().map(|e| e.label).collect::<Vec<_>>();
+        let up_to = crate::i18n::fmt("up to {bound}", &[("bound", "4")]);
+        let more_than = crate::i18n::fmt("more than {bound}", &[("bound", "25")]);
+        let want = [up_to.as_str(), "4 – 25", more_than.as_str()];
+        assert_eq!(labels(interface_legend(&r, r.legend())), want);
+        let strokes: Vec<String> = stroke_classes(&r).into_iter().map(|(_, label, _)| label).collect();
+        assert_eq!(strokes, want);
+        // A class named by hand like an open class keeps its name, and so does the open class.
+        let mut named = r.clone();
+        named.set_class_style(&ClassRef::Index(1), &ClassStyle { label: Some("up to 4".into()), ..Default::default() }, g).unwrap();
+        assert_eq!(labels(interface_legend(&named, named.legend())), ["up to 4", "up to 4", more_than.as_str()]);
+        // Another renderer's row named like an open class is left alone.
+        let row = LegendEntry::plain("up to 4".into(), Symbol::default_for(g, 0));
+        assert_eq!(labels(interface_legend(&Renderer::Single(Symbol::default_for(g, 0)), vec![row])), ["up to 4"]);
     }
 
     /// No numeric candidates means an explanation, not an empty field selector.
@@ -7388,7 +9241,8 @@ mod tests {
         let id = layer(&app, "Countries");
         app.session.active_layer = Some(id);
         app.ui.open_right(RightPane::Symbology);
-        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1400.0)).with_max_steps(64).build_ui_state(
+        // Tall enough for the whole Symbology pane, its Diagram section included.
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 2200.0)).with_max_steps(64).build_ui_state(
             |ui, app: &mut RustGisApp| {
                 let ctx = ui.ctx().clone();
                 app.logic(&ctx);
@@ -7418,6 +9272,86 @@ mod tests {
         assert_eq!(transparency(&h), mid, "letting go keeps the value");
         h.state_mut().run("edit.undo", Value::Null).unwrap();
         assert_eq!(transparency(&h), start, "one undo takes the whole drag back");
+    }
+
+    /// A diagram outline or background at zero opacity keeps a colour picked for it: raising the
+    /// opacity later shows that colour, not black. An opacity-only edit keeps the stored channels.
+    #[test]
+    fn a_transparent_diagram_colour_keeps_its_picked_rgb() {
+        use rustgis_engine::map::Rgba;
+        let old = Rgba::new(0x4D, 0x4D, 0x4D, 0);
+        let mut hsva = egui::ecolor::Hsva::from_srgb([200, 30, 40]);
+        hsva.a = 0.0;
+        let mut shown = egui::ecolor::Hsva::from_srgb([0x4D, 0x4D, 0x4D]);
+        shown.a = 0.0;
+        let picked = crate::widgets::picked_colour(hsva, shown, old);
+        assert_eq!((picked.r(), picked.g(), picked.b(), picked.a()), (200, 30, 40, 0), "the RGB picked at zero opacity is kept");
+        let mut raised = egui::ecolor::Hsva::from_srgb([200, 30, 40]);
+        raised.a = 1.0;
+        assert_eq!(crate::widgets::picked_colour(raised, hsva, picked), picked.with_alpha(255), "raising the opacity shows it");
+        // A new colour and opacity in the same frame (two accessibility requests) keep both.
+        let red = Rgba::new(255, 0, 0, 255);
+        let mut before = egui::ecolor::Hsva::from_srgb([255, 0, 0]);
+        before.a = 1.0;
+        let mut blue = egui::ecolor::Hsva::from_srgb([0, 0, 255]);
+        blue.a = 0.5;
+        let both = crate::widgets::picked_colour(blue, before, red);
+        assert_eq!((both.r(), both.g(), both.b()), (0, 0, 255), "the new colour is kept with the new opacity");
+        assert!(both.a() > 0 && both.a() < 255, "and the new opacity: {}", both.a());
+    }
+
+    /// The Unique Values list shows as many classes as can be drawn from a QGIS rule style
+    /// (MAX_EXPRESSION_CLASSES), not only as many as a field's automatic classes (#1252); past
+    /// that, as a categorized style import can bring, it says how many it doesn't list.
+    #[test]
+    fn unique_values_list_every_class_drawn_and_says_how_many_it_leaves_out() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.symbology", json!({"layer": "Countries", "type": "unique", "field": "name"})).unwrap();
+        let id = layer(&app, "Countries");
+        // A style import's classes past the automatic ones: `n` in all.
+        let grow_to = |app: &mut RustGisApp, n: usize| {
+            if let Some(l) = app.session.map_mut().layers.iter_mut().find(|l| l.id == id)
+                && let Renderer::Unique { classes, .. } = &mut l.renderer
+            {
+                let symbol = classes[0].1;
+                let had = classes.len();
+                classes.extend((had..n.max(had)).map(|i| (format!("imported {i}"), symbol)));
+            }
+        };
+        let n = 150;
+        assert!(n > rustgis_engine::map::symbology::MAX_UNIQUE && n <= MAX_EXPRESSION_CLASSES);
+        grow_to(&mut app, n);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 600.0)).with_max_steps(8).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                let layer = app.session.map().layer(id).unwrap().clone();
+                egui::ScrollArea::vertical().show(ui, |ui| legend_list(app, ui, &layer, &Tokens::light()));
+            },
+            app,
+        );
+        h.run_steps(2);
+        // A label box for each class, and one for `<all other values>`.
+        assert_eq!(h.query_all_by_role(Role::TextInput).count(), n + 1);
+        assert!(h.query_by_label_contains("more classes aren't listed").is_none());
+
+        // More than can be listed, as a categorized style import can bring: the first ones,
+        // `<all other values>`, and how many are left out.
+        grow_to(h.state_mut(), MAX_EXPRESSION_CLASSES + 37);
+        h.run_steps(2);
+        assert_eq!(h.query_all_by_role(Role::TextInput).count(), MAX_EXPRESSION_CLASSES + 1);
+        // `<all other values>` keeps the last row.
+        let last = h.query_all_by_role(Role::TextInput).last().and_then(|n| n.value()).unwrap_or_default();
+        assert_eq!(last, OTHER_VALUES);
+        assert!(h.query_by_label_contains("37 more classes aren't listed").is_some());
+        // One left out is said as one.
+        if let Some(l) = h.state_mut().session.map_mut().layers.iter_mut().find(|l| l.id == id)
+            && let Renderer::Unique { classes, .. } = &mut l.renderer
+        {
+            classes.truncate(MAX_EXPRESSION_CLASSES + 1);
+        }
+        h.run_steps(2);
+        assert!(h.query_by_label_contains("1 more class isn't listed").is_some());
     }
 
     /// Editing opacity must not turn a transparent red or a near-transparent colour into black.
@@ -7567,5 +9501,50 @@ mod tests {
         let map = h.state().session.map();
         assert!(map.layer_by_name("Cities Annotation").is_some(), "no annotation layer");
         assert!(!map.layer_by_name("Cities").unwrap().labels.enabled, "the layer's own labels give way to it");
+    }
+
+    /// Define Projection… is on the Source tab of Properties…, not in the layer menu (#1803); the
+    /// menu's data actions stay, for the layers they apply to: here a file read in place.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_layer_menu_leaves_define_projection_to_properties() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V, raster::Crs, source::gpkg};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("places.gpkg");
+        let mut data = Dataset::new("places", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        data.push(Some(Geometry::Point(Coord::new(1.0, 20.0))), vec![V::Text("a".into())]);
+        gpkg::write_in(&data, &path, Crs::LonLat).unwrap();
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.addData", json!({"path": &path, "stream": true, "name": "Places"})).unwrap();
+        let l = app.session.map().layer_by_name("Places").cloned().unwrap();
+        assert!(l.is_streamed() && l.linked_file().is_some());
+        let mut h = egui_kittest::Harness::builder().build_ui_state(move |ui, app: &mut RustGisApp| layer_menu(app, ui, &l, true), app);
+        h.step();
+        assert!(h.query_by_label("Define Projection…").is_none(), "Define Projection… is still in the menu");
+        for kept in ["Rename…", "Export Features…", "Load All Features", "Reload Data", "Repair Data Source…", "Properties…"] {
+            assert!(h.query_by_label(kept).is_some(), "no {kept}");
+        }
+    }
+
+    /// F2 renames the active layer: it opens the Rename dialog with the layer's name, as the
+    /// layer menu's Rename… does.
+    #[test]
+    fn f2_opens_the_rename_dialog_for_the_active_layer() {
+        let mut app = RustGisApp::with_sample();
+        app.session.active_layer = Some(layer(&app, "Rivers"));
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(2);
+        h.key_press(egui::Key::F2);
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.open, Some("renameLayer"));
+        assert_eq!(h.state().dialogs.text, "Rivers");
     }
 }

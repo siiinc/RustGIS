@@ -12,8 +12,13 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
 - **Single Symbol**: one fill, outline and marker for every feature.
 - **Unique Values**: one colour per distinct value of a field. If no field is chosen, the current
   renderer's field is kept when available; otherwise the first available field is used, including
-  text fields. The Layers pane and layout legends list only the
-  classes that drawn features use (after the definition query and display filters);
+  text fields. There are up to 64 classes: the first values in numeric order when every value is
+  a number (9, 10, 100, as on a numeric field or a text field of codes), otherwise in text order
+  (by character, so `B` before `a`). Features with a value past them draw as
+  `<all other values>`, and a notice says how many and in which order the classes were taken. The
+  legend lists the classes by number when every class is a number, a class renamed by hand in its
+  value's place, and otherwise by label without regard to case. The Layers pane and layout
+  legends list only the classes that drawn features use (after the definition query and display filters);
   `<all other values>` appears only when a drawn feature falls outside the classes and its symbol
   is not fully transparent. A layout legend can leave it out with **Hide other values** (see
   [Layouts](layouts.md)). Instead of a field, Unique Values can class by an
@@ -29,7 +34,10 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
   (`layer.symbology={"type": "unique", "expression": "…"}`).
 - **Graduated Colors**: 1 to 12 classes of a numeric field by natural breaks (Jenks), equal
   interval, quantile, geometric interval, standard deviation, arithmetic progression or head/tail
-  breaks (the Method list is in alphabetical order). Geometric interval makes class
+  breaks (the Method list is in alphabetical order). Quantile sorts the values and places each
+  class's upper bound at an **observed value**, without interpolation between values. It aims for
+  similar record counts per class; ties can give unequal counts or fewer distinct classes.
+  Geometric interval makes class
   widths grow by one ratio, for values piled up at the low end; for a field that reaches zero or
   below, the minimum is taken as if it sat at a hundredth of the range, so the widths grow by
   101^(1/classes). Standard deviation makes classes one deviation wide about the mean, and leaves
@@ -39,7 +47,10 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
   while those stay under 40% of the values they were taken from: for a few very large values among
   many small ones (city sizes, incomes). It sets its own number of classes, at most the number
   asked. Manual keeps the bounds you type: each class's upper bound is a number to edit or take out, **Split the widest
-  class** adds one, and the field's largest value closes the last class. If no field is
+  class** adds one, and the field's largest value closes the last class. On a layer read in
+  place, whose values aren't all at hand, the field's range is unknown: the first class takes
+  every value up to its bound, and one more class takes every value past the last bound, shown
+  as "up to 4" and "more than 25" in the legend. If no field is
   chosen, the current renderer's field is kept when it is numeric; otherwise the first numeric
   field is used. If the layer has no numeric field, or the
   switch fails for another reason, the pane shows why and keeps the current renderer. When numeric
@@ -47,6 +58,30 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
   A problem no field can fix, such as a definition query that keeps no features, needs fixing
   first. Closing the pane or selecting another layer drops the retry.
 - **Proportional Symbols**: point size grows with a numeric field, chosen as for Graduated Colors.
+
+A point layer of Unique Values or Graduated Colors can also be sized by a number field, its classes
+keeping their colours: **Size by**, under **Rotation**, picks the field. Choose **Use field range**
+to apply its detected bounds, or enter the **Values** drawn smallest and largest and click
+**Apply**. Explicit bounds work even when the field is constant or has no values yet. Set the
+**Sizes** they take (points), and the
+**Scaling**: **By area**, as Proportional Symbols grow, or **By radius**, the size in a straight
+line with the value, as GeoLibre and MapLibre size circles. Values past either end take that end's
+size; a feature whose value is empty or not a number keeps its class's size. A final size of zero
+draws no marker. A web style or web layer shared from it draws the classes' sizes, and says so;
+while its points are aggregated into bins, the bins are drawn instead, and that is said too.
+The legend lists the
+classes, then the smallest, middle and largest size. Switching to another renderer keeps the
+setting unused, for when you switch back; a **Size** by expression, if set, wins over it. By
+command:
+
+```text
+layer.sizeBy={"layer":"Earthquakes","field":"mag","min":2.5,"max":7.5,"minSize":4,"maxSize":36,"scaling":"radius"}
+layer.sizeBy={"layer":"Earthquakes","field":null}
+```
+
+A project, map or layer file containing this setting declares format 2 and the
+`classified-point-size` capability. Readers that cannot keep it refuse the file. Files without
+the setting don't list it; removing the last mapping removes the requirement.
 
 A point's **Shape** is a circle, square, triangle, diamond or star, or a **Character**: any
 character of an installed font, picked under **Font**, as map signs often are (a symbol font's
@@ -59,6 +94,21 @@ draws a circle, so the point still shows. By command:
 layer.marker={"layer":"Peaks","char":"▲","font":"DejaVu Sans","size":12}
 ```
 
+A marker can also be an **image**: a PNG or JPEG, given by command as base64 (at most 2 MiB of base64 text, an image of about 1.5 MiB). Other formats, such as GIF, aren't taken.
+Its size is its width, and it is as tall as its proportions make it, as QGIS draws a raster image
+marker; the symbol's fill and outline don't show. It turns with **Rotation**, is ringed when
+selected, and is kept in the project file. A project that has one opens only in a RustGIS that
+draws them. An image that doesn't decode draws a circle, so the point still shows; opening a
+project, map file or layer file, or adding styles, says which layers and styles have such an image,
+or one too large to keep. A PDF or SVG export keeps the image once, however many points and lines
+draw it (in an SVG each place is a `<use>` of it, a clone in a vector editor). The **Layers**
+pane, its legend and the editors' previews (the symbol's, the strokes' and the fills') show the
+image too, whole within their patch and not turned:
+
+```text
+layer.marker={"layer":"Schools","image":"iVBORw0KGgo…","size":16}
+```
+
 **Rotation** turns each point's marker by the angle in a number field, in degrees clockwise
 (**Counterclockwise** for angles as mathematics counts them), as wind arrows or the signs of a
 topographic map turn. **Marks** stack several markers at a point, bottom first, in place of the
@@ -66,8 +116,8 @@ symbol's: a white disc under a sign, say, so it reads on any background. Each ma
 colour, outline, shape, size and angle, and is shifted right (**Offset right**) and down
 (**Offset down**); its offset turns with its angle, as QGIS turns it. **With the field** turns a
 mark by the rotation field too, or keeps it still. A layer with classes can have marks for one
-class of its own, as line strokes can. By command, `layer.markerRotation` and the point layer's
-strokes of markers:
+class of its own, as line strokes can. A mark can be an image too, by command, as along a line
+(below). By command, `layer.markerRotation` and the point layer's strokes of markers:
 
 ```text
 layer.markerRotation={"layer":"Signs","field":"angle","counterclockwise":true}
@@ -113,7 +163,8 @@ project's `jet`, say) is renamed with ` (custom)` when the project opens; layers
 keep their colours, as each holds its own copy. Click a group's name to show or hide it. The Style tab sets the fill **Color**, the
 **Outline** width, **Transparency** and a **Visibility Range** (the scales between which the layer
 draws; a large file read in place is not read at all outside them); points can be circles, squares,
-triangles, diamonds or stars. **Data › Definition Query** draws only the features matching a SQL
+triangles, diamonds or stars. **Data › Definition Query** (the Query tab of the
+[Layer Properties pane](#layer-properties)) draws only the features matching a SQL
 clause; Unique Values, Graduated Colors and Proportional Symbols take their values, classes and
 sizes from those features when you apply them (apply the symbology again after changing the query),
 and **Full Extent** zooms to them. A layer with [subtypes](editing.md#data-design) can be symbolized
@@ -124,10 +175,23 @@ For polygons, **No Fill** in the Symbology pane or **Style › Drawing** draws o
 It keeps each symbol's outline colour and width, including in Unique Values and Graduated Colors,
 without changing the classes. Change the outline with **Outline color** and **Outline width** in
 the Single Symbol editor, or `layer.outline` for all classes. Undo restores the previous fills;
-the colour picker's opacity control can also make a fill visible again. By command:
+the button also changes to **Restore Fill**, which puts the fills back as they were: their
+colours and opacities, the layer's own fill layers and each class's. A fill that was transparent
+before No Fill stays transparent, and a class colour, outline or label changed while No Fill is on
+is kept. Fills shown while No Fill is on (a class's fill layers, or a class colour with an
+opacity) show until No Fill is chosen again, which hides them too and keeps them for Restore Fill
+in place of what it kept for those classes. A new symbology, colour scheme or fill colour (`layer.symbology`, `layer.ramp`,
+`layer.color`), a saved style applied (`style.apply`), a QGIS style with symbols (`style.importQgis`), subtypes that symbolize the layer
+(`data.subtypes`), or fill layers in the symbol's colour for the whole layer (`layer.fillLayers`),
+turn No Fill off and draw the fills themselves, so Restore Fill is then no longer offered, and a
+notice counts the hidden fills that were dropped. On a mixed or streamed layer, where No Fill lays
+a transparent fill over the symbols, fill layers for the whole layer of any colour turn it off
+too, as they replace that fill. A project saved with No Fill on by an earlier RustGIS doesn't record the fills, so Restore Fill says what it couldn't put back.
+On a polygon layer the symbols' fills show at the default opacity; on a mixed or streamed layer the symbols keep their own opacity, and fill layers the layer or its classes had don't come back. By command:
 
 ```text
 layer.noFill={"layer":"Countries"}
+layer.restoreFill={"layer":"Countries"}
 ```
 
 A GeoJSON with mixed geometry keeps its points, lines and polygons in one layer, classified by its
@@ -148,10 +212,14 @@ With Unique Values or Graduated Colors, each class in the Symbology pane's list 
 and a legend label. Pick a colour and opacity to give that class its own. Type a label to show in the Layers
 pane and in layout legends instead of the value or range (for example `High income` for
 `1. High income: OECD`); clear it to show the value again. `<all other values>` can be edited the
-same way. Applying the symbology again on the same field keeps the colours, outlines and labels
-you set by hand on the classes that are still there (the others take the scheme's colours again);
-picking another colour scheme recolours every class but keeps the labels. A Graduated Colors
-class keeps its colour and label while its range stays the same. By command:
+same way. The list shows up to 200 classes. A style imported with more says below the list how many
+it leaves out: the list's limit doesn't change how they're drawn, and `layer.classStyle` edits them,
+a Unique Values class by its `value` (a value listed twice is drawn, and edited, as its first class)
+and a Graduated Colors class by its `index`. Applying the symbology again on the same field keeps
+the colours, outlines and labels you set by hand on the classes that are still there (the others
+take the scheme's colours again); picking another colour scheme recolours every class but keeps the
+labels. A Graduated Colors class keeps its colour and label while its range stays the same. By
+command:
 
 ```text
 layer.classStyle={"layer":"Countries","value":"1. High income: OECD","color":"#2E6B4F","label":"High income"}
@@ -177,6 +245,34 @@ As with other class colour edits, changing the field or graduated ranges starts 
 a different scheme through `layer.symbology` resets polygon opacity to its default.
 Layer/group transparency still applies on top of the symbol's opacity in maps and exports.
 
+**Invert Color Ramp** (Symbology pane, or `layer.invertRamp`) reverses the colours of a Graduated
+Colors or Unique Values layer's classes along the legend's order, so the highest class takes the
+lowest class's colour. Colours edited by hand travel with the reversal, but a polygon fill's
+opacity stays with its position in the legend, as it does when a colour scheme is applied: a
+semi-transparent fill picked for the first class is still the first class's opacity afterwards.
+Applying it twice gives the original back. The `<all other values>` swatch is no colour of the
+scheme and stays as it is. With fewer than two classes showing the scheme there is nothing to
+reverse, and the command says so instead of succeeding.
+
+A class whose own stack hides its symbol keeps it, and the others reverse among themselves; a
+notice says how many classes with a stack of their own were left as they are. A stack hides the
+symbol when it is drawn (stacked fills on a polygon layer, stacked strokes on a line or point
+layer; a polygon's stacked strokes and a line's stacked fills are not drawn) and every layer of it
+sets a colour of its own. A layer of a stack left on "follow the class" shows the class's colour,
+so that class reverses with the rest: a road's black casing over a core that follows the class.
+When the layer's own stack (the one classes without a stack of their own are drawn from) sets a
+colour in every layer, the classes show those colours and little of the colour scheme: the colours
+are reversed all the same, and a notice says so. On a layer that holds several kinds of geometry,
+the reversal treats every class as the layer's main kind, as choosing a colour scheme does.
+A fill or stroke colour from **Symbol by Expression** is drawn over the classes' colours wherever
+the expression gives one, so the reversal shows only where it gives none, and a notice says so.
+
+Choosing a colour scheme again starts from the scheme's own order, but classing the layer again
+on the same field, ranges and scheme keeps the reversed colours, as it keeps other colours edited
+by hand. On a Stretch raster the command switches the existing "Invert color scheme" option. A
+graphics layer draws each feature in its own style, so it has no colour scheme to invert and the
+command says so.
+
 ### Line strokes
 
 A line layer draws one stroke by default. The **Strokes** section of the Symbology pane stacks
@@ -191,7 +287,8 @@ Widths and offsets are in points: they keep their size on screen at every scale,
 keep their coordinates. A positive offset shifts the stroke to the right of the line's direction
 (the order of its vertices) and a negative one to the left, so two copies of an edge drawn in
 opposite directions land on opposite sides of it. Strokes are saved with the project and drawn in
-exports. By command, bottom stroke first (`[]` goes back to the single stroke):
+exports, in a layout legend's swatch, and in the patches of the Layers and Symbology panes (along
+a straight line). By command, bottom stroke first (`[]` goes back to the single stroke):
 
 ```text
 layer.lineStrokes={"layer":"Rivers","strokes":[{"color":"#000000","width":11.5,"offset":8.5},{"color":"#FF8C00","width":7,"offset":8.5,"cap":"round","join":"round"}]}
@@ -245,13 +342,18 @@ Markers take a **Shape** (a character of a font too, as for points) and a **Size
 its start), at its vertices or its inner ones, at either end or both, or in its middle. **With the
 line** turns each mark with the line's direction; the **Angle** turns it further, clockwise. Marks
 take the stroke's colour, its width as a hash mark's line (or a marker's outline, by command), and
-its offset to either side. Stack them with line strokes: a casing, a core and ticks across it. By
-command, `"markers"` on a stroke:
+its offset to either side. Stack them with line strokes: a casing, a core and ticks across it. A
+marker can also be an image, by command (`"image"`, a PNG or JPEG as base64 of at most 2 MiB): as
+wide as its **Size** and as tall as its proportions make it, turned with the line, the stroke's
+colour and outline left out; selected, each is framed. An image a file gave that can't be drawn
+(too large to keep, or one that doesn't decode) shows as a circle; changing the strokes in the
+pane makes it the circle, and says so. By command, `"markers"` on a stroke:
 
 ```text
 layer.lineStrokes={"layer":"Railways","strokes":[{"color":"#333333","width":1.5},{"color":"#333333","width":1,"markers":{"mark":"hash","size":6,"interval":10}}]}
 layer.lineStrokes={"layer":"Rivers","strokes":[{"width":1},{"markers":{"mark":"triangle","size":7,"at":"middle"}}]}
 layer.lineStrokes={"layer":"Trails","strokes":[{"markers":{"mark":"character","char":"»","font":"DejaVu Sans","size":8,"interval":16}}]}
+layer.lineStrokes={"layer":"Pipelines","strokes":[{"width":1},{"markers":{"image":"iVBORw0KGgo…","size":12,"at":"middle"}}]}
 ```
 
 `"at"` takes `"interval"`, `"vertices"`, `"innerVertices"`, `"first"`, `"last"`, `"middle"` and
@@ -269,7 +371,8 @@ arrows move one up or down and the cross removes it; the top fill is listed firs
 **Solid**, **Hatch lines** (parallel lines at an **Angle**, anticlockwise from east, **Spacing**
 apart, of a **Line width**, shifted across by an **Offset**), **Markers** (a **Marker** shape
 of a **Size** on a grid **Spacing across** and **Spacing down** apart, **Rows shifted** to
-stagger them), **Gradient** or **Shapeburst**. A gradient shades each feature from its colour to
+stagger them; by command the marker can be an image, `"image"`, as along a line), **Gradient** or
+**Shapeburst**. A gradient shades each feature from its colour to
 a **Second color**: by default top to bottom, of a **Type** that runs **Linear** (straight
 across), **Radial** (in rings from its first point) or **Conical** (round its first point),
 turned by an **Angle** (anticlockwise), and past its points a **Spread** of **Pad** (its end
@@ -296,8 +399,22 @@ A gradient's `from` and `to` are places in the feature's box (`[across, down]`, 
 (`[[0.5, "#RRGGBB"], …]`), held rather than blended with `"discrete": true`.
 
 `[]` goes back to the single fill (for a class, to the layer's fills). Fills draw on the CPU (on the
-globe, patterns keep to the screen rather than the map as it turns); the
-legend shows the symbol's colour.
+globe, patterns keep to the screen rather than the map as it turns). A layout legend draws
+them in the polygon's swatch, and the Layers and Symbology panes in its patch.
+
+**Hatch only flagged polygons.** Use an overlay to hatch unreliable estimates while keeping
+the choropleth's colours visible.
+
+1. On the choropleth layer, use **Select By Attributes** with `FLAG = 1`, then **Data ›
+   Selection › Make Layer From Selected Features**. Clear the selection on the original layer.
+2. Keep the new layer above the choropleth and rename it **Unreliable estimates (hatched)**.
+   In its **Symbology › Fills**, add one fill and set **Draw** to **Hatch lines**. Set the line
+   colour and spacing so the choropleth shows through. Set **Outline width** to 0 if the
+   choropleth already draws the boundaries.
+3. Include both layers in the [layout legend](layouts.md#layouts). The overlay's swatch
+   shows its hatch lines, as does its patch in the Layers pane.
+
+The new layer contains a copy of the selected features. Recreate it if the flag values change.
 
 ### Reference scale
 
@@ -315,6 +432,53 @@ layer.referenceScale={"layer":"Roads","scale":25000}
 Scales in RustGIS take a screen pixel to be 0.28 mm (the OGC standard pixel). Programs that take
 96 pixels to the inch (0.2646 mm) call the same view a larger scale; to match their sizes,
 multiply their reference scale by 0.2646 / 0.28 (about 0.945).
+
+### Copy symbology between layers
+
+**Copy From**, beside the layer's name at the top of the Symbology pane, draws the layer in the
+pane as another layer of the map is drawn; **Copy To**, next to it, draws another layer as this
+one is. Either is one Undo step, which gives the layer its own symbology back.
+
+A layer takes another's symbology only when it has what that symbology reads:
+
+- Both are feature layers, or both are rasters. A graphics layer and a table take none.
+- Feature layers have the same geometry type (point, line or polygon), and every field the
+  symbology reads is in the layer taking it under the same name (case aside): the field of Unique
+  Values, Graduated Colors or Proportional Symbols; the fields of marker rotation, size by field
+  and a diagram; and each field an expression names (Unique Values by expression, By Expression).
+  A field read as a number must be a number there (Long or Double). A Unique Values field, and a
+  field an expression names, must be of the same type in both layers, Long and Double counting as
+  one: classes match values as they print, so a class made from the number 3 doesn't match a
+  date or the text `03`.
+- A raster has every band the symbology draws, a color table of its own for Colormap, and whole
+  numbers (at most 256 distinct values) in the band for Unique Values.
+
+Each menu lists the map's other layers: those that fit first, then the rest switched off, each
+with the reason under its name (a field it lacks, a type that differs, a band it hasn't). The
+command refuses the same layers with the same reason, and never copies in part.
+
+What is copied is what the Symbology pane sets: the renderer with its classes, colors and legend
+labels, the stacked strokes and fills, No Fill, marker rotation, size by field, the By Expression
+settings, the diagram, the reference scale and transparency; for a raster, the renderer, stretch,
+dynamic range adjustment, resampling, brightness, contrast and gamma, masked values and
+transparency. Labels, the visibility range, blend, masking, display filters and the definition
+query stay each layer's own, and so does the angle a raster is turned by. A setting kept without
+being drawn (a size by field under a single symbol) is neither needed nor copied.
+
+Classes, size ranges, a custom stretch's bounds and masked values are copied as they are, so the
+two layers share one legend and can be compared; they aren't worked out again from the values of
+the layer taking them. A value outside the copied Unique Values classes draws as
+`<all other values>`, and one outside the Graduated Colors range in its first or last class:
+choose the field again in the Symbology pane to class the layer's own values.
+
+By command, naming layers by name or id (`layer` is the selected layer when left out):
+
+```text
+layer.copySymbology={"layer":"Parcels 2024","from":"Parcels 2020"}
+```
+
+In Python, `from` is a reserved word, so give the parameters as a dict:
+`s.run("layer.copySymbology", {"layer": "Parcels 2024", "from": "Parcels 2020"})`.
 
 ### Custom color ramps
 
@@ -372,6 +536,40 @@ qualitative ramp gives each class the next stop, starting again after the last. 
 its own copy of the ramp it uses, so layer files, map files and packages keep their colors in
 projects that don't have the ramp, and deleting a ramp from the project leaves layers that use
 it unchanged.
+
+## Diagrams
+
+A diagram draws a small chart on each feature from **several numeric fields**, over the renderer's
+own symbol, as ArcGIS Pro's Chart symbology and QGIS's Diagrams draw: a polygon layer of
+administrative units can keep a Graduated Colors fill underneath while a pie on each feature shows
+its split of, say, male and female population. The categories take colours in turn from the palette
+new layers take; a feature where every category is null or zero draws nothing. A pie's slice
+angles are each category's share of the total; a bar chart's bars rise from a baseline, one per
+category. The size is a fixed radius or height in points, the same for every feature, or one grown
+with the categories' sum: from the smallest size to the largest, by the square root of the total's
+share of the range, as Proportional Symbols grow. By command:
+
+```text
+layer.diagram={"layer":"Regions","kind":"pie","fields":["pop_male","pop_female"]}
+layer.diagram={"kind":"bar","fields":[{"field":"under18","color":"#4A90D9"},{"field":"over65","color":"#E07B39"}],"size":{"from":6,"to":40},"labels":"both","background":"#FFFFFFCC","outline":{"color":"#4D4D4D","width":0.75}}
+layer.diagramInfo={"layer":"Regions"}
+layer.clearDiagram={"layer":"Regions"}
+```
+
+Each slice or bar can say something beside it (`"labels"`): `"none"` (the default), `"value"` (the
+feature's number, in the legend's number format — 52K, 1.2M), `"percent"` (its share of the
+feature's total, a whole percent or one decimal below ten), or `"both"` (`52K (52%)`). The label
+draws just past a pie's crust on the slice's mid-angle, or above a bar's top, in a small haloed
+dark text; culling makes room for it, so labelled charts stay visible to their last letter.
+
+The categories list under the layer's classes in layout legends — the printed map's legend lists
+them the same way. Clearing the diagram leaves the renderer as it is.
+
+Charts lie flat on the map. On extruded polygons they draw over the extrusion while a flat map is
+untilted, but not while it is tilted; the globe draws extruded polygons flat, charts and all. On a
+point layer in a tilted view the markers stay on the ground under their charts rather than standing
+up, and aggregated points draw their bins, not the charts. Setting a diagram, aggregation or
+extrusion that can hide the charts says so.
 
 ## Labeling
 
@@ -448,6 +646,42 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   Lock keeps the ones placed. The distance grows with the labels at a reference scale
   (`labels.placement={"layer": "Rivers", "position": "curved", "repeat": 144}`; `null` or `0` is
   the one at the middle).
+- **Distance from the line**: a label placed along a line (Parallel or Curved) set off it, so it
+  doesn't sit over the line it names (Labeling pane › Position › **Distance**, 0 to 200 points, with
+  **Above** or **Below**). The distance runs from the line to the text's nearest edge, and above and
+  below are as the text reads, not north and south: over a level road the label is higher on the
+  screen, beside a road read downward it is to its right. Curved, each character moves off with its
+  own part of the line, so the text keeps following it; where the line bends so tightly that the
+  characters on the inside of the bend would run into one another, the place is left out, as one
+  too sharp to curve is. Repeats and other places along the line sit off it the same way, Lock keeps
+  them where they were found along the line, and the distance grows with the labels at a reference
+  scale (`labels.placement={"layer": "Rivers", "lineOffset": 4}`; negative is below, `0` or `null`
+  on the line).
+- **Show all labels** (Labeling pane › Position): labels among the view's 20,000 highest-priority
+  candidates are drawn, over the others where
+  they crowd, rather than some left out (`labels.placement={"layer": "Cities", "showAll": true}`).
+- **Callouts** (Labeling pane › Position): a label crowded off its spot moves to the nearest free
+  spot nearby, and a line is drawn from its feature to the text, as QGIS's callouts. **at most**
+  sets how long the line may be (5 to 500 points, 40 to start with): a label with no free spot
+  that close is left out, or drawn over the others with Show all labels. The line takes the
+  label's colour, over its halo. Labels along lines and labels with an icon aren't moved
+  (`labels.placement={"layer": "Cities", "callout": 60}`; `true` keeps the length, `false` turns
+  them off).
+- **Move Label** (Labeling tab › Label Placement): drag a label to where it should be, as with
+  QGIS's Move Label tool. It stays there as the map moves (kept by its feature, in longitude and
+  latitude, and saved with the project), is drawn whatever is under it, and the other labels keep
+  off it; with Callouts on, its line follows it back to its feature, however far it went.
+  Shift-click a moved label to put it back, or **Reset Moved** for all of the layer's. Dragging
+  anything else pans the map; Esc leaves the tool
+  (`labels.move={"layer": "Cities", "feature": 12, "to": [2.5, 49.1]}`; `"to": null` puts it back;
+  `labels.resetMoved={"layer": "Cities", "all": true}`).
+  Deleting a feature removes its saved move; Undo restores it. Service refresh and Repair Data Source reset saved
+  moves and old label locks because replacement data can reuse feature ids, with a counted notice
+  and undo restoration. Opening a project, importing a map or styles, or adding a layer file
+  reports invalid, duplicate or excess moved-label entries that were ignored, callout lengths that
+  were adjusted, and Show all labels settings that were not true or false. A callout length given
+  to `labels.placement` outside 5 to 500 points is brought within range with a notice. Clean
+  settings give no such notice.
 - **Font**: the labels' font family, any installed on the computer (Labeling pane › Symbol
   › **Font**; type part of a name to find it), or the label font the interface uses. Bold and
   italic take the family's own bold and italic faces where it has them. The family is saved by
@@ -457,7 +691,8 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   installed families, `{"font": ""}` goes back to the label font).
 - **SQL**: label only the features that match a SQL clause (the language of definition
   queries), such as `pop_max > 5000000`. In the Labeling pane, Class › **SQL** › **New
-  expression**: write the clause (the field and operator buttons add to it), **Check** says
+  expression**: write the clause (the field and operator buttons, and the **Functions** and
+  **Variables** menus, add to it), **Check** says
   whether it reads and how many of the features the layer draws at the map's scale match
   (after its definition query, display filters and time window), and **Apply** sets it in one
   undo step; **Clear** removes the chosen class's clause, leaving other classes unchanged
@@ -472,22 +707,61 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   in view, centred on the line and kept upright, and may run past its ends by about a letter; a
   line too short for its text, or (curved) one bending more than 25° from one character to the
   next, is left unlabelled. A text over 200 characters long is set straight rather than
-  curved. Points and polygons with these placements are labelled as automatic
-  (`labels.placement={"layer": "Rivers", "position": "curved"}`).
+  curved. Points with these placements, and polygons placed parallel, are labelled as automatic
+  (`labels.placement={"layer": "Rivers", "position": "curved"}`). A polygon placed **Curved**
+  has its label on one line along its centre line, the longest path down the middle of its part
+  in view, as a lake's or a valley's name follows its shape: from its middle, else as near it as
+  the text fits, with the polygon at least half the text's height either side and the centre
+  line trimmed short of its tips. A polygon too short, narrow or sharply bent for its text is
+  labelled as automatic (`labels.placement={"layer": "Lakes", "position": "curved"}`).
 - **Other places round points**: a point's label whose place another label takes tries the
   other places round the point, corners first (above right, above left, below right, below left,
   right, left, above, below, leaving out its own), and goes to the first where
-  all of it shows; where none is free it is left out, as before (Labeling pane › Position ›
+  all of it shows; where none does, it stays at its own place and shows what fits there (an icon
+  without its text, say), or is left out if nothing fits (Labeling pane › Position ›
   **Try other places round the point**, for point layers). Off by default: a label that moves can
   take the place a less important one had. The class's offset applies to every place, and Lock
   keeps the place each label took
   (`labels.placement={"layer": "Cities", "otherPositions": true}`).
+- **Other places along lines**: a Parallel or Curved label whose place at the middle is taken, or
+  (curved) where the line bends too sharply, tries up to seven others along the same stretch,
+  nearest the middle first, and goes to the first that will do (Labeling pane › Position › Along
+  lines › **Try other places along the line**). If none will, it is left out, as with this off. A
+  line with a repeat keeps its repeats where they are, so the box is hidden while Repeat is on, and
+  the setting does nothing there or at a position off the line. Off by default, for the same reason
+  as round points, and Lock keeps the place each label took
+  (`labels.placement={"layer": "Rivers", "position": "curved", "otherPositions": true}`).
+- **Names that fit their line**: a Curved label with `"fit": "auto"` is fitted to the room its
+  line gives, as hand-lettered maps name streams. A name that can't follow the line anywhere it is
+  tried is abbreviated (whole words: Córrego → Cór., Ribeirão → Rib., Rio → R., Creek → Cr.,
+  River → R., Arroyo → Ao., from a built-in English, Portuguese and Spanish list, or the class's
+  own `"abbreviations"`, which go first) and tried again; still too long, it is left out. A name
+  that takes more than a third of the line goes on its straightest stretch rather than at the
+  middle: the stretch whose ends are farthest apart for its length. With other places along the
+  line on, the next straightest stretches are its other places. On a line with room to spare
+  (more than three times the name), the letters are spread, more as the room grows, toward
+  `"stretch"` of the line (`labels.style`, 0.1 to 1; 0.6 by default), which they reach on a line
+  six times the name or longer (a `"stretch"` under a sixth spreads only once the line is more
+  than 1/`"stretch"` times the name). They are never more than three letters' widths apart, so on
+  a much longer line the name covers less. A spread name is tried at the middle first, then
+  farther along; where it can't follow the line, it is set close. A spread name follows a
+  smoother course, so it can also go where the close-set name was too bent to follow. With a
+  `repeat`, a line more than two spread names long gets the spread name at its middle and the
+  close-set name at the repeats clear of it, as a river is named along its valley and again
+  toward its ends; a shorter line keeps its repeats close-set.
+  Text size by a stream's importance (a Strahler order or a class field) comes from label classes
+  or `labels.by` `"size"` (`labels.placement={"layer": "Rivers", "position": "curved", "fit":
+  "auto", "abbreviations": {"Creek": "Ck"}}`).
 - **Lock** keeps the labelled features fixed while you pan and zoom; **Pause** stops drawing
   labels for faster navigation; **View Unplaced** draws the labels that didn't fit in red. They
   apply to the whole map, so they are on the ribbon (Labeling › Map Labeling), not in the pane.
 - **Convert** (Labeling › Map Labeling, or Layers › right-click › **Convert To Annotation**) turns a
   layer's labels into an annotation layer: one point per label, carrying its
   text in a `TEXT` field, which you can then edit, move or delete like any other features.
+  A label along a line becomes an upright point at its line's middle vertex (the end of a line
+  of two), which can be some way from where the label was drawn: its angle, curve, repeats and
+  distance from the line are left out, and the conversion says how many, and how many of them
+  belong to a class that repeats along lines (each becomes one point).
 - **Label classes** label different features differently, such as large cities in larger text.
   Each class has a SQL clause choosing its features, and its own field, text symbol, placement
   and visibility range. Each class labels every feature its clause matches, the **Default**
@@ -526,6 +800,50 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   <figcaption>City labels placed above and to the right of their points, beside the country labels.</figcaption>
 </figure>
 
+## Layer properties
+
+The **Layer Properties pane** brings together a layer's settings that are otherwise spread over the
+ribbon and the layer's right-click menu. A tab per topic shows one part at a time:
+
+- **General**: the layer's name (renamed when you leave the box or press Enter; Escape keeps the
+  old one; up to 200 characters: a longer paste is cut to fit, and a note under the full box says
+  so),
+  **Visible**, for a feature layer **Selectable** (whether the Select tool picks its
+  features on the map), and **Show legend in Layers**. Symbology and labels keep their own panes.
+- **Source**: what the layer is read from (geometry, feature and field counts, source, coordinate
+  system, extent and fields; for a raster, its size, bands, statistics and coordinate system), with
+  the actions on the source that the layer's menu has, where they apply: **Load All Features**,
+  **Repair Data Source…**, **Reload Data** (desktop) and **Define Projection…**.
+- **Display**: the visibility range (**Out Beyond**, **In Beyond**, **Clear Limits**),
+  **Transparency**, **Masking**, a raster's **Layer Blend** or a feature layer's **Reference
+  scale**, and the **Depth priority** that View › Scene › Raise and Lower Priority change (a
+  higher one draws on top, whatever the layer order). A polygon layer also has its
+  **Extrusion**, as Style › Extrusion, Faces and Light and Shadow set it: the **Type** (None,
+  Constant height or By a numeric field) and, once extruded, the **Height (m)** of a constant
+  height (the ribbon sets 50 km), **Factor**, **Base** with **Base (m)**, **Face Culling**,
+  **Lighting** and **Cast Shadow**. Each change undoes on its own.
+- **Query**, for a feature layer: its definition query, the SQL clause the features must match to
+  draw (the grammar is in [Expressions](expressions.md)). Buttons add a field or an operator, and
+  the **Functions** and **Variables** menus add a function (left open for its arguments, with what
+  it gives on hover) or a variable such as `$area`; a red
+  line says what is wrong with a clause as you type it, **Apply** (or Ctrl+Enter) sets it and
+  **Clear** draws every feature again. A clause being typed is kept while you look at another tab;
+  choosing another layer or Escape in the box drops it.
+- **Time**, for a feature layer: **Bound to the time slider**, and the **Date field** it is bound
+  by (the list shows the fields whose values read as dates, with the share that does). Only the
+  features whose date falls in the slider's window draw; the slider's span, step and playback are
+  on [View › Time](workspace.md). Each change undoes on its own.
+
+Open it with Layers › right-click › **Properties…** or **View › Windows › Layer Properties**;
+**Data › Definition Query** opens it on the Query tab, and **View › Windows › Details** (for a
+raster also **Data › Raster Information**) on the Source tab, which they show and hide as they did
+the Details pane it replaces. It follows the selected layer, as the Symbology and Labeling panes do:
+its header shows the layer's type and name, and lights up for a moment when another layer is
+selected, and the pane's tab names the layer too. A name being typed is kept when you click away,
+even on another layer, as Enter keeps it; Escape drops it. It runs the same commands as the ribbon,
+so each change undoes on its own, except **Show legend in Layers**: like the arrow beside a layer in
+the Layers pane, it changes what that pane shows, not the layer, so it isn't a step to undo.
+
 ## Layer effects
 
 On the **Style** tab, **Masking** shows a layer only inside another layer's polygons;
@@ -535,6 +853,35 @@ range); **Aggregation** draws points as hexagon or square bins coloured by count
 **Factor**, with **Face Culling**, **Lighting** and **Cast Shadow** controls. It draws in an
 oblique view on an untilted flat map and in perspective on a tilted map; the globe draws the
 polygons flat. See [Rotating and tilting the map](maps.md#navigating).
+
+An extrusion can stand on a **base**: its walls rise from the base to the base plus the height,
+so a balcony or a bridge floats above the ground. The base is a numeric field's value (such as the
+`base_height` the CityGML and CityJSON readers give each part), else a constant in metres, both
+multiplied by the same **Factor** as the height. A value that is no number takes the constant,
+and a negative base is the ground. Shadows fall from the base, roof labels sit at the top, and a
+web scene (**Publish › Share As › Web Scene**) raises the parts too. Once a layer is extruded,
+**Style › Extrusion › Base** chooses **Ground** (which also sets **Base (m)** to 0), a field
+(**By base_height**), or the constant **Base (m)** sets, listed once it is above 0; neither changes
+the height or the factor. The `layer.extrusionBase` command does the same (`field`, `base`;
+`"field": null` clears the field). Turning extrusion off drops the base with it. Without a tilt,
+and on a tilted map drawn without the graphics card, extrusions are painted in the order they
+stand on the ground, so a part raised over a building behind it may be painted under it.
+
+A city model (CityJSON or CityGML) comes in standing: when it is added, the polygon layers of its
+volumes are extruded by `height` on `base_height`, and its surfaces stay flat (see
+[Data formats](data-formats.md), CityJSON). **Style › Extrusion › Type › None** turns one off, and undo
+takes the layers away with their extrusion. Other data with the same fields comes in flat.
+
+Layers that go together, such as a city model's layers, are raised at once: pick them in the
+Layers pane, right-click one of them and choose **Extrusion › None** or **By** a numeric field
+every one of them has (**By height**) and, once all are extruded, **Extrusion Base › Ground** or
+**By** a field (**By base_height**).
+It acts on their polygon layers and says so when the others are left out, sets every one alike in
+one step to undo, and leaves each one's height, factor and base as they were where the choice
+doesn't set them. `layer.extrusion` and `layer.extrusionBase` take a list of layers in `layer`
+for the same. A layer that isn't polygons, a field that one of them lacks, or (for the base) one
+that isn't extruded yet refuses the whole list and changes none; the message names those layers
+(a list whose first layer isn't polygons is refused as that one layer would be).
 
 For a raster layer, the **Style** tab also has **Layer Blend** (multiply, screen, overlay,
 darken, lighten, difference), **Swipe** (the layer shows only left of a divider you slide, to

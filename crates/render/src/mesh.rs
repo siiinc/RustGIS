@@ -224,7 +224,6 @@ const STROKE_TOLERANCE: f32 = 0.005;
 /// vertex shader applies the real width. Ring outlines take no width floor (`Ctx::polygon`),
 /// line parts floor at half a physical pixel (`Ctx::line`). `Err(TooDense)` once the vertices
 /// would pass `limit`, as soon as one doesn't fit.
-#[allow(clippy::too_many_arguments)]
 fn stroke(
     rings: &[Vec<Coord>],
     origin: [f64; 2],
@@ -305,7 +304,7 @@ pub(crate) fn stroke_lines(
 pub(crate) fn marker_instances(c: Coord, origin: [f64; 2], s: &Symbol, ppp: f32, halo: Option<Rgba>) -> Vec<PointInstance> {
     let r = (s.size.max(1.0) * ppp) / 2.0;
     let shape = match s.marker {
-        Marker::Circle | Marker::Char(_) => 0,
+        Marker::Circle | Marker::Char(_) | Marker::Picture(_) => 0,
         Marker::Square => 1,
         Marker::Triangle => 2,
         Marker::Diamond => 3,
@@ -347,7 +346,6 @@ fn extend_mesh(
 /// no-ops, and not emitting them is identical output for less work. `Err` when lyon refuses
 /// the geometry, or once the mesh passes `limit` vertices — the layer then falls back to the
 /// CPU path entirely.
-#[allow(clippy::too_many_arguments)]
 fn append_geometry(
     v: &mut Vec<MeshVertex>,
     i: &mut Vec<u32>,
@@ -362,8 +360,8 @@ fn append_geometry(
 ) -> Result<(), TessError> {
     // What the layer's mesh has left: tessellation stops once a part passes it.
     let room = |v: &Vec<MeshVertex>| limit.saturating_sub(v.len());
-    // A character has no shape template: its layer draws on the CPU.
-    if matches!(s.marker, Marker::Char(_)) && matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+    // A character or an image has no shape template: its layer draws on the CPU.
+    if matches!(s.marker, Marker::Char(_) | Marker::Picture(_)) && matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
         return Err(TessError::Refused);
     }
     match g {
@@ -448,7 +446,6 @@ fn estimate_vertices(g: &Geometry, s: &Symbol, wireframe: bool) -> usize {
 /// lyon refused a feature, `Err(TooDense)` when the mesh would pass `limit`, `Err(Imprecise)` when
 /// the features reach too far for f32 at this zoom — the caller then draws the layer
 /// (or batch) with tiny-skia instead (nothing is pushed part-way).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_layer(
     cmds: &mut Vec<DrawCmd>,
     layer: &Layer,

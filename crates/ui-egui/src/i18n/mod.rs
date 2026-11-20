@@ -18,7 +18,7 @@
 //! is future work.
 //!
 //! # Catalog format
-//! UTF-8, one `English<TAB>Translation` pair per line; `#` starts a comment line; `\n` and `\t`
+//! UTF-8, one `English<TAB>Translation` pair or `Context<TAB>English<TAB>Translation` per line; `#` starts a comment line; `\n` and `\t`
 //! inside a field are a line break and a tab. `{name}` placeholders must be kept (they may move).
 //!
 //! # Adding a language
@@ -44,12 +44,16 @@ pub enum Script {
     Arabic,
     /// Bengali: an Indic script with a face discovered on the desktop where available.
     Bengali,
+    /// Lao: a face discovered on the desktop where available, after the interface font.
+    Lao,
 }
 
 /// Which CJK face reads best for a language (the glyph shapes differ by region).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CjkFont {
     SimplifiedChinese,
+    /// Taiwan's standard glyph forms.
+    TraditionalChinese,
     Japanese,
     Korean,
 }
@@ -63,9 +67,9 @@ pub struct LangInfo {
     pub english: &'static str,
     pub script: Script,
     source: &'static str,
-    catalog: OnceLock<HashMap<&'static str, &'static str>>,
+    catalog: OnceLock<Catalog>,
     /// Catalog values in display form, for a language laid out back to front.
-    visual: OnceLock<HashMap<&'static str, &'static str>>,
+    visual: OnceLock<Catalog>,
 }
 
 macro_rules! lang {
@@ -83,7 +87,7 @@ macro_rules! lang {
 }
 
 /// The registry. English first: it is the source language and the fallback.
-pub static LANGUAGES: [LangInfo; 19] = [
+pub static LANGUAGES: [LangInfo; 22] = [
     LangInfo {
         code: "en",
         name: "English",
@@ -107,10 +111,16 @@ pub static LANGUAGES: [LangInfo; 19] = [
     lang!("vi", "Tiếng Việt", "Vietnamese", Script::Alphabetic, "vi.tsv"),
     lang!("fa", "فارسی", "Persian (Farsi)", Script::Arabic, "fa.tsv"),
     lang!("zh", "简体中文", "Chinese (Simplified)", Script::Cjk(CjkFont::SimplifiedChinese), "zh.tsv"),
+    // Taiwan's wording (GIS terms after the National Academy for Educational Research's
+    // glossary), drawn in a Traditional Chinese face with Taiwan's glyph forms where one is
+    // installed (Microsoft JhengHei, PingFang TC, Noto Sans CJK TC) or on the web.
+    lang!("zh-tw", "繁體中文（臺灣）", "Chinese (Traditional, Taiwan)", Script::Cjk(CjkFont::TraditionalChinese), "zh-tw.tsv"),
     lang!("ja", "日本語", "Japanese", Script::Cjk(CjkFont::Japanese), "ja.tsv"),
     lang!("ko", "한국어", "Korean", Script::Cjk(CjkFont::Korean), "ko.tsv"),
     lang!("ka", "ქართული", "Georgian", Script::Alphabetic, "ka.tsv"),
+    lang!("lo", "ພາສາລາວ", "Lao", Script::Lao, "lo.tsv"),
     lang!("bn", "বাংলা", "Bengali", Script::Bengali, "bn.tsv"),
+    lang!("el", "Ελληνικά", "Greek", Script::Alphabetic, "el.tsv"),
 ];
 
 fn unescape(s: &str) -> String {
@@ -135,47 +145,81 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// Parses a catalog. Malformed lines are skipped and reported.
+/// Catalogs group keys by context; the empty context holds ordinary two-column entries.
+type Catalog = HashMap<String, HashMap<String, String>>;
+
+/// Parses the context-free entries of a catalog, reporting malformed and duplicate rows.
+/// Contextual entries are checked too; the UI loads them through [`parse_catalog`].
 pub fn parse(source: &str) -> (HashMap<String, String>, Vec<String>) {
-    let mut map = HashMap::new();
+    let (mut catalog, errors) = parse_catalog(source);
+    (catalog.remove("").unwrap_or_default(), errors)
+}
+
+/// Parses both row formats without allowing a duplicate to replace an earlier translation.
+/// Diagnostics carry one-based line numbers; callers add the catalog's language or filename.
+fn parse_catalog(source: &str) -> (Catalog, Vec<String>) {
+    let mut catalog = Catalog::new();
     let mut errors = Vec::new();
     for (i, line) in source.lines().enumerate() {
         let line = line.trim_end_matches('\r');
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
-        match line.split_once('\t') {
-            Some((en, tr)) if !en.is_empty() && !tr.trim().is_empty() => {
-                map.insert(unescape(en), unescape(tr));
+        let columns: Vec<_> = line.split('\t').collect();
+        let (context, en, tr) = match columns.as_slice() {
+            [en, tr] => ("", *en, *tr),
+            [context, en, tr] => (*context, *en, *tr),
+            _ => {
+                errors.push(format!("line {}: expected [context<TAB>]English<TAB>translation", i + 1));
+                continue;
             }
-            _ => errors.push(format!("line {}: expected English<TAB>translation", i + 1)),
+        };
+        if en.is_empty() || tr.trim().is_empty() {
+            errors.push(format!("line {}: English and translation must not be empty", i + 1));
+            continue;
+        }
+        let entries = catalog.entry(unescape(context)).or_default();
+        match entries.entry(unescape(en)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(unescape(tr));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                errors.push(format!("line {}: duplicate key {en:?} in context {context:?}", i + 1));
+            }
         }
     }
-    (map, errors)
+    (catalog, errors)
 }
 
 impl LangInfo {
-    fn catalog(&self) -> &HashMap<&'static str, &'static str> {
+    /// Loads each catalog once, keeping owned strings for the lifetime of the registry entry.
+    fn catalog(&self) -> &Catalog {
         self.catalog.get_or_init(|| {
-            let (map, errors) = parse(self.source);
+            let (catalog, errors) = parse_catalog(self.source);
             for e in errors {
                 log::warn!("{} catalog: {e}", self.code);
             }
-            // Leaked once per language for the life of the process, so lookups return 'static.
-            map.into_iter().map(|(k, v)| (&*Box::leak(k.into_boxed_str()), &*Box::leak(v.into_boxed_str()))).collect()
+            catalog
         })
     }
 
-    /// The catalog in display form: for a language whose text is laid out back to front,
-    /// each value as [`tr`] hands it out (Latin runs pre-reversed, brackets mirrored).
-    /// Empty — and free — for languages with no right-to-left text.
-    fn visual_catalog(&self) -> &HashMap<&'static str, &'static str> {
+    /// Catalog values in display form, grouped by context. Empty for languages without RTL text.
+    fn visual_catalog(&self) -> &Catalog {
         self.visual.get_or_init(|| {
             if !rtl::has_rtl(self.source) {
                 return HashMap::new();
             }
-            self.catalog().iter().map(|(k, v)| (*k, &*Box::leak(rtl::visual(v).into_boxed_str()))).collect()
+            self.catalog()
+                .iter()
+                .map(|(context, entries)| (context.clone(), entries.iter().map(|(key, value)| (key.clone(), rtl::visual(value))).collect()))
+                .collect()
         })
+    }
+
+    /// Looks up a context without allocating a combined context/text key on each frame.
+    fn lookup(&self, context: &str, s: &str, visual: bool) -> Option<&str> {
+        let catalog = if visual { self.visual_catalog() } else { self.catalog() };
+        catalog.get(context)?.get(s).map(String::as_str)
     }
 }
 
@@ -222,7 +266,7 @@ impl Lang {
     }
     /// Number of translated strings.
     pub fn len(self) -> usize {
-        self.0.catalog().len()
+        self.0.catalog().values().map(HashMap::len).sum()
     }
     pub fn is_empty(self) -> bool {
         self.len() == 0
@@ -237,10 +281,17 @@ pub fn lang_from_tag(tag: &str) -> Option<Lang> {
     }
     let mut parts = base.split('-');
     let primary = parts.next().unwrap_or("");
-    // Only Simplified Chinese has a catalog: Traditional-script locales fall back to English
-    // rather than get Simplified text.
-    if primary == "zh" && parts.any(|p| matches!(p, "hant" | "tw" | "hk" | "mo")) {
-        return None;
+    // Taiwan (`zh-TW`) and `zh-Hant` get the Traditional (Taiwan) catalog, unless an explicit
+    // `Hans` script asks for Simplified (`zh-Hans-TW`). Hong Kong and Macau have no catalog of
+    // their own: they fall back to English whatever the script (`zh-Hans-HK` too), as before.
+    if primary == "zh" {
+        let rest: Vec<&str> = parts.collect();
+        if rest.iter().any(|p| matches!(*p, "hk" | "mo")) {
+            return None;
+        }
+        if !rest.contains(&"hans") && rest.iter().any(|p| matches!(*p, "hant" | "tw")) {
+            return Lang::from_code("zh-tw");
+        }
     }
     Lang::from_code(primary)
 }
@@ -290,10 +341,10 @@ pub fn t(s: &str) -> &str {
 /// Strings without a translation come back unchanged. Text the catalog doesn't have may
 /// be a plugin's (a tool name, a parameter label…): its own `i18n` translates it.
 pub fn tr(lang: Lang, s: &str) -> &str {
-    if let Some(t) = lang.0.visual_catalog().get(s) {
+    if let Some(t) = lang.0.lookup("", s, true) {
         return t;
     }
-    if let Some(t) = lang.0.catalog().get(s) {
+    if let Some(t) = lang.0.lookup("", s, false) {
         return t;
     }
     if lang == Lang::EN {
@@ -302,12 +353,29 @@ pub fn tr(lang: Lang, s: &str) -> &str {
     plugin_tr(lang, s).unwrap_or(s)
 }
 
+/// Translates a homograph in the given context, falling back to the ordinary translation.
+/// Missing contextual and ordinary entries show the English source, never the context name.
+pub fn tr_context<'a>(lang: Lang, context: &str, s: &'a str) -> &'a str {
+    lang.0.lookup(context, s, true).or_else(|| lang.0.lookup(context, s, false)).unwrap_or_else(|| tr(lang, s))
+}
+
+/// Contextual translation in the current language, in display form.
+pub fn t_context<'a>(context: &str, s: &'a str) -> &'a str {
+    tr_context(current(), context, s)
+}
+
+/// Contextual translation in logical order, for fragments inserted into a formatted message.
+pub fn t_raw_context<'a>(context: &str, s: &'a str) -> &'a str {
+    let lang = current();
+    lang.0.lookup(context, s, false).unwrap_or_else(|| tr_raw(lang, s))
+}
+
 /// `s` in `lang`, in logical order: [`tr`] without the display form, for a message whose
 /// placeholders are filled — and whose separators are joined — before it is shown. A
 /// plugin's translation is used when the catalog has none, so [`fmt`] and [`location`]
 /// translate plugin strings as well.
 pub fn tr_raw(lang: Lang, s: &str) -> &str {
-    if let Some(t) = lang.0.catalog().get(s) {
+    if let Some(t) = lang.0.lookup("", s, false) {
         return t;
     }
     if lang == Lang::EN {
@@ -335,9 +403,11 @@ thread_local! {
     /// The same, in logical order, for messages whose placeholders are filled
     /// ([`fmt`]) or whose segments are joined ([`location`]) before they are shown.
     static PLUGIN_RAW_STRINGS: std::cell::RefCell<std::collections::HashSet<&'static str>> = Default::default();
-    /// Plugin lookups this frame and the ones before, misses included: (plugin revision, language,
-    /// logical and display results). `tr` runs for every label every frame.
-    static PLUGIN_CACHE_MAP: std::cell::RefCell<(u64, &'static str, std::collections::HashMap<String, Option<(&'static str, &'static str)>>)> =
+    /// Plugin lookups this frame and the ones before, misses included: (plugin and GeoLibre
+    /// translation revisions, language, logical and display results). `tr` runs for every label
+    /// every frame.
+    #[allow(clippy::type_complexity)]
+    static PLUGIN_CACHE_MAP: std::cell::RefCell<((u64, u64), &'static str, std::collections::HashMap<String, Option<(&'static str, &'static str)>>)> =
         Default::default();
 }
 
@@ -352,9 +422,10 @@ fn leak_once(seen: &mut std::collections::HashSet<&'static str>, s: String) -> &
     kept
 }
 
-/// `s` translated by a loaded plugin's `i18n`, in logical order and in display form.
+/// `s` translated by a loaded plugin's `i18n`, else by the GeoLibre tool translations kept for
+/// `lang` (#2224), in logical order and in display form.
 fn plugin_tr_pair(lang: Lang, s: &str) -> Option<(&'static str, &'static str)> {
-    let revision = rustgis_engine::plugins::revision();
+    let revision = (rustgis_engine::plugins::revision(), rustgis_engine::cmd::gp::geolibre_language_revision());
     PLUGIN_CACHE_MAP.with_borrow_mut(|(rev, code, map)| {
         if *rev != revision || *code != lang.code() || map.len() > PLUGIN_CACHE {
             *rev = revision;
@@ -364,7 +435,9 @@ fn plugin_tr_pair(lang: Lang, s: &str) -> Option<(&'static str, &'static str)> {
         if let Some(hit) = map.get(s) {
             return *hit;
         }
-        let found = rustgis_engine::plugins::translate(lang.code(), s).map(|t| {
+        let translated =
+            rustgis_engine::plugins::translate(lang.code(), s).or_else(|| rustgis_engine::cmd::gp::geolibre_translate(lang.code(), s));
+        let found = translated.map(|t| {
             let shown = rtl::visual(&t);
             let raw = PLUGIN_RAW_STRINGS.with_borrow_mut(|seen| leak_once(seen, t));
             let vis = PLUGIN_STRINGS.with_borrow_mut(|seen| leak_once(seen, shown));
@@ -388,9 +461,13 @@ fn plugin_tr_raw(lang: Lang, s: &str) -> Option<&'static str> {
 /// A location such as `Map › Navigate`, translated segment by segment and shown in
 /// display form as one line.
 pub fn location(loc: &str) -> String {
+    rtl::visual(&location_raw(loc))
+}
+
+/// A translated location in logical order, as typed into Command Search.
+pub(crate) fn location_raw(loc: &str) -> String {
     let lang = current();
-    let loc = loc.split(" › ").map(|s| tr_raw(lang, s)).collect::<Vec<_>>().join(" › ");
-    rtl::visual(&loc)
+    loc.split(" › ").map(|s| tr_raw(lang, s)).collect::<Vec<_>>().join(" › ")
 }
 
 /// Translates `template`, fills its `{name}` placeholders in one pass (values are never
@@ -400,7 +477,43 @@ pub fn location(loc: &str) -> String {
 /// logical order — [`t_raw`] (`tl_raw!`) for translated fragments, raw data as it is —
 /// for the finished message is transformed as a whole.
 pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
-    let template = tr_raw(current(), template);
+    rtl::visual(&fmt_raw(template, args))
+}
+
+/// [`fmt`] in logical order, without the display form: for a message shown with
+/// [`paragraph`], which fits a right-to-left message to its rows and puts each row in
+/// display form itself.
+pub fn fmt_raw(template: &str, args: &[(&str, &str)]) -> String {
+    fill_placeholders(tr_raw(current(), template), args)
+}
+
+/// Translates a whole-file size refusal, keeping the file name and limit as literal arguments.
+pub(crate) fn file_size_error(error: &str, format: impl FnOnce(&str, &[(&str, &str)]) -> String) -> Option<String> {
+    use rustgis_engine::data::io::FileSizeAdvice;
+    let (name, limit, advice) = rustgis_engine::data::io::file_size_error_args(error)?;
+    let args = &[("name", name), ("limit", limit)];
+    let template = match advice {
+        FileSizeAdvice::Split => {
+            "{name} is too large to open (limit {limit} MiB). Split the data into smaller files and import each one separately."
+        }
+        FileSizeAdvice::Vector => {
+            "{name} is too large to open (limit {limit} MiB). Split it into smaller files, or convert vector data to FlatGeobuf or GeoPackage and open it on the desktop."
+        }
+        FileSizeAdvice::Shapefile => {
+            "{name} is too large to open (limit {limit} MiB). Split the whole Shapefile, or convert it to FlatGeobuf or GeoPackage and open it on the desktop."
+        }
+    };
+    Some(format(template, args))
+}
+
+/// Translates a template in its context, then fills placeholders before RTL display conversion.
+pub fn fmt_context(context: &str, template: &str, args: &[(&str, &str)]) -> String {
+    rtl::visual(&fill_placeholders(t_raw_context(context, template), args))
+}
+
+/// Fills placeholders once, keeping inserted data literal, and leaves the line in logical
+/// order: callers put the completed line in display form as a whole, or not at all.
+fn fill_placeholders(template: &str, args: &[(&str, &str)]) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some((before, after)) = rest.split_once('{') {
@@ -408,7 +521,7 @@ pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
         let Some((name, tail)) = after.split_once('}') else {
             out.push('{');
             out.push_str(after);
-            return rtl::visual(&out);
+            return out;
         };
         match args.iter().find(|(k, _)| *k == name) {
             Some((_, v)) => out.push_str(v),
@@ -421,7 +534,7 @@ pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
         rest = tail;
     }
     out.push_str(rest);
-    rtl::visual(&out)
+    out
 }
 
 thread_local! {
@@ -488,6 +601,9 @@ pub fn paragraph(ui: &mut egui::Ui, s: &str, font_id: egui::FontId, color: egui:
 /// `s` in the current language: `tl!("Explore")`.
 #[macro_export]
 macro_rules! tl {
+    ($s:expr, context = $context:expr) => {
+        $crate::i18n::t_context($context, $s)
+    };
     ($s:expr) => {
         $crate::i18n::t($s)
     };
@@ -498,6 +614,9 @@ macro_rules! tl {
 /// `tl!`'s display form would be transformed twice.
 #[macro_export]
 macro_rules! tl_raw {
+    ($s:expr, context = $context:expr) => {
+        $crate::i18n::t_raw_context($context, $s)
+    };
     ($s:expr) => {
         $crate::i18n::t_raw($s)
     };

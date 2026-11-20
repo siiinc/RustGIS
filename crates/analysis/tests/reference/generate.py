@@ -278,9 +278,12 @@ def linear(g):
 
 
 def write_expected(name, rows):
+    """Writes full-precision reference geometry, compactly with one feature per line."""
     feats = [{"type": "Feature", "properties": {"id": i}, "geometry": mapping(g)} for i, g in rows]
     (OUT / "expected").mkdir(exist_ok=True)
-    text = json.dumps({"type": "FeatureCollection", "features": feats}, indent=1)
+    text = '{"type":"FeatureCollection","features":[\n' + ",\n".join(
+        json.dumps(f, separators=(",", ":")) for f in feats
+    ) + "\n]}"
     (OUT / "expected" / f"{name}.geojson").write_text(text + "\n")
     return f"expected/{name}.geojson"
 
@@ -554,6 +557,10 @@ def check():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--overlay"]:
+        import overlay as generated_overlay
+
+        sys.exit(generated_overlay.run(sys.argv[2:]))
     if sys.argv[1:] not in ([], ["--check"]):
-        sys.exit(f"usage: uv run generate.py [--check] (not {' '.join(sys.argv[1:])})")
+        sys.exit(f"usage: uv run generate.py [--check | --overlay RUNNER --findings DIR] (not {' '.join(sys.argv[1:])})")
     sys.exit(check() if sys.argv[1:] == ["--check"] else main())

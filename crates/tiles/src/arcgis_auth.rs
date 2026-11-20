@@ -91,7 +91,8 @@ pub fn portal_base(input: &str) -> Result<String, String> {
     if raw.is_empty() {
         return Ok(ONLINE.to_string());
     }
-    let (origin, path) = split(raw).ok_or_else(|| format!("{raw}: a portal is given by its https:// address"))?;
+    let (origin, path) =
+        split(raw).ok_or_else(|| rustgis_data::diagnostics::message_with_address(raw, "a portal is given by its https:// address"))?;
     if origin == "https://arcgis.com" {
         return Ok(ONLINE.to_string());
     }
@@ -139,43 +140,11 @@ fn encode(s: &str) -> String {
     out
 }
 
-fn form(params: &[(&str, &str)]) -> String {
+pub(crate) fn form(params: &[(&str, &str)]) -> String {
     params.iter().map(|(k, v)| format!("{k}={}", encode(v))).collect::<Vec<_>>().join("&")
 }
 
-/// Decodes a query value (`+` is a space).
-fn decode(s: &str) -> String {
-    decode_with(s, true)
-}
-
-/// Decodes `%XX` escapes, and `+` as a space when `plus` (form data, not a pasted token).
-fn decode_with(s: &str, plus: bool) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        match b {
-            b'+' if plus => out.push(b' '),
-            b'%' => {
-                let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
-                if let Some(v) = hex {
-                    out.push(v);
-                    i += 2;
-                } else {
-                    out.push(b'%');
-                }
-            }
-            _ => out.push(b),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// A query's parameters, decoded.
-pub fn query_params(query: &str) -> Vec<(String, String)> {
-    query.split('&').filter(|p| !p.is_empty()).map(|p| p.split_once('=').unwrap_or((p, ""))).map(|(k, v)| (decode(k), decode(v))).collect()
-}
+pub use rustgis_data::address::query_params;
 
 /// Whether `id` looks like an OAuth client id (ArcGIS's are 16 letters and digits).
 pub fn valid_client_id(id: &str) -> bool {
@@ -371,6 +340,84 @@ struct Session {
     retry_at: i64,
 }
 
+impl Session {
+    /// Whether it is a sign-in that still gives a token at `now`: it renews itself, or it hasn't
+    /// expired. A token given with an address isn't a sign-in.
+    fn signed_in_at(&self, now: i64) -> bool {
+        !self.client_id.is_empty() && (self.refresh_token.is_some() || self.expires_at > now)
+    }
+}
+
+/// An immutable, exact runtime account snapshot, never an output representation. It contains
+/// credentials and deliberately has no formatting, serialization or raw-value accessors.
+/// Renewal that rotates credentials invalidates it just like replacing a token does.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountIdentity {
+    url: Option<String>,
+    accounts: Vec<Account>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct Account {
+    portal: String,
+    client_id: String,
+    username: String,
+    access_token: String,
+    expires_at: i64,
+    refresh_token: Option<String>,
+    scopes: Vec<Scope>,
+}
+
+impl From<&Session> for Account {
+    fn from(s: &Session) -> Self {
+        Self {
+            portal: s.portal.clone(),
+            client_id: s.client_id.clone(),
+            username: s.username.clone(),
+            access_token: s.access_token.clone(),
+            expires_at: s.expires_at,
+            refresh_token: s.refresh_token.clone(),
+            scopes: s.scopes.clone(),
+        }
+    }
+}
+
+impl AccountIdentity {
+    /// Compares only active in-memory accounts. Never restores, renews or performs I/O;
+    /// an unavailable or poisoned store returns false.
+    pub fn is_current(&self) -> bool {
+        identity(self.url.as_deref()).is_ok_and(|current| *self == current)
+    }
+}
+
+fn identity(url: Option<&str>) -> Result<AccountIdentity, String> {
+    identity_in(store(), url)
+}
+
+fn identity_in(store: &Mutex<Vec<Session>>, url: Option<&str>) -> Result<AccountIdentity, String> {
+    let all = store.lock().map_err(|_| "active account store unavailable".to_string())?;
+    let accounts = match url {
+        Some(url) => covering(&all, url).and_then(|i| all.get(i)).map(Account::from).into_iter().collect(),
+        None => all.iter().map(Account::from).collect(),
+    };
+    Ok(AccountIdentity { url: url.map(str::to_string), accounts })
+}
+
+/// Snapshots all active runtime accounts in selection order, without I/O. Use when the
+/// request's eventual addresses cannot yet be scoped; unrelated account changes invalidate it.
+/// An unavailable or poisoned store is an error, never an empty identity.
+pub fn account_identity() -> Result<AccountIdentity, String> {
+    identity(None)
+}
+
+/// Snapshots the account selected for this address, including its absence. Changes to an
+/// unrelated account do not invalidate it; a newly covering account or rotation does.
+/// Expiry and retry scheduling are not executed by this pure read.
+/// An unavailable or poisoned store is an error, never an absent account.
+pub fn account_identity_for(url: &str) -> Result<AccountIdentity, String> {
+    identity(Some(url))
+}
+
 fn store() -> &'static Mutex<Vec<Session>> {
     static S: std::sync::OnceLock<Mutex<Vec<Session>>> = std::sync::OnceLock::new();
     S.get_or_init(Mutex::default)
@@ -426,7 +473,10 @@ pub fn add_token(url: &str, token: &str) -> Result<String, String> {
         return Err("an ArcGIS token is one word of letters, digits and - _ . ~ + / =".into());
     }
     let root = server_root(url).ok_or_else(|| {
-        format!("{}: a token is given with an ArcGIS REST address on https:// (…/rest/services/… or …/sharing/rest)", url.trim())
+        rustgis_data::diagnostics::message_with_address(
+            url.trim(),
+            "a token is given with an ArcGIS REST address on https:// (…/rest/services/… or …/sharing/rest)",
+        )
     })?;
     let scopes = Scope::prefix(&root).into_iter().collect();
     keep(Session {
@@ -454,9 +504,9 @@ pub fn adopt_url_token(url: &str) -> Result<String, String> {
         .split('&')
         .filter(|p| {
             let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            if k.eq_ignore_ascii_case("token") {
+            if rustgis_data::address::normalized_name(k).as_deref() == Some("token") {
                 // A token is pasted, not form-encoded: its `+` stays a `+`.
-                token = Some(decode_with(v, false));
+                token = Some(rustgis_data::address::percent_decode(v));
                 false
             } else {
                 true
@@ -701,6 +751,14 @@ pub fn signed_in(portal: &str) -> Option<Info> {
     list().into_iter().find(|s| s.portal == portal && !s.token)
 }
 
+/// Whether a sign-in kept still gives a token: one that renews itself or hasn't expired. A sign-in
+/// past its expiry with nothing to renew it is kept, but no request uses it; a token given with an
+/// address covers its server only and isn't counted.
+pub fn kept() -> bool {
+    let now = now_secs();
+    sessions().iter().any(|s| s.signed_in_at(now))
+}
+
 /// A revocation to send after a sign-out: the endpoint and its form.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Revocation {
@@ -740,7 +798,7 @@ mod native {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     use super::{Info, Revocation};
@@ -795,28 +853,40 @@ mod native {
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
     }
 
-    fn agent() -> ureq::Agent {
-        // A token request is never redirected: a redirect would replay the code or the refresh token.
-        ureq::Agent::config_builder()
-            .timeout_global(Some(REQUEST_TIMEOUT))
-            .user_agent(concat!("RustGIS/", env!("CARGO_PKG_VERSION"), " (+https://rustgis.app)"))
-            .max_redirects(0)
-            .build()
-            .into()
+    /// The agent for token requests (`forms`: an error status is answered, for the caller to
+    /// read) or portal reads (an error status fails). Each is made once, so its TLS setup (the
+    /// system's certificates, read from disk on Linux) is too; connections aren't kept, as before.
+    fn agent(forms: bool) -> &'static ureq::Agent {
+        static FORMS: OnceLock<ureq::Agent> = OnceLock::new();
+        static READS: OnceLock<ureq::Agent> = OnceLock::new();
+        (if forms { &FORMS } else { &READS }).get_or_init(|| {
+            // A token request is never redirected: a redirect would replay the code or the refresh token.
+            ureq::Agent::config_builder()
+                .tls_config(rustgis_data::http::tls_config())
+                .http_status_as_error(!forms)
+                .timeout_global(Some(REQUEST_TIMEOUT))
+                .user_agent(concat!("RustGIS/", env!("CARGO_PKG_VERSION"), " (+https://rustgis.app)"))
+                .max_redirects(0)
+                .max_idle_connections(0)
+                .build()
+                .into()
+        })
     }
 
     /// POSTs a form; a refusal's answer (an OAuth `error`, often with HTTP 400) is returned for
     /// the caller to read, while a server error (5xx) counts as the portal not being reached.
     fn post_form(url: &str, body: &str) -> Result<Vec<u8>, String> {
-        let resp = agent()
-            .post(url)
-            .config()
-            .http_status_as_error(false)
-            .build()
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Accept", "application/json")
-            .send(body)
-            .map_err(|e| format!("couldn't reach the portal: {e}"))?;
+        post_form_claimed(url, body, &None)
+    }
+
+    /// Checks a download's owned predicate after request preparation, directly at renewal send.
+    /// Interactive sign-in and sign-out use `post_form` without a download predicate.
+    fn post_form_claimed(url: &str, body: &str, still: &Option<crate::cache::Still>) -> Result<Vec<u8>, String> {
+        let resp = send_form(
+            still,
+            || agent(true).post(url).header("Content-Type", "application/x-www-form-urlencoded").header("Accept", "application/json"),
+            |req| req.send(body).map_err(|e| format!("couldn't reach the portal: {e}")),
+        )?;
         let status = resp.status().as_u16();
         if status >= 500 {
             return Err(format!("the portal answered HTTP {status}"));
@@ -824,8 +894,19 @@ mod native {
         resp.into_body().with_config().limit(1 << 20).read_to_vec().map_err(|e| e.to_string())
     }
 
+    /// Request preparation (including TLS setup) can wait; the final send has its own check.
+    fn send_form<T, R>(
+        still: &Option<crate::cache::Still>,
+        prepare: impl FnOnce() -> T,
+        send: impl FnOnce(T) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let prepared = prepare();
+        crate::cache::check_still(still)?;
+        send(prepared)
+    }
+
     fn get_json(url: &str, token: &str) -> Result<Vec<u8>, String> {
-        let resp = agent()
+        let resp = agent(false)
             .get(url)
             .header("X-Esri-Authorization", &format!("Bearer {token}"))
             .header("Accept", "application/json")
@@ -1001,12 +1082,29 @@ mod native {
     /// Like [`authorization`](super::authorization), renewing the access token first when it is
     /// about to expire. A refused renewal ends the session; an unreachable portal keeps it.
     pub fn authorization_fresh(url: &str) -> Option<String> {
+        authorization_fresh_using(url, crate::cache::current_still(), post_form_claimed)
+    }
+
+    fn renewing() -> &'static Mutex<()> {
+        static RENEWING: Mutex<()> = Mutex::new(());
+        &RENEWING
+    }
+
+    /// The same owned predicate crosses the renewal lock and reaches the actual sender.
+    fn authorization_fresh_using(
+        url: &str,
+        still: Option<crate::cache::Still>,
+        post: impl FnOnce(&str, &str, &Option<crate::cache::Still>) -> Result<Vec<u8>, String>,
+    ) -> Option<String> {
+        crate::cache::check_still(&still).ok()?;
         if super::renewal_due(url).is_some() {
             // One renewal at a time: the others wait for it, then find the token fresh.
-            static RENEWING: Mutex<()> = Mutex::new(());
-            let _one = RENEWING.lock().unwrap_or_else(|e| e.into_inner());
+            let _one = renewing().lock().unwrap_or_else(|e| e.into_inner());
+            crate::cache::check_still(&still).ok()?;
             if let Some(r) = super::renewal_due(url) {
-                let answer = post_form(&r.endpoint, &r.body);
+                crate::cache::check_still(&still).ok()?;
+                let answer = post(&r.endpoint, &r.body, &still);
+                crate::cache::check_still(&still).ok()?;
                 super::renewal_done(&r, answer.as_deref().map_err(String::clone));
             }
         }
@@ -1072,6 +1170,149 @@ mod native {
             t = escape(title),
             m = escape(text)
         )
+    }
+
+    #[cfg(test)]
+    mod renewal_tests {
+        use super::*;
+
+        /// Revocation during synchronous request preparation is checked at the actual sender.
+        #[test]
+        fn permission_transport_renewal_rechecks_immediately_before_post() {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+                mpsc::channel,
+            };
+            let live = Arc::new(AtomicBool::new(true));
+            let flag = live.clone();
+            let still: crate::cache::Still = Arc::new(move || flag.load(SeqCst));
+            let sends = Arc::new(AtomicUsize::new(0));
+            let posted = sends.clone();
+            let (entered, entry) = channel();
+            let (release, released) = channel();
+            let worker = std::thread::spawn(move || {
+                send_form(
+                    &Some(still),
+                    || {
+                        entered.send(()).unwrap();
+                        released.recv().unwrap();
+                    },
+                    |()| {
+                        posted.fetch_add(1, SeqCst);
+                        Ok(())
+                    },
+                )
+            });
+            entry.recv_timeout(Duration::from_secs(10)).unwrap();
+            live.store(false, SeqCst);
+            release.send(()).unwrap();
+            assert!(worker.join().unwrap().unwrap_err().contains("cancelled"));
+            assert_eq!(sends.load(SeqCst), 0);
+        }
+
+        /// Renewal is permitted while current, but a rotated credential needs fresh consent.
+        #[test]
+        fn permission_transport_renewal_rotation_invalidates_old_identity_only() {
+            use crate::{arcgis_auth as auth, cache};
+            let portal = "https://rotation.example.org/portal";
+            let url = format!("{portal}/sharing/rest/content/items/a");
+            let due = || {
+                auth::sign_in(
+                    portal,
+                    "client",
+                    auth::Grant {
+                        access_token: "synthetic-old".into(),
+                        refresh_token: Some("synthetic-refresh".into()),
+                        expires_at: auth::now_secs() + 20,
+                        username: "test".into(),
+                    },
+                    auth::scopes_for(portal, None, &[]),
+                )
+            };
+            let answer = br#"{"access_token":"synthetic-new","refresh_token":"synthetic-rotated","expires_in":3600}"#;
+            due();
+            let identity = auth::account_identity_for(&url).unwrap();
+            let still: cache::Still = std::sync::Arc::new(move || identity.is_current());
+            let token = authorization_fresh_using(&url, Some(still.clone()), |_, _, owned| {
+                assert!(std::sync::Arc::ptr_eq(owned.as_ref().unwrap(), &still));
+                cache::check_still(owned).unwrap();
+                Ok(answer.to_vec())
+            });
+            assert_eq!(token.as_deref(), Some("Bearer synthetic-new"));
+            assert!(cache::check_still(&Some(still)).is_err(), "the final GET must refuse old identity");
+            let fresh = auth::account_identity_for(&url).unwrap();
+            let fresh: cache::Still = std::sync::Arc::new(move || fresh.is_current());
+            assert!(cache::check_still(&Some(fresh.clone())).is_ok());
+            assert!(authorization_fresh_using(&url, Some(fresh), |_, _, _| panic!("already renewed")).is_some());
+            // Ordinary unclaimed User requests retain renewal behavior.
+            due();
+            assert_eq!(
+                authorization_fresh_using(&url, None, |_, _, owned| {
+                    assert!(owned.is_none());
+                    Ok(answer.to_vec())
+                })
+                .as_deref(),
+                Some("Bearer synthetic-new")
+            );
+            auth::sign_out(Some(portal));
+        }
+
+        /// A real renewal waits behind preparation; revocation prevents its POST and the GET.
+        #[test]
+        fn permission_transport_renewal_rechecks_after_waiting_for_preparation() {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+                mpsc::channel,
+            };
+            let portal = "https://held-renewal.example.org/portal";
+            let url = format!("{portal}/sharing/rest/content/items/a");
+            super::super::sign_in(
+                portal,
+                "client",
+                super::super::Grant {
+                    access_token: "synthetic-old".into(),
+                    refresh_token: Some("synthetic-refresh".into()),
+                    expires_at: super::super::now_secs() + 20,
+                    username: "test".into(),
+                },
+                super::super::scopes_for(portal, None, &[]),
+            );
+            let one = renewing().lock().unwrap();
+            let live = Arc::new(AtomicBool::new(true));
+            let sends = Arc::new(AtomicUsize::new(0));
+            let (entered, entry) = channel();
+            let flag = live.clone();
+            let first = AtomicBool::new(true);
+            let still: crate::cache::Still = Arc::new(move || {
+                let allowed = flag.load(SeqCst);
+                if first.swap(false, SeqCst) {
+                    entered.send(()).unwrap();
+                }
+                allowed
+            });
+            let posted = sends.clone();
+            let worker = std::thread::spawn(move || {
+                crate::cache::with_still(still, || {
+                    let auth = authorization_fresh_using(&url, crate::cache::current_still(), |_, _, _| {
+                        posted.fetch_add(1, SeqCst);
+                        Ok(br#"{"access_token":"synthetic-new","expires_in":3600}"#.to_vec())
+                    });
+                    assert!(auth.is_none());
+                    // The native GET's actual-send check still rejects the same initiating claim.
+                    if crate::cache::check_still(&crate::cache::current_still()).is_ok() {
+                        posted.fetch_add(1, SeqCst);
+                    }
+                })
+            });
+            entry.recv_timeout(Duration::from_secs(10)).unwrap();
+            live.store(false, SeqCst);
+            drop(one);
+            worker.join().unwrap();
+            assert_eq!(sends.load(SeqCst), 0);
+            super::super::sign_out(Some(portal));
+        }
     }
 }
 

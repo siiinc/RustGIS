@@ -224,6 +224,31 @@ fn maneuver(p: &P, kind: &str) {
     }
 }
 
+/// A key filled with `fill` and outlined with `ink`, on a disc of `backdrop` that keeps it clear of
+/// the icon it sits on: a command's sign-in, kept (green) or missing (red, and struck through, so
+/// the state doesn't rest on colour alone).
+pub fn key_badge(painter: &Painter, r: Rect, fill: Color32, ink: Color32, backdrop: Color32, missing: bool) {
+    let p = P { p: painter, r, ink, acc: fill };
+    p.circle(12.0, 12.0, 12.0, Some(backdrop), None);
+    // The bow, then the shaft and its two teeth: the outline first, the fill over it.
+    let shaft = [(9.5, 9.5), (19.5, 19.5)];
+    let teeth = [[(16.0, 16.0), (18.5, 13.5)], [(19.5, 19.5), (21.5, 17.5)]];
+    for (w, c) in [(4.6, ink), (2.4, fill)] {
+        p.line(&shaft, w, c);
+        for t in &teeth {
+            p.line(t, w, c);
+        }
+    }
+    p.circle(8.0, 8.0, 5.0, Some(fill), Some((1.4, ink)));
+    p.circle(7.0, 7.0, 1.6, Some(backdrop), None);
+    if missing {
+        // Across the key, on a gap of the backdrop that keeps it readable over the fill.
+        let slash = [(4.0, 20.0), (20.0, 4.0)];
+        p.line(&slash, 5.0, backdrop);
+        p.line(&slash, 2.2, ink);
+    }
+}
+
 /// Paints icon `name` into `r`. `ink` draws outlines, `accent` the colour parts.
 pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color32) {
     let p = P { p: painter, r, ink, acc: accent };
@@ -388,6 +413,14 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.circle(12.0, 7.5, 1.4, Some(Color32::WHITE), None);
             p.line(&[(12.0, 10.5), (12.0, 17.0)], 2.2, Color32::WHITE);
         }
+        "message_log" => {
+            // A message bubble containing a log's severity dots and text lines.
+            p.closed(&[(3.0, 3.0), (21.0, 3.0), (21.0, 17.0), (11.0, 17.0), (6.0, 21.0), (6.0, 17.0), (3.0, 17.0)], 1.4, ink);
+            for (y, color) in [(7.0, red), (10.5, amber), (14.0, accent)] {
+                p.circle(6.5, y, 1.0, Some(color), None);
+                p.line(&[(10.0, y), (18.0, y)], 1.3, ink);
+            }
+        }
         "help" => {
             p.circle(12.0, 12.0, 9.0, Some(accent), None);
             p.text(12.0, 12.3, "?", 12.0, Color32::WHITE);
@@ -456,6 +489,17 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.circle(12.5, 12.0, 8.5, Some(p.tint(40)), Some((1.4, ink)));
             p.line(&[(12.5, 7.0), (12.5, 12.0), (16.0, 14.0)], 1.6, ink);
             p.fill(&[(1.5, 9.5), (6.0, 9.5), (3.5, 13.5)], ink);
+        }
+        "calendar" => {
+            // A page of a calendar: its rings over a band, and a day marked in the grid below.
+            p.rect(3.0, 5.0, 18.0, 16.0, Some(p.tint(30)), Some((1.4, ink)), 2.0);
+            p.line(&[(3.0, 9.5), (21.0, 9.5)], 1.4, ink);
+            p.line(&[(8.0, 3.0), (8.0, 7.0)], 1.6, ink);
+            p.line(&[(16.0, 3.0), (16.0, 7.0)], 1.6, ink);
+            for (x, y) in [(6.5, 13.0), (10.5, 13.0), (6.5, 17.0), (10.5, 17.0), (14.5, 17.0)] {
+                p.rect(x - 1.0, y - 1.0, 2.0, 2.0, Some(ink), None, 0.0);
+            }
+            p.rect(13.0, 11.5, 4.0, 3.5, Some(p.acc), None, 0.5);
         }
         "time_slider" => {
             // A clock over a slider track with its thumb.
@@ -871,6 +915,13 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
         "point_layer" => p.circle(12.0, 12.0, 5.0, Some(accent), Some((1.2, ink))),
         "line_layer" => p.line(&[(3.0, 17.0), (9.0, 8.0), (15.0, 15.0), (21.0, 6.0)], 2.2, accent),
         "polygon_layer" => p.polygon_shape(&[(3.0, 8.0), (11.0, 3.0), (21.0, 7.0), (19.0, 20.0), (5.0, 19.0)], 180),
+        // A block raised over the ground: what an extrusion stands on (Style › Extrusion › Base).
+        "extrusion_base" => {
+            p.line(&[(2.0, 20.0), (22.0, 20.0)], 1.4, ink);
+            p.line(&[(8.0, 19.0), (8.0, 14.0)], 1.0, p.tint(160));
+            p.line(&[(16.0, 19.0), (16.0, 14.0)], 1.0, p.tint(160));
+            p.rect(5.0, 4.0, 14.0, 9.0, Some(p.tint(110)), Some((1.3, ink)), 1.0);
+        }
         // A lit globe with an orbit: the 3D view.
         "globe_view" => {
             p.circle(11.0, 12.0, 8.0, Some(teal.gamma_multiply(0.85)), None);
@@ -1164,6 +1215,13 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
                 p.line(&[(x - 1.6, 18.5), (x + 1.6, 18.5)], 1.3, ink);
             }
         }
+        "extension" => {
+            // A puzzle piece with an on/off switch.
+            p.rect(2.5, 4.5, 12.0, 11.0, Some(p.tint(40)), Some((1.3, ink)), 2.0);
+            p.circle(8.5, 4.0, 2.4, Some(accent), Some((1.2, ink)));
+            p.rect(10.0, 15.0, 12.0, 6.5, Some(green), Some((1.1, ink)), 3.25);
+            p.circle(18.75, 18.25, 2.2, Some(Color32::WHITE), None);
+        }
         "plugin" | "plugin_add" => {
             // A puzzle piece: a body with two knobs.
             p.rect(3.5, 7.5, 13.0, 13.0, Some(p.tint(40)), Some((1.3, ink)), 2.0);
@@ -1196,6 +1254,7 @@ pub const ALL: &[&str] = &[
     "maneuver_merge",
     "plugin",
     "plugin_add",
+    "extension",
     "explore",
     "zoom_full",
     "zoom_world",
@@ -1224,6 +1283,7 @@ pub const ALL: &[&str] = &[
     "measure",
     "measure_area",
     "identify",
+    "message_log",
     "about",
     "help",
     "label",
@@ -1238,6 +1298,7 @@ pub const ALL: &[&str] = &[
     "modelbuilder",
     "python",
     "history",
+    "calendar",
     "time_slider",
     "time_off",
     "time_first",
@@ -1320,6 +1381,7 @@ pub const ALL: &[&str] = &[
     "point_layer",
     "line_layer",
     "polygon_layer",
+    "extrusion_base",
     "globe_view",
     "planet",
     "raster_layer",

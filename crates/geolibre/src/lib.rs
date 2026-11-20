@@ -25,6 +25,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod install;
+pub mod langpack;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
@@ -57,6 +58,7 @@ pub fn register() {
 pub fn set_runner(exe: Option<std::path::PathBuf>) -> Result<Option<(std::path::PathBuf, String)>, String> {
     let found = runner::choose(exe)?;
     rustgis_analysis::reload_external_of(SOURCE);
+    let _ = rustgis_analysis::external_tools_of(SOURCE);
     Ok(found)
 }
 
@@ -73,6 +75,7 @@ pub fn set_manifests(json: &str) -> Result<usize, String> {
         *m = Some(v);
     }
     rustgis_analysis::reload_external_of(SOURCE);
+    let _ = rustgis_analysis::external_tools_of(SOURCE);
     Ok(n)
 }
 
@@ -129,8 +132,25 @@ struct MetaParam {
 /// What a run needs to know about a tool beyond its [`ToolSpec`].
 #[derive(Clone, Debug)]
 struct Meta {
+    schema: &'static [ParamSpec],
     category: String,
     params: Vec<MetaParam>,
+    /// The form has the [`OUTPUT`] field naming the layers the outputs come back as.
+    names_outputs: bool,
+}
+
+/// The parameter that names a tool's new layers, under the key the built-in tools use (#2224).
+pub const OUTPUT: &str = "output";
+/// The [`OUTPUT`] field's label, as on the built-in tools.
+const OUTPUT_LABEL: &str = "Output Name";
+/// The [`OUTPUT`] field's help: the same text on every tool, so it can be translated.
+const OUTPUT_HELP: &str = "Name of the new layer. Empty: the tool's name. With several outputs, each adds its own name to it. A name already in use gets a number.";
+/// The longest layer name [`OUTPUT`] keeps (the engine's longest name).
+const MAX_OUTPUT_NAME: usize = 200;
+
+/// `p` is the [`OUTPUT`] field RustGIS adds, not one of the manifest's parameters.
+pub fn is_output_name(p: &ParamSpec) -> bool {
+    p.name == OUTPUT && p.label == OUTPUT_LABEL && p.kind == ParamKind::Text
 }
 
 static META: Mutex<Option<HashMap<String, Meta>>> = Mutex::new(None);
@@ -218,6 +238,7 @@ fn field_kind(name: &str) -> Option<ParamKind> {
     }
 }
 
+/// Builds the form and staging metadata together, including legacy Composite Bands inputs.
 fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
     let id = m.get("id")?.as_str()?;
     let name = m.get("display_name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(id);
@@ -229,17 +250,26 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
     for p in m.get("params").and_then(Value::as_array).into_iter().flatten() {
         let Some(pname) = p.get("name").and_then(Value::as_str) else { continue };
         let schema = p.get("schema");
-        let data = Data::of(p.get("data_kind").and_then(Value::as_str).unwrap_or(""));
+        // GeoLibre 1.8.0/1.8.1 describe this raster list as a string option (#1684).
+        // Correct both the form and staging; leave explicit metadata from newer runners alone.
+        let composite_inputs = id == "composite_bands"
+            && pname == "inputs"
+            && p.get("io_role").is_none()
+            && p.get("data_kind").and_then(Value::as_str) == Some("string")
+            && schema.and_then(|s| s.get("kind")).and_then(Value::as_str) == Some("string");
+        let data = if composite_inputs { Data::Raster } else { Data::of(p.get("data_kind").and_then(Value::as_str).unwrap_or("")) };
         let role = match p.get("io_role").and_then(Value::as_str) {
+            None if composite_inputs => Role::Input,
             Some("input") => Role::Input,
             Some("output") => Role::Output,
             _ => Role::Option,
         };
-        let many = schema.and_then(|s| s.get("cardinality")).and_then(Value::as_str).is_some_and(|c| c != "single");
+        let many = composite_inputs || schema.and_then(|s| s.get("cardinality")).and_then(Value::as_str).is_some_and(|c| c != "single");
         let optional = !p.get("required").and_then(Value::as_bool).unwrap_or(false);
         let default = defaults.and_then(|d| d.get(pname)).filter(|v| optional && !v.is_null()).cloned();
         meta.push(MetaParam { name: pname.to_string(), role, data, default });
-        // Outputs are written to a scratch folder and come back as layers: no form field.
+        // Outputs are written to a scratch folder and come back as layers: no field of their own
+        // (the one [`OUTPUT`] field below names the layers).
         if role == Role::Output {
             continue;
         }
@@ -293,6 +323,19 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
             help: leak(help),
         });
     }
+    // One optional field names the new layers. A tool with an option or input of its own called
+    // `output` keeps it, and its outputs keep the tool's name.
+    let names_outputs = meta.iter().any(|p| p.role == Role::Output) && !params.iter().any(|p| p.name == OUTPUT);
+    if names_outputs {
+        params.push(ParamSpec {
+            name: OUTPUT,
+            label: OUTPUT_LABEL,
+            kind: ParamKind::Text,
+            required: false,
+            default: "",
+            help: OUTPUT_HELP,
+        });
+    }
     let spec = ToolSpec {
         id: leak(format!("{PREFIX}{id}")),
         name: leak(name),
@@ -301,7 +344,8 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
         params: Box::leak(params.into_boxed_slice()),
         run: rustgis_analysis::external_placeholder,
     };
-    Some((spec, Meta { category, params: meta }))
+    let schema = spec.params;
+    Some((spec, Meta { schema, category, params: meta, names_outputs }))
 }
 
 /// `g` with every point converted by `f`, or `None` when a point can't be (rather than
@@ -527,6 +571,51 @@ fn option_value(v: &Value, data: Data) -> Value {
     }
 }
 
+/// Whether option value `v` is the manifest's default `d`. The form sends text, so a default that
+/// isn't text on a field shown as text comes back as its JSON (`[255,255,255,255]`, `false`).
+fn is_default(v: &Value, d: &Value, data: Data) -> bool {
+    option_value(d, data) == *v || (!d.is_string() && json_text(v).as_ref() == Some(d))
+}
+
+/// The JSON a text value spells (`"[255,255,255,255]"` gives the list), if it is text and reads.
+fn json_text(v: &Value) -> Option<Value> {
+    v.as_str().and_then(|t| serde_json::from_str(t).ok())
+}
+
+/// Immutable manifest metadata paired with one published analysis schema.
+#[derive(Clone)]
+pub struct ResolvedTool {
+    spec: &'static ToolSpec,
+    meta: Meta,
+}
+impl ResolvedTool {
+    /// Pairs a published analysis schema with metadata from that exact manifest load.
+    pub fn capture(spec: &'static ToolSpec) -> Result<Self, String> {
+        let id = spec.id.strip_prefix(PREFIX).ok_or("not a GeoLibre tool")?;
+        let meta =
+            META.lock().ok().and_then(|m| m.as_ref().and_then(|m| m.get(id)).cloned()).ok_or("the GeoLibre metadata is unavailable")?;
+        if !std::ptr::eq(meta.schema, spec.params) {
+            return Err("the GeoLibre metadata and analysis schema belong to different loads".into());
+        }
+        let pinned = Self { spec, meta };
+        pinned.check()?;
+        Ok(pinned)
+    }
+    /// Rejects a withdrawn or replaced schema before inputs or runner arguments are prepared.
+    pub fn check(&self) -> Result<(), String> {
+        if !rustgis_analysis::published_external_tools_of(SOURCE).iter().any(|spec| std::ptr::eq(spec, self.spec)) {
+            return Err("the GeoLibre tool schema was reloaded".into());
+        }
+        Ok(())
+    }
+    /// Preparation uses captured metadata, never another lookup by tool name.
+    /// Uses captured manifest metadata to prepare arguments; does not resolve the tool by name.
+    pub fn prepare(&self, inputs: &dyn Inputs, params: &Value) -> Result<Job, String> {
+        self.check()?;
+        prepare_with(self.spec, &self.meta, inputs, params)
+    }
+}
+
 /// Prepares a run of `spec` (a GeoLibre tool) on the map's layers, with `params` already
 /// resolved (defaults filled, required ones present: see `rustgis_analysis::resolve_params`).
 pub fn prepare(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<Job, String> {
@@ -536,22 +625,21 @@ pub fn prepare(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<J
     prepare_with(spec, &meta, inputs, params)
 }
 
+/// Validates input name lists before choosing a CRS or staging files, preserving their order.
 fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Value) -> Result<Job, String> {
     let id = spec.id.strip_prefix(PREFIX).ok_or("not a GeoLibre tool")?;
     let value_of = |name: &str| params.get(name).filter(|v| !v.is_null() && v.as_str() != Some(""));
-    let names = |v: &Value| -> Vec<String> {
-        v.as_str().map(|s| s.split(';').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()).unwrap_or_default()
-    };
+    let names = rustgis_analysis::layer_list;
 
     // Rasters set the coordinate system; otherwise the vector data's UTM zone.
     let mut raster_crs = Vec::new();
     let mut vector_extents = Vec::new();
     for p in meta.params.iter().filter(|p| p.role == Role::Input) {
-        for n in value_of(&p.name).map(names).unwrap_or_default() {
-            if let Some(r) = inputs.raster(&n) {
+        for n in value_of(&p.name).map(names).transpose()?.unwrap_or_default() {
+            if let Some(r) = inputs.raster(n) {
                 raster_crs.push(r.raster.crs);
-            } else if let Some(ds) = inputs.dataset(&n) {
-                vector_extents.push(ds.extent());
+            } else if let Some(ds) = inputs.dataset(n) {
+                vector_extents.push(ds.lonlat_extent());
             }
         }
     }
@@ -568,11 +656,14 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
     };
 
     let n_outputs = meta.params.iter().filter(|p| p.role == Role::Output).count();
+    let given = if meta.names_outputs { output_name(spec, params, &mut job.notes)? } else { None };
+    let base = given.as_deref().unwrap_or(spec.name);
+    let (mut renamed, mut shortened) = (Vec::new(), false);
     for p in &meta.params {
         match p.role {
             Role::Input => {
                 let Some(v) = value_of(&p.name) else { continue };
-                let files = names(v).iter().map(|n| stage(inputs, n, p.data, &tf, &mut job)).collect::<Result<Vec<_>, _>>()?;
+                let files = names(v)?.into_iter().map(|n| stage(inputs, n, p.data, &tf, &mut job)).collect::<Result<Vec<_>, _>>()?;
                 if !files.is_empty() {
                     job.args.push((p.name.clone(), Arg::Files(files)));
                 }
@@ -580,9 +671,21 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
             Role::Output => {
                 let file = format!("{}.{}", safe(&p.name), output_ext(p, meta));
                 job.args.push((p.name.clone(), Arg::Files(vec![FileRef::Work(file.clone())])));
-                let name =
-                    if n_outputs > 1 { format!("{} {}", spec.name, label_of(&p.name).to_lowercase()) } else { spec.name.to_string() };
-                job.outputs.push((file, name));
+                // Each output's own name after the one given, kept whole within the limit.
+                let suffix = if n_outputs > 1 { format!(" {}", label_of(&p.name).to_lowercase()) } else { String::new() };
+                let room = MAX_OUTPUT_NAME.saturating_sub(suffix.chars().count());
+                shortened |= given.is_some() && base.chars().count() > room;
+                let name: String = base.chars().take(room).chain(suffix.chars()).collect();
+                // A name a layer, a table or an earlier output of this run has gets a number, so two
+                // runs don't give two layers of one name. Said when it was the name given.
+                let taken = |n: &str| {
+                    inputs.dataset(n).is_some() || inputs.raster(n).is_some() || job.outputs.iter().any(|(_, o)| o.eq_ignore_ascii_case(n))
+                };
+                let free = numbered(base, &suffix, taken);
+                if given.is_some() && free != name {
+                    renamed.push(format!("'{name}' is now '{free}'"));
+                }
+                job.outputs.push((file, free));
             }
             Role::Option => {
                 let Some(v) = value_of(&p.name).map(|v| option_value(v, p.data)) else { continue };
@@ -590,14 +693,56 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
                 // own default, as when it runs alone. They can differ: `fill_depressions` lists
                 // a `flat_increment` of 0.0001 but, without one, picks a far smaller step that
                 // keeps flats draining (#237).
-                if p.default.as_ref().is_some_and(|d| option_value(d, p.data) == v) {
+                if p.default.as_ref().is_some_and(|d| is_default(&v, d, p.data)) {
                     continue;
                 }
                 job.args.push((p.name.clone(), Arg::Value(v)));
             }
         }
     }
+    // One notice per kind, with a count.
+    if !renamed.is_empty() {
+        job.notes.push(format!("{}: {} output name(s) in use already, so numbered: {}", spec.name, renamed.len(), renamed.join(", ")));
+    }
+    if shortened {
+        job.notes.push(format!("{}: the output name is cut to fit each output's own name within {MAX_OUTPUT_NAME} characters", spec.name));
+    }
     Ok(job)
+}
+
+/// The layer name given in [`OUTPUT`], trimmed, or `None` for the tool's own name. Cut to
+/// [`MAX_OUTPUT_NAME`] characters, which is said.
+fn output_name(spec: &ToolSpec, params: &Value, notes: &mut Vec<String>) -> Result<Option<String>, String> {
+    let name = match params.get(OUTPUT) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.trim(),
+        Some(_) => return Err(format!("{}: '{OUTPUT}' is the new layer's name and must be text", spec.name)),
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let n = name.chars().count();
+    if n > MAX_OUTPUT_NAME {
+        notes.push(format!("{}: the output name is cut from {n} to {MAX_OUTPUT_NAME} characters", spec.name));
+    }
+    Ok(Some(name.chars().take(MAX_OUTPUT_NAME).collect()))
+}
+
+/// `base` with `suffix` (one output's own name) after it, or, while `taken` claims that, the
+/// first with ` 2`, ` 3`… after the suffix that it doesn't. Each fits [`MAX_OUTPUT_NAME`]
+/// characters by cutting `base`, never the suffix or the number.
+fn numbered(base: &str, suffix: &str, taken: impl Fn(&str) -> bool) -> String {
+    let fit = |tail: &str| -> String {
+        let room = MAX_OUTPUT_NAME.saturating_sub(tail.chars().count());
+        base.chars().take(room).chain(tail.chars()).collect()
+    };
+    let mut name = fit(suffix);
+    let mut k = 1u64;
+    while taken(&name) {
+        k += 1;
+        name = fit(&format!("{suffix} {k}"));
+    }
+    name
 }
 
 /// Coordinates that can't be longitude/latitude (a tool kept the working coordinate system).
@@ -729,7 +874,7 @@ pub fn finish(job: &Job, files: &[(String, Vec<u8>)], lines: &[String], dir: Opt
     if layers.is_empty() && messages.is_empty() {
         messages.push(format!("{} finished without output", job.name));
     }
-    ToolResult { output: Output::Layers(layers), messages }
+    ToolResult { losses: Vec::new(), output: Output::Layers(layers), messages }
 }
 
 /// Runs a tool to completion: natively through the `geolibre` program; in the browser the
@@ -745,6 +890,22 @@ fn run(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<ToolResul
         let _ = job;
         Err(format!("{}: in the browser, run GeoLibre tools from the Tools pane", spec.name))
     }
+}
+
+/// Runs the immutable native choice supplied by the engine. Development-process bytes remain
+/// unsandboxed and unattested, exactly as for the ordinary runner.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_pinned(
+    tool: &ResolvedTool,
+    inputs: &dyn Inputs,
+    params: &Value,
+    pin: &runner::ResolvedRunner,
+    live: &dyn Fn() -> Result<(), String>,
+) -> Result<ToolResult, String> {
+    pin.check()?;
+    live()?;
+    let job = tool.prepare(inputs, params)?;
+    native::run_pinned(&job, pin, live)
 }
 
 #[cfg(test)]

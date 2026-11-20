@@ -281,7 +281,24 @@ impl FileBridge {
                 }
                 let entered = s.active_layer;
                 s.actor = Some(BRIDGE_ACTOR.to_string());
-                let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.handle(s, &call))).ok().flatten();
+                let access = if server.full_access {
+                    rustgis_engine::policy::AgentAccess::Full
+                } else if server.allow_access {
+                    rustgis_engine::policy::AgentAccess::Allow
+                } else {
+                    rustgis_engine::policy::AgentAccess::Refuse
+                };
+                let scope = rustgis_engine::policy::Scope::agent(
+                    access,
+                    true,
+                    BRIDGE_ACTOR,
+                    Some(BRIDGE_ACTOR.into()),
+                    Arc::new(BridgeLive(Arc::downgrade(&self.inner))),
+                );
+                let text =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.handle_scoped(s, &call, scope, Vec::new(), "bridge")))
+                        .ok()
+                        .flatten();
                 s.actor = None;
                 if s.active_layer != entered || (crate::relay::selects_layer(&call) && crate::relay::reply_ok(text.as_deref())) {
                     *lock(&self.inner.active) = s.active_layer;
@@ -372,6 +389,26 @@ fn write_atomic(dir: &Path, name: &str, text: &str) -> Result<(), String> {
     })
 }
 
+struct BridgeLive(std::sync::Weak<Inner>);
+impl rustgis_engine::policy::Revocation for BridgeLive {
+    fn allows(&self, e: rustgis_engine::policy::Effects) -> bool {
+        use rustgis_engine::policy::Effect;
+        let Some(inner) = self.0.upgrade() else {
+            return false;
+        };
+        if inner.stopped.load(SeqCst) {
+            return false;
+        }
+        if e.contains(Effect::Reserved) || e.contains(Effect::Automation) || e.contains(Effect::Replaces) {
+            return inner.full_access.load(SeqCst);
+        }
+        if e.contains(Effect::Files) || e.contains(Effect::Network) || e.contains(Effect::Plugin) {
+            return inner.allow_access.load(SeqCst) || inner.full_access.load(SeqCst);
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,7 +428,7 @@ mod tests {
                 return o;
             }
             assert!(Instant::now() < deadline, "the bridge never ran the command file");
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20)); // test-wait: legacy polling for the bridge command result
         }
     }
 
@@ -419,7 +456,7 @@ mod tests {
         assert_eq!(ready["command"], b.command_path().display().to_string());
         let mut s = sample();
         let (layers, undo) = (s.map().layers.len(), s.undo_depth());
-        std::thread::sleep(POLL * 2);
+        std::thread::sleep(POLL * 2); // test-wait: cross the bridge poll interval to check stale commands stay ignored
         assert!(b.poll(&mut s).is_none(), "the old command file ran");
 
         write_command(&b, "# two layers\nlayer.addSample {\"name\": \"countries\"}\nlayer.addSample {\"name\": \"cities\"}\n");
@@ -435,7 +472,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !b.inner.changed.load(SeqCst) {
             assert!(Instant::now() < deadline, "the change was never seen");
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(20)); // test-wait: legacy polling for the file-change flag
         }
         assert!(b.result_path().exists(), "kept until the run");
         assert!(run_next(&b, &mut s).success);
