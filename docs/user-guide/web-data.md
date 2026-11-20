@@ -35,6 +35,7 @@ them, and the network permission when a plugin does. `ui.dialog` opens a panel o
 | Source Cooperative… | Files on Source Cooperative | [Source Cooperative](#source-cooperative) |
 | STAC Search… | Any STAC API or static catalog | [STAC catalogs](#stac-catalogs) |
 | Vantor… | Vantor's (formerly Maxar's) disaster imagery | [Vantor](#vantor) |
+| Vantor Transform… | Imagery made from a collect on request (Transform API, Raster Analytics) | [Vantor Transform](#vantor-transform) |
 | France › IGN LiDAR HD… | IGN's LiDAR HD point clouds | [Web services](#web-services) |
 | United States › … | EnviroAtlas, FEMA NFHL, Tennessee GIS, The National Map, US Federal/State/Local GIS, USGS 3DEP DEM, USGS LiDAR, USGS NLDI | [United States](#united-states) |
 
@@ -606,6 +607,45 @@ needs its one-time code. `copernicus.status` says whether a sign-in is remembere
 
 ```sh
 rustgis-cli run --cmd 'copernicus.login={"username":"you@example.org","password":"…"}' --cmd 'layer.addUrl={"url":"https://download.dataspace.copernicus.eu/odata/v1/Products(…)/Nodes(…)/Nodes(….tif)/$value","cog":true,"bbox":[-43.0,-20.84,-42.75,-20.65]}'
+```
+
+## Vantor Transform
+
+**Home › Add › Web Data › Vantor Transform…** adds imagery that [Vantor](https://vantor.com)'s
+Transform API or Raster Analytics makes from a satellite collect on request: orthorectified,
+pan-sharpened or NDVI. Both need an account with Vantor. The image is a cloud-optimised GeoTIFF
+that can be tens of gigabytes: it is read in place, so the map reads only the part in view.
+
+Pick the **Service**, then the **Script** and the **Function** (hover a function for what it
+makes). The form lists that function's parameters, the required ones marked `*`: the collect's
+identifier, the coordinate system (`EPSG:3857`, the map's own, unless changed; `UTM` or another
+`EPSG:` code also works) and the options, each left to the service while it shows **Default**.
+**Add** adds the image as a layer named after the collect and the function, and zooms to it. The
+address it is asked for at is shown under the form.
+
+| Service | Its address | Its login |
+|---|---|---|
+| Transform API | `https://api.transform.satcloud.us/v1/ipe` | A Bearer token, sent in the `Authorization` header |
+| Raster Analytics | `https://api.maxar.com/analytics/v1/raster` | An API key, sent as the `maxar_api_key` parameter |
+
+Paste the token or the key and choose **Log In**. The pane keeps it as the login of a
+[saved connection](data.md#web-service-logins) at the service's address, which it makes the first
+time (**Vantor Transform API** or **Vantor Raster Analytics**, under **Data Sources ›
+Connections**). So the login is sent only to that address, lasts until RustGIS closes unless
+**Remember on this computer** is ticked, and is never in the project, the layer's address or the
+address shown: a project opened later asks for the login again. A token's expiry date is shown
+when the token says it; after that, paste a new one. **Address** takes another deployment of a
+service; a plain `http://` one needs its box ticked before a login is sent to it unencrypted.
+
+The services' ideal (sensor geometry) imagery isn't listed: it has no coordinate system to place
+it on the map. Any other address of a service can still be added with **Home › Add › Add Data ›
+From URL…**, which reads it through the same connection. From the command line, the same
+connection and login do it:
+
+```sh
+rustgis-cli run --cmd 'connection.new={"kind":"service","name":"Vantor Transform API","address":"https://api.transform.satcloud.us/v1/ipe","auth":"header","keyName":"Authorization"}' \
+  --cmd 'connection.login={"id":"Vantor Transform API","apiKey":"Bearer …"}' \
+  --cmd 'layer.addUrl={"url":"https://api.transform.satcloud.us/v1/ipe/ortho-with-overviews/geotiff?function=pansharp_ortho&p=collect_identifier=%22…%22&p=crs=%22EPSG%3A3857%22"}'
 ```
 
 ## Open-data portals

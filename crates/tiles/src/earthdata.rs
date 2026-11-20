@@ -346,7 +346,7 @@ pub fn expired_forgotten() -> bool {
 }
 
 /// A JWT's `exp` claim: its middle part, base64url-decoded, is JSON.
-fn jwt_expiry(token: &str) -> Option<i64> {
+pub(crate) fn jwt_expiry(token: &str) -> Option<i64> {
     let payload = token.split('.').nth(1)?;
     let v: Value = serde_json::from_slice(&base64url(payload)?).ok()?;
     v.get("exp")?.as_i64()

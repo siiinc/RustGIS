@@ -127,6 +127,7 @@ mod tilt_drape;
 mod tilt_settle;
 mod timebar;
 mod update;
+mod vantorui;
 mod vertexedit;
 mod webdataui;
 mod widgets;
@@ -952,6 +953,8 @@ pub struct UiState {
     pub earthaccess: earthaccessui::State,
     /// Copernicus Data Space: the sign-in being typed and what the last one said.
     pub copernicus: copernicusui::State,
+    /// Vantor Transform: the service, the image picked and its parameters, and the login typed.
+    pub vantor: vantorui::State,
     /// Add From Service › Sign in to ArcGIS.
     pub arcgis: arcgisui::State,
     /// USGS NLDI: the point traced, its COMID, the navigation and the request under way.
@@ -1133,6 +1136,7 @@ impl Default for UiState {
             session_log: Default::default(),
             earthaccess: Default::default(),
             copernicus: Default::default(),
+            vantor: Default::default(),
             arcgis: Default::default(),
             nldi: Default::default(),
             geocode: Default::default(),
