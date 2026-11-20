@@ -1144,8 +1144,14 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "layer.reloadData" => Command("ui.reloadData"),
         "ui.importShapefile" => Dialog("addShapefile"),
         "layer.definitionQuery" => PropertiesTab("query"),
-        "layer.symbology" | "raster.symbology" | "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.fillLayers"
-        | "layer.ramp" => Pane(RightPane::Symbology),
+        "layer.symbology"
+        | "raster.symbology"
+        | "layer.color"
+        | "layer.outline"
+        | "layer.lineStrokes"
+        | "layer.fillLayers"
+        | "layer.ramp"
+        | "layer.copySymbology" => Pane(RightPane::Symbology),
         "select.byAttributes" => Dialog("selectByAttributes"),
         "select.rows" => Command("table.open"),
         "edit.addField" => Dialog("addField"),

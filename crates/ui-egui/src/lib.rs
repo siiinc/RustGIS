@@ -117,6 +117,7 @@ mod spectralui;
 mod sqlbox;
 mod sqlpane;
 mod stacui;
+mod symbologycopy;
 mod table;
 mod textform;
 pub mod theme;

@@ -4542,7 +4542,8 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let g = l.geometry_type();
     let numeric: Vec<String> = l.dataset.fields.iter().filter(|f| f.ty.is_numeric()).map(|f| f.name.clone()).collect();
     let all: Vec<String> = l.dataset.fields.iter().map(|f| f.name.clone()).collect();
-    ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
+    // The name, with the menus that copy a symbology from or to another layer beside it.
+    crate::symbologycopy::heading(app, ui, &l, t);
     ui.add_space(6.0);
     ui.label(egui::RichText::new(tl!("Primary symbology")).size(11.5).color(t.text_dim));
     let kinds: Vec<(&str, &str)> = if g == GeometryType::Point {
@@ -7161,7 +7162,7 @@ fn rgb_stretch_bounds(app: &mut RustGisApp, ui: &mut Ui, layer: impl std::hash::
 }
 
 fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
-    ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
+    crate::symbologycopy::heading(app, ui, l, t);
     let Some(rl) = l.raster.clone() else { return };
     let Some(d) = rl.data.clone() else {
         // Read in place, its overview is on its way until it lands, or fails (as Details says).

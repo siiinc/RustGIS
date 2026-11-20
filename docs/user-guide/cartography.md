@@ -433,6 +433,53 @@ Scales in RustGIS take a screen pixel to be 0.28 mm (the OGC standard pixel). Pr
 96 pixels to the inch (0.2646 mm) call the same view a larger scale; to match their sizes,
 multiply their reference scale by 0.2646 / 0.28 (about 0.945).
 
+### Copy symbology between layers
+
+**Copy From**, beside the layer's name at the top of the Symbology pane, draws the layer in the
+pane as another layer of the map is drawn; **Copy To**, next to it, draws another layer as this
+one is. Either is one Undo step, which gives the layer its own symbology back.
+
+A layer takes another's symbology only when it has what that symbology reads:
+
+- Both are feature layers, or both are rasters. A graphics layer and a table take none.
+- Feature layers have the same geometry type (point, line or polygon), and every field the
+  symbology reads is in the layer taking it under the same name (case aside): the field of Unique
+  Values, Graduated Colors or Proportional Symbols; the fields of marker rotation, size by field
+  and a diagram; and each field an expression names (Unique Values by expression, By Expression).
+  A field read as a number must be a number there (Long or Double). A Unique Values field, and a
+  field an expression names, must be of the same type in both layers, Long and Double counting as
+  one: classes match values as they print, so a class made from the number 3 doesn't match a
+  date or the text `03`.
+- A raster has every band the symbology draws, a color table of its own for Colormap, and whole
+  numbers (at most 256 distinct values) in the band for Unique Values.
+
+Each menu lists the map's other layers: those that fit first, then the rest switched off, each
+with the reason under its name (a field it lacks, a type that differs, a band it hasn't). The
+command refuses the same layers with the same reason, and never copies in part.
+
+What is copied is what the Symbology pane sets: the renderer with its classes, colors and legend
+labels, the stacked strokes and fills, No Fill, marker rotation, size by field, the By Expression
+settings, the diagram, the reference scale and transparency; for a raster, the renderer, stretch,
+dynamic range adjustment, resampling, brightness, contrast and gamma, masked values and
+transparency. Labels, the visibility range, blend, masking, display filters and the definition
+query stay each layer's own, and so does the angle a raster is turned by. A setting kept without
+being drawn (a size by field under a single symbol) is neither needed nor copied.
+
+Classes, size ranges, a custom stretch's bounds and masked values are copied as they are, so the
+two layers share one legend and can be compared; they aren't worked out again from the values of
+the layer taking them. A value outside the copied Unique Values classes draws as
+`<all other values>`, and one outside the Graduated Colors range in its first or last class:
+choose the field again in the Symbology pane to class the layer's own values.
+
+By command, naming layers by name or id (`layer` is the selected layer when left out):
+
+```text
+layer.copySymbology={"layer":"Parcels 2024","from":"Parcels 2020"}
+```
+
+In Python, `from` is a reserved word, so give the parameters as a dict:
+`s.run("layer.copySymbology", {"layer": "Parcels 2024", "from": "Parcels 2020"})`.
+
 ### Custom color ramps
 
 Besides the built-in color schemes, a project can hold your own color ramps: an organization's

@@ -58,6 +58,7 @@ pub mod sql;
 pub mod stac;
 pub mod stac_area;
 pub mod stac_bands;
+pub mod symbology_copy;
 pub mod table_stats;
 pub(crate) mod terrain_blocks;
 pub mod tile_export;
@@ -93,6 +94,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(diagram::commands());
     v.extend(group::commands());
     v.extend(layer_copy::commands());
+    v.extend(symbology_copy::commands());
     v.extend(raster::commands());
     v.extend(repair::commands());
     v.extend(zarr::commands());

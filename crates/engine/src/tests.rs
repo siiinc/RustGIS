@@ -6373,6 +6373,9 @@ fn hostile_params_never_panic(shard: usize) {
         // A sign-in past its username: a password of the wrong type is refused before any request.
         json!({"username": "junk@example.invalid", "password": 7, "totp": []}),
         json!({"username": "junk@example.invalid", "password": "", "totp": "x"}),
+        // A symbology copied: from a layer of another geometry, and from what names no layer.
+        json!({"layer": "Cities", "from": "Countries"}),
+        json!({"layer": "Countries", "from": {"name": "Lakes"}, "row": -1}),
     ];
     let ids: Vec<&str> = Session::new(Project::default())
         .registry
