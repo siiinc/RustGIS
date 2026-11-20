@@ -7,6 +7,10 @@
 //! same loop works on the desktop and in the browser, where nothing may wait: the fetching is the
 //! app's (installed with [`set_fetcher`]; this crate does no networking).
 //!
+//! A [`Remote`] can also hold whole answers to queries of the same service (an ArcGIS layer read a
+//! view at a time, [`super::arcgis`]): a read asks for each by its address, and [`drive`] fetches
+//! the missing ones in the same rounds as missing bytes.
+//!
 //! Readers plan ahead (a FlatGeobuf index level, the column chunks of a GeoParquet read) so a read
 //! takes a few rounds, not one per missing piece. Files are hostile input: what a read may hold is
 //! bounded, and a read that keeps needing more stops after [`MAX_ROUNDS`].
@@ -34,12 +38,93 @@ pub const MAX_ROUNDS: usize = 48;
 const ROUND_BUDGET: u64 = READ_BUDGET.saturating_mul(2);
 /// Files kept, with what was fetched of them.
 const MAX_FILES: usize = 32;
+/// The most bytes of whole answers one [`Remote`] keeps (least recently used ones are dropped past
+/// it): a layer read by its query address, as [`KEEP`] bounds a file's parts, for each of up to
+/// [`MAX_FILES`] addresses kept. Small in tests, so that they can fill it.
+pub const KEEP_ANSWERS: usize = if cfg!(test) {
+    2 << 20
+} else if cfg!(target_arch = "wasm32") {
+    96 << 20
+} else {
+    256 << 20
+};
+/// The most bytes one answer may have ([`Want::Upto`]).
+pub const MAX_ANSWER: u64 = if cfg!(test) {
+    64 << 10
+} else if cfg!(target_arch = "wasm32") {
+    4 << 20
+} else {
+    8 << 20
+};
+/// The most answers one round of a read asks for: the rest are asked for by the next round.
+pub const ROUND_ANSWERS: usize = if cfg!(target_arch = "wasm32") { 12 } else { 16 };
+// A read holds at most half of what a service keeps (`arcgis`), and a round's answers at their
+// largest fit the other half: what a read needs at once is never pushed out by its own answers.
+const _: () = assert!((ROUND_ANSWERS as u64) * MAX_ANSWER <= (KEEP_ANSWERS as u64) / 2);
+const _: () = assert!((ROUND_ANSWERS as u64) * MAX_ANSWER <= ROUND_BUDGET);
 
 /// The error of a read that needs bytes not fetched yet (it is run again once they are).
 pub const NEED: &str = "waiting for the file's bytes";
+/// The error of an answer larger than [`MAX_ANSWER`] ([`Remote::answer`]): the read asks for a
+/// smaller one (see [`is_too_large`]).
+pub const TOO_LARGE: &str = "the answer is larger than an answer may be";
+
+/// Whether `e` says an answer was larger than [`MAX_ANSWER`] ([`TOO_LARGE`]).
+pub fn is_too_large(e: &DataError) -> bool {
+    matches!(e, DataError::Format(m) if m == TOO_LARGE)
+}
+
 /// Starts the error of a file that can't be read in place (no spatial index, no bounding-box
 /// covering, a server without ranges): it is downloaded whole instead.
 pub const READ_WHOLE: &str = "can't be read in place";
+
+/// An owned, principal-free predicate for a claimed deferred request.
+pub type Still = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+thread_local! { static STILL: std::cell::RefCell<Option<Still>> = const { std::cell::RefCell::new(None) }; }
+/// Clones synchronous request context before a worker or browser future is scheduled.
+pub fn current_still() -> Option<Still> {
+    STILL.with(|s| s.borrow().clone())
+}
+/// The guard is synchronous. Never hold it across an await.
+pub fn with_still<T>(still: Still, f: impl FnOnce() -> T) -> T {
+    with_optional_still(Some(still), f)
+}
+/// Re-enters captured context synchronously, including around follow-on callbacks.
+pub fn with_optional_still<T>(still: Option<Still>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Still>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STILL.with(|s| *s.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = current_still();
+    let combined = match (previous.clone(), still) {
+        (Some(a), Some(b)) => Some(std::sync::Arc::new(move || a() && b()) as Still),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
+    STILL.with(|s| *s.borrow_mut() = combined);
+    let _restore = Restore(previous);
+    f()
+}
+/// Hands a shared I/O completion to an independently captured request, restoring the current
+/// scope afterwards. Use only at that callback boundary; nested work uses [`with_optional_still`]
+/// to inherit restrictions. This synchronous guard must never cross an await.
+pub fn with_captured_still<T>(still: Option<Still>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Still>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STILL.with(|s| *s.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(STILL.with(|s| s.replace(still)));
+    f()
+}
+
+/// Checked immediately before a request-producing stage, without suspension before sending.
+pub fn check_still(still: &Option<Still>) -> std::result::Result<(), String> {
+    if still.as_ref().is_some_and(|s| !s()) { Err("request cancelled before it was sent".into()) } else { Ok(()) }
+}
 
 /// A request for part of a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +135,8 @@ pub enum Want {
     Tail(u64),
     /// The whole file: one that can't be read in place ([`READ_WHOLE`]), downloaded instead.
     Whole,
+    /// The whole answer to a query ([`Remote::answer`]), refused past this many bytes.
+    Upto(u64),
 }
 
 /// Why a fetch brought no bytes.
@@ -61,6 +148,9 @@ pub enum Failed {
     PastEnd,
     /// The server doesn't answer byte-range requests: the file is downloaded whole instead.
     NoRanges,
+    /// The download is larger than its limit (an answer past [`Want::Upto`], which a read asks
+    /// for again smaller), with the fetcher's message.
+    TooLarge(String),
     /// Anything else, with its message.
     Other(String),
 }
@@ -86,6 +176,27 @@ pub fn can_fetch() -> bool {
 
 /// Fetches a whole file through the installed fetcher (a file that can't be read in place).
 pub fn fetch_whole(url: &str, done: Done) {
+    let still = current_still();
+    if let Err(e) = check_still(&still) {
+        done(Err(Failed::Other(e)));
+        return;
+    }
+    let context = still.clone();
+    let done: Done = Box::new(move |r| {
+        with_optional_still(context.clone(), || {
+            done(check_still(&context).map_err(Failed::Other).and(r));
+        })
+    });
+    if let Err(error) = crate::login_address::check(url) {
+        done(Err(Failed::Other(error.into())));
+        return;
+    }
+    let done: Done = if crate::login_address::is_wrapper(url) {
+        let address = url.to_string();
+        Box::new(move |r| done(crate::login_address::check(&address).map_err(|e| Failed::Other(e.into())).and(r)))
+    } else {
+        done
+    };
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
     match f {
         Some(f) => f(url, Want::Whole, done),
@@ -96,6 +207,13 @@ pub fn fetch_whole(url: &str, done: Done) {
 struct Piece {
     bytes: Arc<Vec<u8>>,
     used: u64,
+}
+
+/// What a round fetches: part of the file, or the whole answer to a query of the same service.
+#[derive(Clone)]
+enum Job {
+    Part(Want),
+    Answer(String),
 }
 
 #[derive(Default)]
@@ -113,7 +231,17 @@ struct Store {
     missing: Vec<(u64, u64, u64, bool)>,
     /// The last bytes reads found missing: (the read's drive, how many).
     missing_tail: Vec<(u64, u64)>,
+    /// Whole answers held, by their address ([`Remote::answer`]).
+    answers: std::collections::HashMap<String, Piece>,
+    answers_held: usize,
+    /// Answers reads found missing: (the read's drive, the address).
+    missing_answers: Vec<(u64, String)>,
+    /// Addresses whose answers were larger than [`MAX_ANSWER`], at most [`MAX_TOO_LARGE`].
+    too_large: std::collections::HashSet<String>,
 }
+
+/// The most addresses of answers too large a [`Remote`] remembers (all are forgotten past it).
+const MAX_TOO_LARGE: usize = 1024;
 
 thread_local! {
     /// The drive whose read runs on this thread (0: none), so each drive fetches what its own
@@ -148,7 +276,7 @@ pub struct Remote {
 
 impl std::fmt::Debug for Remote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Remote").field("url", &self.url).finish_non_exhaustive()
+        f.debug_struct("Remote").field("url", &crate::login_address::inner(&self.url)).finish_non_exhaustive()
     }
 }
 
@@ -185,6 +313,7 @@ impl Remote {
     }
 
     fn get(&self, at: u64, len: u64, exact: bool) -> Option<bytes::Bytes> {
+        crate::login_address::check(&self.url).ok()?;
         let mut s = self.lock();
         let len = match s.end {
             Some(end) if at >= end => return Some(bytes::Bytes::new()),
@@ -216,6 +345,7 @@ impl Remote {
     /// Bytes from `at` to the end of the held piece that holds `at` (a column chunk read in
     /// pages), or `None` (noted as missing, `want` bytes from there).
     pub fn from(&self, at: u64, want: u64) -> Option<bytes::Bytes> {
+        crate::login_address::check(&self.url).ok()?;
         let mut s = self.lock();
         s.tick += 1;
         let tick = s.tick;
@@ -244,6 +374,7 @@ impl Remote {
     /// The file's last `n` bytes (all of it when it's shorter), and whether that is the whole
     /// file; `None` when they aren't held (noted as missing).
     pub fn tail(&self, n: u64) -> Option<(Arc<Vec<u8>>, bool)> {
+        crate::login_address::check(&self.url).ok()?;
         let mut s = self.lock();
         match &s.tail {
             Some((t, whole)) if *whole || t.len() as u64 >= n => Some((t.clone(), *whole)),
@@ -257,7 +388,100 @@ impl Remote {
     /// Whether a read found something missing.
     pub fn is_missing(&self) -> bool {
         let s = self.lock();
-        !s.missing.is_empty() || !s.missing_tail.is_empty()
+        !s.missing.is_empty() || !s.missing_tail.is_empty() || !s.missing_answers.is_empty()
+    }
+
+    /// The whole answer to `url`, a query of the same service (the same origin, and the same login
+    /// when the address is bound to one), or `None` when it isn't held (it is then noted as
+    /// missing). An address of another origin is refused.
+    pub fn answer(&self, url: &str) -> Result<Option<Arc<Vec<u8>>>> {
+        self.same_service(url)?;
+        crate::login_address::check(url).map_err(|e| DataError::Format(e.into()))?;
+        let mut s = self.lock();
+        s.tick += 1;
+        let tick = s.tick;
+        if let Some(a) = s.answers.get_mut(url) {
+            a.used = tick;
+            return Ok(Some(a.bytes.clone()));
+        }
+        if s.too_large.contains(url) {
+            return Err(DataError::Format(TOO_LARGE.into()));
+        }
+        s.missing_answers.push((drive_now(), url.to_string()));
+        Ok(None)
+    }
+
+    /// Remembers that the answer to `url` was larger than [`MAX_ANSWER`].
+    fn note_too_large(&self, url: &str) {
+        let mut s = self.lock();
+        if s.too_large.len() >= MAX_TOO_LARGE {
+            s.too_large.clear();
+        }
+        s.too_large.insert(url.to_string());
+    }
+
+    /// Drops a held answer (one that couldn't be read, so a later read asks for it again).
+    pub fn forget_answer(&self, url: &str) {
+        let mut s = self.lock();
+        if let Some(a) = s.answers.remove(url) {
+            s.answers_held = s.answers_held.saturating_sub(a.bytes.len());
+        }
+    }
+
+    /// Refuses an address that isn't a query of this service: answers are fetched with the
+    /// service's login, so they must go nowhere else.
+    fn same_service(&self, url: &str) -> Result<()> {
+        let mine = crate::login_address::origin(&self.url);
+        if mine.is_some()
+            && mine == crate::login_address::origin(url)
+            && crate::login_address::is_wrapper(url) == crate::login_address::is_wrapper(&self.url)
+        {
+            Ok(())
+        } else {
+            Err(DataError::Format(crate::diagnostics::message_with_address(&self.url, "a query of another service was asked for")))
+        }
+    }
+
+    /// The answers this drive's reads found missing, each once, at most [`ROUND_ANSWERS`]: the
+    /// rest are found missing again by the next run. Forgets them.
+    fn take_missing_answers(&self, drive: u64) -> Vec<String> {
+        let mut s = self.lock();
+        let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut s.missing_answers).into_iter().partition(|m| m.0 == drive);
+        s.missing_answers = others.into_iter().filter(|m| m.0 != 0).collect();
+        let mut out: Vec<String> = Vec::new();
+        for (_, url) in mine {
+            if out.len() == ROUND_ANSWERS {
+                break;
+            }
+            if !out.contains(&url) {
+                out.push(url);
+            }
+        }
+        out
+    }
+
+    /// Keeps the whole answer to `url`, dropping the least recently used others past
+    /// [`KEEP_ANSWERS`].
+    fn insert_answer(&self, url: &str, bytes: Vec<u8>) {
+        if crate::login_address::check(&self.url).is_err() || crate::login_address::check(url).is_err() {
+            return;
+        }
+        let mut s = self.lock();
+        s.tick += 1;
+        let tick = s.tick;
+        let len = bytes.len();
+        if let Some(old) = s.answers.insert(url.to_string(), Piece { bytes: Arc::new(bytes), used: tick }) {
+            s.answers_held = s.answers_held.saturating_sub(old.bytes.len());
+        }
+        s.answers_held = s.answers_held.saturating_add(len);
+        while s.answers_held > KEEP_ANSWERS {
+            let Some(old) = s.answers.iter().filter(|(u, _)| u.as_str() != url).min_by_key(|(_, a)| a.used).map(|(u, _)| u.clone()) else {
+                break;
+            };
+            if let Some(a) = s.answers.remove(&old) {
+                s.answers_held = s.answers_held.saturating_sub(a.bytes.len());
+            }
+        }
     }
 
     /// The requests that fetch what reads found missing: rounded out, merged and split into
@@ -308,6 +532,9 @@ impl Remote {
     /// Keeps fetched bytes `at..`: merged with the parts they meet. A piece shorter than asked
     /// for (`asked`) ends the file.
     fn insert(&self, at: u64, asked: u64, bytes: Vec<u8>) {
+        if crate::login_address::check(&self.url).is_err() {
+            return;
+        }
         let mut s = self.lock();
         if (bytes.len() as u64) < asked {
             let end = at.saturating_add(bytes.len() as u64);
@@ -359,6 +586,9 @@ impl Remote {
 
     /// Keeps a file's last `asked` bytes: fewer is the whole file.
     fn insert_tail(&self, asked: u64, bytes: Vec<u8>) {
+        if crate::login_address::check(&self.url).is_err() {
+            return;
+        }
         let whole = (bytes.len() as u64) < asked;
         let bytes = Arc::new(bytes);
         {
@@ -410,6 +640,12 @@ pub fn need() -> DataError {
     DataError::Format(NEED.into())
 }
 
+/// A refused native view needs geometry matching before sampling, but that scan cannot fit.
+/// Returning a partial sample here could wrongly make a nonempty view look empty.
+pub(crate) fn view_budget() -> DataError {
+    DataError::Format("the requested view can't be bounded in the file's coordinate system, and matching it would exceed the remote read budget; download the file or choose a smaller view".into())
+}
+
 /// Runs `work` until it needs nothing it hasn't got: each run that finds bytes missing fetches
 /// them (in one round of requests) and runs again. `done` gets the last run's result. Off the
 /// caller's thread: the rounds run as the fetches land.
@@ -419,33 +655,66 @@ pub fn drive<T: Send + 'static>(
     done: Box<dyn FnOnce(Result<T>) + Send>,
 ) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    step(remote, work, done, NEXT.fetch_add(1, Ordering::Relaxed), 0);
+    step(remote, work, done, NEXT.fetch_add(1, Ordering::Relaxed), 0, current_still());
 }
 
+/// Re-enters the owned synchronous carrier for each read round, including callbacks on another thread.
 fn step<T: Send + 'static>(
     remote: Arc<Remote>,
     work: Arc<dyn Fn() -> Result<T> + Send + Sync>,
     done: Box<dyn FnOnce(Result<T>) + Send>,
     drive: u64,
     rounds: usize,
+    still: Option<Still>,
 ) {
+    with_optional_still(still.clone(), || step_in(remote, work, done, drive, rounds, still));
+}
+
+/// Checks before reading, sending each new range, accepting bytes and starting another round.
+fn step_in<T: Send + 'static>(
+    remote: Arc<Remote>,
+    work: Arc<dyn Fn() -> Result<T> + Send + Sync>,
+    done: Box<dyn FnOnce(Result<T>) + Send>,
+    drive: u64,
+    rounds: usize,
+    still: Option<Still>,
+) {
+    if let Err(e) = check_still(&still) {
+        done(Err(DataError::Format(e)));
+        return;
+    }
+    if let Err(error) = crate::login_address::check(remote.url()) {
+        done(Err(DataError::Format(error.into())));
+        return;
+    }
     let r = {
         let _running = Running::enter(drive);
         work()
     };
+    if let Err(error) = crate::login_address::check(remote.url()) {
+        done(Err(DataError::Format(error.into())));
+        return;
+    }
     let wants = remote.take_missing(drive);
-    if wants.is_empty() {
-        done(r);
+    let answers = remote.take_missing_answers(drive);
+    if wants.is_empty() && answers.is_empty() {
+        done(check_still(&still).map_err(DataError::Format).and(r));
         return;
     }
     // Readers plan within READ_BUDGET; a round asking for far more is a hostile file's offsets.
     let asked: u64 = wants.iter().map(|w| if let Want::Range(a, b) = w { b - a } else { 0 }).fold(0, u64::saturating_add);
     if asked > ROUND_BUDGET {
-        done(Err(DataError::Format(format!("{}: a read asked for {} MB of the file at once", remote.url, asked >> 20))));
+        done(Err(DataError::Format(crate::diagnostics::message_with_address(
+            &remote.url,
+            &format!("a read asked for {} MB of the file at once", asked >> 20),
+        ))));
         return;
     }
     if rounds >= MAX_ROUNDS {
-        done(Err(DataError::Format(format!("{}: still needed more of the file after {MAX_ROUNDS} rounds of reading", remote.url))));
+        done(Err(DataError::Format(crate::diagnostics::message_with_address(
+            &remote.url,
+            &format!("still needed more of the file after {MAX_ROUNDS} rounds of reading"),
+        ))));
         return;
     }
     let Some(fetch) = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone() else {
@@ -458,45 +727,65 @@ fn step<T: Send + 'static>(
         failed: Option<String>,
         done: Option<Box<dyn FnOnce(Result<T>) + Send>>,
     }
-    let round = Arc::new(Mutex::new(Round { left: wants.len(), failed: None, done: Some(done) }));
-    for w in wants {
+    let jobs: Vec<Job> = wants.into_iter().map(Job::Part).chain(answers.into_iter().map(Job::Answer)).collect();
+    let round = Arc::new(Mutex::new(Round { left: jobs.len(), failed: None, done: Some(done) }));
+    for job in jobs {
         let (remote2, work2, round2) = (remote.clone(), work.clone(), round.clone());
+        let landed_job = job.clone();
+        let context = still.clone();
         let landed: Done = Box::new(move |res| {
-            match (w, res) {
-                (Want::Range(a, b), Ok(bytes)) => remote2.insert(a, b - a, bytes),
-                (Want::Tail(n), Ok(bytes)) => remote2.insert_tail(n, bytes),
-                // (Reads ask for ranges and tails; a whole file is all of its bytes from the start.)
-                (Want::Whole, Ok(bytes)) => remote2.insert(0, bytes.len() as u64, bytes),
-                // A request dropped unfetched (the view moved on) is asked for again next round.
-                (_, Err(Failed::Dropped)) => {}
-                // A range past the end of the file.
-                (Want::Range(a, b), Err(Failed::PastEnd)) => remote2.insert(a, b - a, Vec::new()),
-                (_, Err(e)) => {
-                    let e = match e {
-                        Failed::NoRanges => format!("the server doesn't answer byte-range requests ({READ_WHOLE})"),
-                        Failed::PastEnd => "the last bytes asked for past the end of the file".into(),
-                        Failed::Dropped => "the request was dropped".into(),
-                        Failed::Other(e) => e,
-                    };
-                    let mut r = round2.lock().unwrap_or_else(|e| e.into_inner());
-                    r.failed.get_or_insert(e);
-                }
-            }
-            let next = {
-                let mut r = round2.lock().unwrap_or_else(|e| e.into_inner());
-                r.left = r.left.saturating_sub(1);
-                if r.left == 0 { Some((r.done.take(), r.failed.take())) } else { None }
-            };
-            if let Some((Some(done), failed)) = next {
-                match failed {
-                    Some(e) => {
-                        done(Err(DataError::Format(if e.starts_with(remote2.url()) { e } else { format!("{}: {e}", remote2.url()) })))
+            with_optional_still(context.clone(), || {
+                let res = check_still(&context).map_err(Failed::Other).and(res);
+                match (&landed_job, res) {
+                    (Job::Part(Want::Range(a, b)), Ok(bytes)) => remote2.insert(*a, b - a, bytes),
+                    (Job::Part(Want::Tail(n)), Ok(bytes)) => remote2.insert_tail(*n, bytes),
+                    // (Reads ask for ranges and tails; a whole file is all of its bytes from the start.)
+                    (Job::Part(Want::Whole | Want::Upto(_)), Ok(bytes)) => remote2.insert(0, bytes.len() as u64, bytes),
+                    (Job::Answer(url), Ok(bytes)) => remote2.insert_answer(url, bytes),
+                    // Said to the read by `Remote::answer`, which asks for a smaller one.
+                    (Job::Answer(url), Err(Failed::TooLarge(_))) => remote2.note_too_large(url),
+                    // A request dropped unfetched (the view moved on) is asked for again next round.
+                    (_, Err(Failed::Dropped)) => {}
+                    // A range past the end of the file.
+                    (Job::Part(Want::Range(a, b)), Err(Failed::PastEnd)) => remote2.insert(*a, b - a, Vec::new()),
+                    (_, Err(e)) => {
+                        let e = match e {
+                            Failed::NoRanges => format!("the server doesn't answer byte-range requests ({READ_WHOLE})"),
+                            Failed::PastEnd => "the last bytes asked for past the end of the file".into(),
+                            Failed::Dropped => "the request was dropped".into(),
+                            Failed::TooLarge(e) => e,
+                            Failed::Other(e) => e,
+                        };
+                        let mut r = round2.lock().unwrap_or_else(|e| e.into_inner());
+                        r.failed.get_or_insert(e);
                     }
-                    None => step(remote2, work2, done, drive, rounds + 1),
                 }
-            }
+                let next = {
+                    let mut r = round2.lock().unwrap_or_else(|e| e.into_inner());
+                    r.left = r.left.saturating_sub(1);
+                    if r.left == 0 { Some((r.done.take(), r.failed.take())) } else { None }
+                };
+                if let Some((Some(done), failed)) = next {
+                    match failed {
+                        Some(e) => done(Err(DataError::Format(crate::diagnostics::message_with_address(remote2.url(), &e)))),
+                        None => step(remote2, work2, done, drive, rounds + 1, context),
+                    }
+                }
+            })
         });
-        fetch(&remote.url, w, landed);
+        match (check_still(&still), &job) {
+            (Err(e), _) => landed(Err(Failed::Other(e))),
+            (Ok(()), Job::Part(w)) => fetch(&remote.url, *w, landed),
+            // Asked for by a read through `Remote::answer`, which keeps it to this service.
+            (Ok(()), Job::Answer(url)) => match remote
+                .same_service(url)
+                .map_err(|e| e.to_string())
+                .and_then(|()| crate::login_address::check(url).map_err(String::from))
+            {
+                Ok(()) => fetch(url, Want::Upto(MAX_ANSWER), landed),
+                Err(e) => landed(Err(Failed::Other(e))),
+            },
+        }
     }
 }
 
@@ -513,7 +802,7 @@ pub fn drive_blocking<T: Send + 'static>(remote: Arc<Remote>, work: Arc<dyn Fn()
         }),
     );
     rx.recv_timeout(std::time::Duration::from_secs(120))
-        .unwrap_or_else(|_| Err(DataError::Format(format!("{url}: no answer in two minutes"))))
+        .unwrap_or_else(|_| Err(DataError::Format(crate::diagnostics::message_with_address(&url, "no answer in two minutes"))))
 }
 
 /// A file by its address, read and seeked through what is held of it: a read of bytes not held
@@ -598,16 +887,62 @@ pub(crate) mod testing {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    pub(crate) static LOGIN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    pub(crate) fn validate_login(address: &str) -> std::result::Result<(), &'static str> {
+        let binding = crate::login_address::parse(address)?.map(|b| b.binding);
+        if binding == Some("ffffffffffffffff") && !LOGIN_ACTIVE.load(Ordering::Acquire) {
+            Err("The service login is no longer active.")
+        } else {
+            Ok(())
+        }
+    }
+
     fn served() -> &'static Mutex<HashMap<String, (Arc<Vec<u8>>, Arc<AtomicUsize>)>> {
         static S: OnceLock<Mutex<HashMap<String, (Arc<Vec<u8>>, Arc<AtomicUsize>)>>> = OnceLock::new();
         S.get_or_init(Mutex::default)
+    }
+
+    /// Answers computed from the address, for addresses starting with a prefix (a service).
+    type Handler = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
+    fn handlers() -> &'static Mutex<Vec<(String, Handler)>> {
+        static H: OnceLock<Mutex<Vec<(String, Handler)>>> = OnceLock::new();
+        H.get_or_init(Mutex::default)
     }
 
     /// Serves `bytes` at `url` (by range); returns the count of bytes sent.
     pub(crate) fn serve(url: &str, bytes: Vec<u8>) -> Arc<AtomicUsize> {
         let sent = Arc::new(AtomicUsize::new(0));
         served().lock().unwrap_or_else(|e| e.into_inner()).insert(url.to_string(), (Arc::new(bytes), sent.clone()));
+        install();
+        sent
+    }
+
+    /// Answers every address starting with `prefix` with what `answer` makes of it (`None`: HTTP
+    /// 404), whole.
+    pub(crate) fn handle(prefix: &str, answer: impl Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static) {
+        handlers().lock().unwrap_or_else(|e| e.into_inner()).push((prefix.to_string(), Arc::new(answer)));
+        install();
+    }
+
+    /// The one fetcher every test installs, so tests running at once serve each other's files.
+    fn install() {
         set_fetcher(|url, w, done| {
+            let handler = handlers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|(p, _)| url.starts_with(p.as_str()))
+                .map(|(_, h)| h.clone());
+            if let Some(h) = handler {
+                let answer = h(url).ok_or_else(|| Failed::Other("HTTP 404".into()));
+                done(match (w, answer) {
+                    (Want::Upto(n), Ok(a)) if a.len() as u64 > n => Err(Failed::TooLarge("the answer is too large".into())),
+                    (_, answer) => answer,
+                });
+                return;
+            }
             let file = served().lock().unwrap_or_else(|e| e.into_inner()).get(url).cloned();
             let Some((f, sent)) = file else {
                 done(Err(Failed::Other("HTTP 404".into())));
@@ -623,17 +958,43 @@ pub(crate) mod testing {
                 Want::Range(a, b) => f.get(a as usize..(b as usize).min(f.len())).map(<[u8]>::to_vec).unwrap_or_default(),
                 Want::Tail(n) => f.get(f.len().saturating_sub(n as usize)..).map(<[u8]>::to_vec).unwrap_or_default(),
                 Want::Whole => f.to_vec(),
+                Want::Upto(n) if f.len() as u64 > n => {
+                    done(Err(Failed::TooLarge("the answer is too large".into())));
+                    return;
+                }
+                Want::Upto(_) => f.to_vec(),
             };
             sent.fetch_add(r.len(), Ordering::Relaxed);
             done(Ok(r));
         });
-        sent
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_ranges_and_late_publications_are_revoked() {
+        crate::login_address::set_validator(testing::validate_login);
+        let address = crate::login_address::bind("ffffffffffffffff", "https://revoked.test", "https://revoked.test/file.fgb").unwrap();
+        let remote = Remote::new(&address);
+        remote.insert(0, 4, b"body".to_vec());
+        remote.insert_tail(4, b"tail".to_vec());
+        assert_eq!(remote.bytes(0, 4).unwrap().as_ref(), b"body");
+        assert!(remote.tail(4).is_some());
+        testing::LOGIN_ACTIVE.store(false, Ordering::Release);
+        assert!(remote.bytes(0, 4).is_none());
+        assert!(remote.from(0, 4).is_none());
+        assert!(remote.tail(4).is_none());
+        remote.insert(4, 4, b"late".to_vec());
+        remote.insert_tail(4, b"late".to_vec());
+        assert_eq!(remote.lock().held, 4);
+        assert_eq!(remote.lock().tail.as_ref().unwrap().0.as_slice(), b"tail");
+        let replacement = crate::login_address::bind("eeeeeeeeeeeeeeee", "https://revoked.test", "https://revoked.test/file.fgb").unwrap();
+        assert!(file(&replacement).bytes(0, 4).is_none());
+        assert!(file("https://revoked.test/file.fgb").bytes(0, 4).is_none());
+    }
 
     #[test]
     fn holds_merges_and_notes_what_is_missing() {
@@ -684,6 +1045,27 @@ mod tests {
         drive(r, work, Box::new(move |res| tx.send(res.map_err(|e| e.to_string())).unwrap_or_default()));
         let v = rx.recv().unwrap_or(Err("no answer".into()));
         assert_eq!(v, Ok(u64::from(file[200_000]) + u64::from(file[5000])));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn failed_remote_reads_preserve_http_reason_without_known_query_secrets() {
+        testing::serve("test:diagnostic-fetcher", Vec::new());
+        let address = "https://remote-diagnostic.test/missing.fgb?%2574oken=hidden unescaped hidden";
+        let remote = Arc::new(Remote::new(address));
+        let read_remote = remote.clone();
+        let work: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(move || {
+            read_remote.bytes(0, 8).ok_or_else(need)?;
+            Ok(())
+        });
+        let error = drive_blocking(remote, work).unwrap_err().to_string();
+        assert!(error.contains("HTTP 404"), "{error}");
+        assert!(!error.contains("hidden"), "{error}");
+        assert_eq!(crate::diagnostics::redact(&error), error);
+        let history = crate::diagnostics::History::default();
+        history.push(crate::diagnostics::Severity::Error, "Data", &error, "");
+        let report = history.report(crate::diagnostics::Filter::All);
+        assert!(report.contains("HTTP 404") && !report.contains("hidden"), "{report}");
     }
 
     #[test]

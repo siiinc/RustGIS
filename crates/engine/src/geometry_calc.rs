@@ -42,8 +42,10 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
     if !properties(l.geometry_type()).iter().any(|(k, _)| *k == property) {
         return Err("property does not match the layer geometry".into());
     }
-    if !units(property).iter().any(|(k, _)| *k == unit) {
-        return Err("unit does not match the property".into());
+    let accepted = units(property);
+    if !accepted.iter().any(|(k, _)| *k == unit) {
+        let valid = accepted.iter().map(|(key, _)| *key).collect::<Vec<_>>().join(", ");
+        return Err(format!("unit does not match the property; valid units: {valid}"));
     }
     let transformer = if unit == "projected" {
         let code = p.get("epsg").and_then(Json::as_u64).and_then(|n| u32::try_from(n).ok()).ok_or("EPSG code is required")?;
@@ -81,6 +83,11 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
     if rows.is_empty() {
         return Err("no features to calculate".into());
     }
+    if property == "area"
+        && let Some(message) = l.dataset.ambiguous_area_message(rows.iter().filter_map(|&r| l.dataset.features.get(r)?.geometry.as_ref()))
+    {
+        return Err(format!("{}: {message}", l.dataset.name));
+    }
     let measure = Measure::from_key(property);
     let divisor = match measure {
         Some(m) => m.unit(unit).ok_or("unit does not match the property")?,
@@ -94,6 +101,9 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
             if g.kind() != l.geometry_type() {
                 return Err("feature geometry does not match the layer".into());
             }
+            // Measured and placed in longitude/latitude, from the layer's own coordinates.
+            let g = l.dataset.geometry_to_lonlat(g).map_err(|e| format!("feature {}: {e}", f.id))?;
+            let g = g.as_ref();
             // Lengths and areas use longitude differences, so a shape drawn or buffered across the
             // antimeridian may run past ±180°; a coordinate has to be a real longitude.
             let max_x = if matches!(property, "x" | "y") { 180.0 } else { 360.0 };

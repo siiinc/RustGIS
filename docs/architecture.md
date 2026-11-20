@@ -60,7 +60,7 @@ previous owner; browser futures receive explicit captures and never hold a threa
 across an await. Unowned requests are not broadcast to other sessions. Transport metadata
 uses observed statuses and known timeout/connection causes only.
 
-The egui Diagnostics pane (`ui.pane.diagnosticLog`) filters and copies these sanitized records.
+The egui Messages pane (`ui.pane.diagnosticLog`) filters and copies these sanitized records.
 The existing Diagnostic Monitor (`ui.pane.diagnostics`) remains the performance view.
 
 ## Never crash
@@ -88,10 +88,9 @@ when they are installed, RustGIS calls them to read [more formats](user-guide/da
 run DuckDB queries and run the [GeoLibre tools](user-guide/analysis.md#geolibre-tools). In the web
 app the GeoLibre tools run in the browser instead, through geolibre-rust's WASI runner. Some
 dependencies do compile C code into the build: the Zstandard decoder (`zstd-sys`,
-desktop and browser), SQLite (`libsqlite3-sys` through `rusqlite`, desktop), the TLS cryptography
-libraries (`aws-lc-sys` and `ring`, desktop) and GeographicLib's geodesic routines for the
-azimuthal equidistant projection (`proj4rs-geodesic`, desktop). Building them needs a C
-compiler; building the web app needs clang for Zstandard.
+desktop and browser), SQLite (`libsqlite3-sys` through `rusqlite`, desktop) and the TLS
+cryptography libraries (`aws-lc-sys` and `ring`, desktop). Building them needs a C compiler;
+building the web app needs clang for Zstandard.
 
 ## Secrets
 
@@ -133,10 +132,19 @@ model listing.
   the requested bucket's explicit-grant status. Copy only that login and grant boolean, not
   the grant list; parse and validate addresses and prepare signatures outside the lock.
   Keychain calls and network I/O never run under the registry lock.
+- **Web-service login bindings.** Session-only Basic and API-key-header logins use 128-bit
+  cryptographically random bearer capabilities, encoded as 32 lowercase hex digits. Native
+  builds use `getrandom`'s OS source; browser builds enable its `wasm_js` backend, which calls
+  `globalThis.crypto.getRandomValues` in both windows and workers. No initialization hook or
+  time/counter/hash fallback is used. A missing or throwing secure source returns a fixed,
+  non-secret activation error before installing an entry or replacing the session's prior
+  login. Collisions retry at most four times without overwriting a live entry.
 - **Earthdata Login token.** `rustgis_tiles::earthdata::set_secret_store` gets `Services::secrets`
   from `RustGisApp::with_services`, and `prefs::opt_in`'s store for the command line and Python. `earthdata.login` with
   `remember` keeps the token at `earthdata/token`, and without it (or when the store refuses
-  it) deletes the remembered one; `earthdata.logout` always deletes it. The token is read back
+  it) deletes the remembered one; `earthdata.logout` always deletes it and calls `cache::clear`,
+  as `arcgis.signOut` does, so what was read with the token is not served after it (a read still
+  under way then is kept when it ends, as at an ArcGIS sign-out). The token is read back
   once per store given, on the first
   request to an Earthdata data host or when the NASA Earthaccess pane opens (on a worker), never
   over a token typed this session. An expired token is deleted, not sent, and the pane and the

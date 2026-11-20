@@ -40,7 +40,7 @@ fn click_run(h: &mut Harness<'_, RustGisApp>) {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while h.state().gp.tool_run.is_some() {
         assert!(std::time::Instant::now() < end, "the run never landed");
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for background tool completion
         h.run_steps(1);
     }
     h.run_steps(2);
@@ -460,4 +460,75 @@ fn saved_duplicate_statistics_explain_how_to_repair_them() {
     assert!(h.state().gp.last.as_ref().unwrap().0);
     let output = &h.state().session.project.tables.last().unwrap().dataset;
     assert_eq!(output.value(0, 1).as_f64(), Some(16.3));
+}
+
+/// Summarize Within's statistics list takes the fields of its `points` input, not the polygons',
+/// and its separator appears only once CONCATENATE is picked.
+#[test]
+fn summarize_within_statistics_offer_the_point_layers_fields() {
+    use rustgis_engine::{data::Geometry, geom::Coord};
+    let mut h = harness("countPoints", json!({"polygons": "Zones", "points": "Target"}));
+    let ring = vec![Coord::new(0.0, 0.0), Coord::new(4.0, 0.0), Coord::new(4.0, 4.0), Coord::new(0.0, 4.0), Coord::new(0.0, 0.0)];
+    let mut zones = Dataset::new("Zones", GeometryType::Polygon, vec![Field::new("zone_only", FieldType::Text)]);
+    zones.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Value::Text("z".into())]);
+    let session = &mut h.state_mut().session;
+    session.map_mut().add_dataset(zones);
+    let target = session.map_mut().layers.iter_mut().find(|l| l.name == "Target").unwrap();
+    for (x, name) in [(1.0, "a"), (2.0, "b"), (9.0, "c")] {
+        target.dataset.push(Some(Geometry::Point(Coord::new(x, 1.0))), vec![Value::Text(name.into())]);
+    }
+    h.run_steps(3);
+    assert_eq!(h.query_all_by_label("Separator").count(), 0, "no CONCATENATE yet");
+    h.get_by_label("Add statistic").click();
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Field").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("zone_only").is_none(), "the polygons' fields aren't offered");
+    h.get_by_label("target_only").click();
+    h.run_steps(2);
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Statistic").click();
+    h.run_steps(2);
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::Button, "SUM").is_none(), "a text field takes no SUM");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "CONCATENATE").click_accesskit();
+    h.run_steps(3);
+    assert!(h.query_all_by_label("Separator").count() > 0);
+    click_run(&mut h);
+    assert!(h.state().gp.last.as_ref().unwrap().0);
+    let history = h.state().session.project.gp_history.last().unwrap();
+    assert_eq!(history.params["statistics"], json!([{"field":"target_only","statistic":"CONCATENATE"}]));
+    let out = &h.state().session.map().layer_by_name("Zones_Summarize").unwrap().dataset;
+    assert_eq!(out.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["zone_only", "point_count", "CONCATENATE_target_only"]);
+    assert_eq!(out.value(0, 1), &Value::Int(2));
+    assert_eq!(out.value(0, 2), &Value::Text("a, b".into()));
+}
+
+/// Removing the last zone field leaves a runnable form whose area-unit choice reaches history.
+#[test]
+fn tabulate_intersection_runs_with_empty_zone_fields_and_chosen_area_unit() {
+    use rustgis_engine::{data::Geometry, geom::Coord};
+    let mut h = harness("tabulateIntersection", json!({"zones":"Zones", "zoneFields":["name"], "classes":"Classes"}));
+    let ring = vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 1.0), Coord::new(0.0, 0.0)];
+    for name in ["Zones", "Classes"] {
+        let mut ds = Dataset::new(name, GeometryType::Polygon, vec![Field::new("name", FieldType::Text)]);
+        ds.push_next(Some(Geometry::Polygon(vec![vec![ring.clone()]])), vec![Value::Text(name.into())]);
+        h.state_mut().session.map_mut().add_dataset(ds);
+    }
+    h.run_steps(3);
+    assert!(h.query_by_label("Zone Fields *").is_none());
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Remove").click();
+    h.run_steps(3);
+    h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("km2")).unwrap().click();
+    h.run_steps(2);
+    h.get_by_label("ac").click();
+    h.run_steps(2);
+    assert_eq!(h.state().gp.values["areaUnit"], "ac");
+    click_run(&mut h);
+    assert!(h.state().gp.last.as_ref().unwrap().0);
+    let output = &h.state().session.project.tables.last().unwrap().dataset;
+    assert_eq!(output.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["zone_row", "area_ac", "percentage"]);
+    assert_eq!(output.value(0, 0), &Value::Int(0));
+    assert!((output.value(0, 2).as_f64().unwrap() - 100.0).abs() < 1e-8);
+    let history = h.state().session.project.gp_history.last().unwrap();
+    assert_eq!(history.params["zoneFields"], json!([]));
+    assert_eq!(history.params["areaUnit"], json!("ac"));
 }

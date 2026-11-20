@@ -73,6 +73,7 @@ impl TileKind {
     }
     /// The kind an address most likely is, from how it looks.
     pub fn guess(url: &str) -> TileKind {
+        let url = rustgis_data::login_address::inner(url);
         let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
         if path.ends_with(".pmtiles") {
             TileKind::PmTiles
@@ -178,6 +179,15 @@ pub struct TileLayer {
     /// Expanded in the Layers pane, its legend and source layers showing.
     #[serde(default, skip_serializing_if = "is_false")]
     pub expanded: bool,
+    /// The saved connection it was added from (its id, in the app's preferences), so a project
+    /// reopened later logs in with that connection's login and never needs a token in its
+    /// address. Empty for a layer that came from no connection. Never a secret.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub connection: String,
+    /// Added by an anonymous plugin command: none of its addresses may acquire a saved
+    /// web-service login, including after saving and reopening the project.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
     /// Picked in the Layers pane (`map.selectTiles`), for the session only: it holds while no
     /// map layer is active (the engine's `Session::selected_tile`).
     #[serde(skip)]
@@ -188,6 +198,18 @@ pub struct TileLayer {
     /// doesn't offer) it is drawn in tiles. Off in a project saved before: tiles, as then.
     #[serde(default, skip_serializing_if = "is_false")]
     pub single_image: bool,
+    /// A cloud-optimised GeoTIFF's files whose header losses have been said (as it was added, or
+    /// once a header landed: the engine's `Session::notice_landed_rasters`): each date's file of a
+    /// dated series, as the slider shows it. For the session only, so a project opened again says
+    /// them again.
+    #[serde(skip)]
+    pub headers_said: Vec<String>,
+    /// The addresses a dated series has shown (each date's file, as the slider moved to it),
+    /// for the session only: a file whose header lands after the slider moved on (or after an
+    /// export of the time steps drew it) is still said, by the engine's
+    /// `Session::notice_landed_rasters`. At most [`MAX_STEPS`](crate::time::MAX_STEPS).
+    #[serde(skip)]
+    pub headers_shown: Vec<String>,
 }
 
 /// The longest legend address kept.
@@ -200,7 +222,13 @@ pub fn checked_legends(legends: impl IntoIterator<Item = rustgis_data::ogc::Lege
     legends
         .into_iter()
         .map(|l| rustgis_data::ogc::Legend { url: l.url.trim().to_string(), min_scale: scale(l.min_scale), max_scale: scale(l.max_scale) })
-        .filter(|l| is_web(&l.url) && l.url.len() <= MAX_LEGEND_URL)
+        .filter(|l| {
+            // Percent-escaping can use three bytes per original byte; advertised_len below
+            // still enforces the original 4,096-byte budget after recognized escapes normalize.
+            is_web(&l.url)
+                && rustgis_data::login_address::inner(&l.url).len() <= MAX_LEGEND_URL * 3
+                && rustgis_data::login_address::advertised_len(&l.url) <= MAX_LEGEND_URL
+        })
         .take(rustgis_data::ogc::MAX_LEGENDS)
         .collect()
 }
@@ -227,6 +255,7 @@ pub const MAX_TIME_URLS: usize = crate::time::MAX_STEPS;
 
 /// Whether an address is on the web (`http://` or `https://`, in any case).
 pub fn is_web(url: &str) -> bool {
+    let url = rustgis_data::login_address::inner(url);
     let scheme = url.get(..8).unwrap_or(url).to_ascii_lowercase();
     scheme.starts_with("https://") || scheme.starts_with("http://")
 }
@@ -335,6 +364,21 @@ fn sizable(base: &str) -> bool {
     })
 }
 
+/// Content discarded or settings changed while checking a tile layer read from a file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TileRepairs {
+    /// Invalid, repeated or excess dated addresses removed.
+    pub addresses: usize,
+    /// Invalid or excess layer names and subdomain entries removed.
+    pub entries: usize,
+    /// Unreadable style definitions removed.
+    pub styles: usize,
+    /// Address, name, attribution or identifier fields shortened or replaced.
+    pub text: usize,
+    /// Coverage or numeric settings removed or brought into range.
+    pub settings: usize,
+}
+
 impl TileLayer {
     /// The local archive that Repair Data Source replaces.
     pub fn archive_file(&self) -> Option<&str> {
@@ -370,9 +414,13 @@ impl TileLayer {
             error: None,
             feature_info: None,
             legends: Vec::new(),
+            connection: String::new(),
+            anonymous: false,
             expanded: false,
             selected: false,
             single_image: false,
+            headers_said: Vec::new(),
+            headers_shown: Vec::new(),
         }
     }
 
@@ -418,20 +466,75 @@ impl TileLayer {
         self.visible && !self.time_hidden && self.error.is_none()
     }
 
+    /// Selects this tile's date and address from a normalized slider, without fetching it.
+    /// With no slider, a dated list shows its last entry and a template keeps its saved date.
+    pub fn apply_time(&mut self, time: Option<&crate::time::TimeSlider>) {
+        let window = time.map(crate::time::TimeSlider::window);
+        let current = time.map(|t| t.current);
+        // The date it leaves is kept too: its header's read may have started as it was drawn.
+        if !self.time_urls.is_empty() || self.time_url.is_some() {
+            self.note_shown();
+        }
+        if !self.time_urls.is_empty() {
+            let at = match window {
+                Some((from, to)) => self.time_urls.iter().rposition(|(d, _)| *d >= from && *d < to),
+                None => self.time_urls.len().checked_sub(1),
+            };
+            self.time_hidden = at.is_none();
+            if let Some((d, u)) = at.and_then(|i| self.time_urls.get(i)) {
+                self.url.clone_from(u);
+                self.time_at = *d;
+                self.note_shown();
+            }
+            return;
+        }
+        // Only web addresses take dates (a file's template is dropped when it is repaired).
+        if let Some(template) = self.time_url.as_ref().filter(|u| is_web(u)) {
+            self.url = rustgis_data::time::fill_template(template, current.unwrap_or(self.time_at));
+            self.time_at = current.unwrap_or(self.time_at);
+            self.note_shown();
+        }
+    }
+
+    /// Keeps the address it now shows among those a dated series has shown ([`TileLayer::headers_shown`]):
+    /// a cloud-optimised GeoTIFF's only, whose header's losses are said once it lands, and only
+    /// while they haven't been (a date whose file was said, its look at the address's end or
+    /// not, isn't kept again), so the list holds the dates still to say, not every date shown.
+    pub fn note_shown(&mut self) {
+        let file = self.url.rsplit_once('#').map_or(self.url.as_str(), |(file, _)| file);
+        let said = self.headers_said.iter().any(|f| *f == self.url || f == file);
+        if self.kind == TileKind::Cog
+            && !said
+            && self.headers_shown.len() < crate::time::MAX_STEPS
+            && !self.headers_shown.contains(&self.url)
+        {
+            self.headers_shown.push(self.url.clone());
+        }
+    }
+
     /// Checks the address and brings the numbers into range, after reading one from a project
     /// file or a command.
     pub fn repair(&mut self) -> Result<(), String> {
+        self.repair_counted().map(|_| ())
+    }
+
+    /// Applies the same checks, returning losses for a reader or command to report on success.
+    pub fn repair_counted(&mut self) -> Result<TileRepairs, String> {
+        let mut repairs = TileRepairs::default();
+        repairs.text += usize::from(self.url.trim().len() != self.url.len());
+        let dated = self.time_urls.len() + usize::from(self.time_url.is_some());
         self.url = self.url.trim().to_string();
         // A dated address is a web address whose date is filled in after the scheme and host.
-        if self.time_url.as_ref().is_some_and(|u| !is_web(u) || u.len() > 4096) {
+        if self.time_url.as_ref().is_some_and(|u| !is_web(u) || rustgis_data::login_address::inner(u).len() > 4096) {
             self.time_url = None;
         }
         // A file per date: web addresses, finite dates, in order.
-        self.time_urls.retain(|(d, u)| d.is_finite() && is_web(u) && u.len() <= 4096);
+        self.time_urls.retain(|(d, u)| d.is_finite() && is_web(u) && rustgis_data::login_address::inner(u).len() <= 4096);
         // Sorted before the cap, so a list out of order keeps its first dates, not any.
         self.time_urls.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.time_urls.dedup_by(|a, b| a.0 == b.0);
         self.time_urls.truncate(MAX_TIME_URLS);
+        repairs.addresses = dated - self.time_urls.len() - usize::from(self.time_url.is_some());
         let local = matches!(self.kind, TileKind::PmTiles | TileKind::MbTiles) && is_local_archive(&self.url);
         if let Some(name) = self.url.strip_prefix(UPLOAD).filter(|_| self.kind == TileKind::MbTiles) {
             if name.is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
@@ -444,6 +547,7 @@ impl TileLayer {
         } else {
             check_url(&self.url)?;
         }
+        repairs.text += usize::from(self.name.trim().len() != self.name.len() || self.name.chars().nth(120).is_some());
         self.name = self.name.trim().chars().take(120).collect();
         if self.name.is_empty() {
             let file = || {
@@ -455,14 +559,17 @@ impl TileLayer {
             self.name = if local { file() } else { host_of(&self.url).map(str::to_string) }.unwrap_or_else(|| "Tiles".into());
         }
         // Layer names (a project file is hostile input): at most 64, each short and printable.
+        let entries = self.layers.len() + self.subdomains.len();
         self.layers.retain(|l| !l.trim().is_empty() && l.len() <= 200 && !l.chars().any(char::is_control));
         self.layers.truncate(64);
         // A project file's style layers that don't read are dropped: the tiles keep their colours.
         if !self.style_layers.is_empty() && checked_style_layers(&self.style_layers).is_err() {
             self.style_layers.clear();
+            repairs.styles += 1;
         }
         // Bounds from a project must describe a finite geographic rectangle. Invalid metadata
         // doesn't make the tiles unreadable; it only leaves their coverage unknown.
+        let settings = (self.bounds, self.min_zoom, self.max_zoom, self.tile_size, self.opacity);
         self.bounds = self.bounds.filter(valid_bounds);
         self.max_zoom = self.max_zoom.min(MAX_ZOOM);
         self.min_zoom = self.min_zoom.min(self.max_zoom);
@@ -478,9 +585,19 @@ impl TileLayer {
         self.opacity = self.opacity.clamp(0.0, 1.0);
         self.subdomains.retain(|s| !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
         self.subdomains.truncate(16);
+        repairs.entries = entries - self.layers.len() - self.subdomains.len();
+        repairs.settings = usize::from(settings.0 != self.bounds)
+            + usize::from(settings.1 != self.min_zoom)
+            + usize::from(settings.2 != self.max_zoom)
+            + usize::from(settings.3 != self.tile_size)
+            + usize::from(settings.4 != self.opacity);
+        repairs.text += usize::from(self.attribution.chars().nth(500).is_some());
+        repairs.text += usize::from(
+            self.id.chars().any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))) || self.id.chars().nth(80).is_some(),
+        );
         self.attribution = self.attribution.chars().take(500).collect();
         self.id = self.id.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')).take(80).collect();
-        Ok(())
+        Ok(repairs)
     }
 }
 
@@ -488,9 +605,9 @@ impl TileLayer {
 pub const UPLOAD: &str = "upload:";
 
 /// Whether a PMTiles or MBTiles archive address is a file rather than a web address. An address
-/// read through a saved S3 connection is never a file, well formed or not.
+/// wrapped for an S3 connection or service login is never a file, well formed or not.
 pub fn is_local_archive(url: &str) -> bool {
-    if rustgis_data::s3_address::is_wrapper(url) {
+    if rustgis_data::s3_address::is_wrapper(url) || rustgis_data::login_address::is_wrapper(url) {
         return false;
     }
     let lower = url.to_ascii_lowercase();
@@ -517,10 +634,15 @@ pub fn check_path(path: &str, ext: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `url` may be fetched: HTTP or HTTPS, with a host, and no longer than 4096 bytes. An
-/// address read through a saved S3 connection is judged by the address it wraps (still bounded
-/// by 4096 bytes), and itself by the wrapper's own bound; it needs no login to be kept.
+/// Whether `url` may be fetched: HTTP, HTTPS or S3, with a host, and no longer than 4096 bytes.
+/// Connection and service-login wrappers are judged by their inner address and their own bound;
+/// no live login is needed to keep a saved address.
 pub fn check_url(url: &str) -> Result<(), String> {
+    let url = match rustgis_data::login_address::parse(url) {
+        Ok(Some(b)) => b.url,
+        Ok(None) => url,
+        Err(e) => return Err(e.to_string()),
+    };
     let url = match rustgis_data::s3_address::parse(url) {
         Ok(Some(b)) => b.url,
         Ok(None) => url,
@@ -531,20 +653,23 @@ pub fn check_url(url: &str) -> Result<(), String> {
     }
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("s3://")) {
-        return Err(format!("'{url}': tile addresses start with https://, http:// or s3://"));
+        return Err(format!(
+            "'{}': tile addresses start with https://, http:// or s3://",
+            rustgis_data::diagnostics::address_in_message(url)
+        ));
     }
     if host_of(url).is_none_or(str::is_empty) {
-        return Err(format!("'{url}' has no host"));
+        return Err(format!("'{}' has no host", rustgis_data::diagnostics::address_in_message(url)));
     }
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(format!("'{url}' has spaces in it"));
+        return Err(format!("'{}' has spaces in it", rustgis_data::diagnostics::address_in_message(url)));
     }
     Ok(())
 }
 
-/// The host part of an HTTP(S) address (of the address an address read through a saved S3
-/// connection wraps).
+/// The host part of an HTTP(S) address, inspecting the address inside a connection or login wrapper.
 pub fn host_of(url: &str) -> Option<&str> {
+    let url = rustgis_data::login_address::parse(url).ok()?.map_or(url, |b| b.url);
     let url = rustgis_data::s3_address::inner(url);
     let rest = url.split_once("://")?.1;
     let host = rest.split(['/', '?', '#']).next()?;
@@ -552,9 +677,134 @@ pub fn host_of(url: &str) -> Option<&str> {
     Some(host.split(':').next().unwrap_or(host))
 }
 
+impl TileLayer {
+    /// All persisted tile addresses, with the archive URL also classified as a local path.
+    pub(crate) fn output_slots(&self) -> Vec<(crate::TileRole, &str, bool)> {
+        let TileLayer {
+            name: _,
+            kind: _,
+            url,
+            bounds: _,
+            subdomains: _,
+            min_zoom: _,
+            max_zoom: _,
+            tile_size: _,
+            tms: _,
+            attribution: _,
+            visible: _,
+            opacity: _,
+            overlay: _,
+            over: _,
+            blend: _,
+            id: _,
+            layers: _,
+            style_layers: _,
+            hidden_layers: _,
+            time_url,
+            time_at: _,
+            time_urls,
+            time_hidden: _,
+            error: _,
+            feature_info: _,
+            legends,
+            connection: _,
+            anonymous: _,
+            expanded: _,
+            selected: _,
+            single_image: _,
+            headers_said: _,
+            headers_shown: _,
+        } = self;
+        use crate::TileRole as R;
+        let mut out = vec![(R::Url, url.as_str(), self.archive_file().is_some())];
+        if let Some(v) = time_url {
+            out.push((R::TimeUrl, v.as_str(), false));
+        }
+        out.extend(time_urls.iter().enumerate().map(|(i, (_, v))| (R::TimeAt(i), v.as_str(), false)));
+        out.extend(legends.iter().enumerate().map(|(i, v)| {
+            let rustgis_data::ogc::Legend { url, min_scale: _, max_scale: _ } = v;
+            (R::Legend(i), url.as_str(), false)
+        }));
+        out
+    }
+
+    /// Resolves a fixed location, independent of the address's current spelling.
+    pub(crate) fn output_slot_mut(&mut self, role: crate::TileRole) -> Option<&mut String> {
+        match role {
+            crate::TileRole::Url => Some(&mut self.url),
+            crate::TileRole::TimeUrl => self.time_url.as_mut(),
+            crate::TileRole::TimeAt(i) => Some(&mut self.time_urls.get_mut(i)?.1),
+            crate::TileRole::Legend(i) => Some(&mut self.legends.get_mut(i)?.url),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_secret_tile_addresses_keep_the_validation_reason() {
+        for (url, reason) in [
+            ("ftp://tiles.test/a?token=secret value", "tile addresses start with"),
+            ("https://?token=secret value", "has no host"),
+            ("https://tiles.test/a?token=secret value", "has spaces in it"),
+            ("https://tiles.test/a#token=secret value", "has spaces in it"),
+        ] {
+            let error = check_url(url).unwrap_err();
+            let error = rustgis_data::diagnostics::redact(&rustgis_data::diagnostics::redact(&error));
+            assert!(error.contains(reason), "{error}");
+            assert!(!error.contains("secret") && !error.contains("value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn runtime_bound_tile_and_legend_addresses_are_web_addresses() {
+        let bound = rustgis_data::login_address::bind("0123456789abcdef", "https://maps.test", "https://maps.test/style.json").unwrap();
+        assert!(is_web(&bound));
+        assert!(check_url(&bound).is_ok());
+        assert_eq!(host_of(&bound), Some("maps.test"));
+        assert_eq!(TileKind::guess(&bound), TileKind::Style);
+        let legend = rustgis_data::ogc::Legend { url: bound.clone(), ..Default::default() };
+        assert_eq!(checked_legends([legend]).first().unwrap().url, bound);
+        assert!(check_url("rustgis-login:broken").is_err());
+        assert!(!is_web("rustgis-login:broken"));
+    }
+
+    #[test]
+    fn same_origin_legend_with_a_space_keeps_its_login() {
+        let document = rustgis_data::login_address::bind("0123456789abcdef", "https://maps.test", "https://maps.test/wms").unwrap();
+        let url = rustgis_data::login_address::inherit(&document, "https://maps.test/legend?LAYER=a b");
+        let legend = rustgis_data::ogc::Legend { url: url.clone(), ..Default::default() };
+        assert_eq!(checked_legends([legend]).first().map(|l| l.url.as_str()), Some(url.as_str()));
+        assert_eq!(rustgis_data::login_address::inner(&url), "https://maps.test/legend?LAYER=a%20b");
+        assert!(check_url(&url).is_ok());
+    }
+
+    #[test]
+    fn a_near_limit_legend_keeps_spaces_encoded_for_its_login() {
+        use rustgis_data::{login_address, ogc::Legend};
+        let document = login_address::bind("0123456789abcdef", "https://maps.test", "https://maps.test/wms").unwrap();
+        let prefix = "https://maps.test/legend?name=";
+        let raw = format!("{prefix}{}x", " ".repeat(MAX_LEGEND_URL - prefix.len() - 1));
+        assert_eq!(raw.len(), MAX_LEGEND_URL);
+        let url = login_address::inherit(&document, &raw);
+        assert!(login_address::inner(&url).len() > MAX_LEGEND_URL);
+        assert_eq!(login_address::advertised_len(&url), raw.len());
+        assert_eq!(checked_legends([Legend { url: url.clone(), ..Default::default() }]).len(), 1);
+        let over = login_address::inherit(&document, &format!("{raw}x"));
+        assert!(checked_legends([Legend { url: over, ..Default::default() }]).is_empty());
+        // Arbitrary escapes do not bypass the advertised byte limit.
+        let long = format!("{prefix}{}", "%41".repeat(MAX_LEGEND_URL));
+        let long = login_address::inherit(&document, &long);
+        assert!(checked_legends([Legend { url: long, ..Default::default() }]).is_empty());
+        let encoded = login_address::inner(&url).to_string();
+        assert_eq!(
+            checked_legends([Legend { url: encoded, ..Default::default() }]).len(),
+            1,
+            "saved URLs retain the same budget after unbinding"
+        );
+    }
 
     #[test]
     fn style_layers_are_checked() {
@@ -571,6 +821,31 @@ mod tests {
         assert_eq!(TileKind::guess("https://example.com/tiles/{z}/{x}/{y}.pbf?key=1"), TileKind::Vector);
         assert_eq!(TileKind::guess("https://tiles.openfreemap.org/styles/liberty"), TileKind::Style);
         assert_eq!(TileKind::guess("https://api.maptiler.com/maps/streets/style.json?key=k"), TileKind::Style);
+    }
+
+    /// Only a cloud-optimised GeoTIFF's dates are kept as shown (their headers' losses are said once
+    /// they land, #1331): the date it leaves and the one it goes to, from a list or a template;
+    /// other dated tile layers keep none, however the slider moves.
+    #[test]
+    fn only_a_cogs_dates_are_kept_as_shown() {
+        let (a, b) = ("https://a.example.com/2000.tif".to_string(), "https://a.example.com/2001.tif".to_string());
+        for (kind, kept) in [(TileKind::Cog, vec![a.clone(), b.clone()]), (TileKind::Raster, Vec::new())] {
+            let mut t = TileLayer::new("Series", kind, a.clone());
+            t.time_urls = vec![(1.0, a.clone()), (2.0, b.clone())];
+            t.apply_time(None);
+            assert_eq!(t.headers_shown, kept, "{kind:?}");
+            // A template: the address it fills in for its date is kept too.
+            let mut t = TileLayer::new("Series", kind, a.clone());
+            t.time_url = Some("https://a.example.com/{YYYY}.tif".into());
+            t.apply_time(None);
+            assert_eq!(t.headers_shown.contains(&t.url), kind == TileKind::Cog, "{kind:?}: {:?}", t.headers_shown);
+            // A date whose file was said isn't kept again, its look at the address's end or not.
+            let mut t = TileLayer::new("Series", kind, format!("{a}#bands=1"));
+            t.headers_said = vec![a.clone()];
+            t.time_urls = vec![(1.0, format!("{a}#bands=1")), (2.0, b.clone())];
+            t.apply_time(None);
+            assert_eq!(t.headers_shown, kept.iter().filter(|u| **u != a).cloned().collect::<Vec<_>>(), "{kind:?}");
+        }
     }
 
     #[test]

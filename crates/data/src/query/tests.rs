@@ -63,7 +63,7 @@ fn hostile_input() {
 
 fn v(text: &str) -> Value {
     let d = ds();
-    value(&parse(text, &d).unwrap_or_else(|e| panic!("{text}: {e}")), &d, 0, &Env { map_scale: Some(25_000.0) })
+    value(&parse(text, &d).unwrap_or_else(|e| panic!("{text}: {e}")), &d, 0, &Env { map_scale: Some(25_000.0), ..Env::default() })
 }
 
 fn t(s: &str) -> Value {
@@ -381,7 +381,7 @@ fn junk_never_panics() {
         let s: String = (0..n).map(|_| g.pick(&bits)).collect::<Vec<_>>().join(if g.next().is_multiple_of(2) { " " } else { "" });
         if let Ok(e) = parse(&s, &d) {
             for r in [0, 1, 7, 999] {
-                let _ = value(&e, &d, r, &Env { map_scale: Some(f64::NAN) });
+                let _ = value(&e, &d, r, &Env { map_scale: Some(f64::NAN), ..Env::default() });
                 let _ = eval(&e, &d, r);
             }
         }
@@ -472,6 +472,14 @@ fn a_computed_in_list_skips_nulls_and_a_long_pattern_matches_nothing() {
     assert_eq!(rows(&costly), Vec::<usize>::new());
     assert_eq!(rows(&costly.replace(" LIKE ", " NOT LIKE ")), Vec::<usize>::new());
     assert!(!like(&"a".repeat(65536), &format!("%{}b", "a".repeat(1000))));
+    // A costly LIKE leaves the others in its clause theirs: a cheap one after it (every name is
+    // like itself) still matches. But four at their cap spend what a clause's LIKEs may take for
+    // one row together (#1398), so one after them is unknown: on Paris's row only, as each row
+    // has a budget of its own.
+    let cheap = "name LIKE name";
+    assert_eq!(rows(&format!("{costly} OR {cheap}")), vec![0, 1, 2, 3]);
+    let four = [costly.as_str(); 4].join(" OR ");
+    assert_eq!(rows(&format!("(name = 'Paris' AND ({four})) OR {cheap}")), vec![1, 2, 3]);
 }
 
 #[test]
@@ -515,4 +523,379 @@ fn geometry_is_measured_on_the_ellipsoid() {
     let lines = Dataset::new("roads", GeometryType::Polyline, vec![]);
     assert!(parse("$area > 1", &lines).is_err_and(|e| e.contains("polygon")));
     assert!(parse("$length > 1 AND line_length('mi') < 2", &lines).is_ok());
+}
+
+#[test]
+fn ambiguous_polar_area_is_a_counted_expression_error() {
+    use crate::{Geometry, Measure};
+    use rustgis_geom::Coord;
+    let c = Coord::new;
+    let bad = vec![c(-180.0, 90.0), c(180.0, 90.0), c(-90.0, -90.0), c(90.0, -80.0)];
+    let world = vec![c(-180.0, -90.0), c(180.0, -90.0), c(180.0, 90.0), c(-180.0, 90.0)];
+    let mut ds = Dataset::new("Polar", GeometryType::Polygon, vec![]);
+    ds.push(Some(Geometry::Polygon(vec![vec![bad.clone()]])), vec![]);
+    ds.push(Some(Geometry::Polygon(vec![vec![world.clone(), bad]])), vec![]);
+    for expression in ["$area", "area('km2')", "$area > 0"] {
+        let error = parse(expression, &ds).unwrap_err();
+        assert!(error.contains("Polar") && error.contains("2 ring(s) in 2 feature(s)") && error.contains("area is ambiguous"), "{error}");
+    }
+    let geometry = ds.features[0].geometry.as_ref().unwrap();
+    assert_eq!(geometry.wgs84_measure(Measure::Area), None);
+    assert!(geometry.wgs84_measure(Measure::Perimeter).is_some_and(f64::is_finite));
+    let perimeter = parse("$perimeter", &ds).unwrap();
+    assert!(value(&perimeter, &ds, 0, &Env::default()).as_f64().is_some_and(f64::is_finite));
+    let mut clean = Dataset::new("World", GeometryType::Polygon, vec![]);
+    clean.push(Some(Geometry::Polygon(vec![vec![world]])), vec![]);
+    let expression = parse("$area", &clean).unwrap();
+    assert!(value(&expression, &clean, 0, &Env::default()).as_f64().is_some_and(|area| area > 5e14));
+}
+
+#[test]
+fn where_clauses_compare_dates() {
+    let mut d = Dataset::new("t", GeometryType::None, vec![Field::new("issued", FieldType::Date), Field::new("ts", FieldType::DateTime)]);
+    for (day, at) in
+        [("2025-12-31", "2026-03-05T00:00:00"), ("2026-01-01", "2026-03-05T09:00:00+02:00"), ("2026-06-30", "2026-03-04T23:00:00-05:00")]
+    {
+        d.push(None, vec![Value::parse(day, FieldType::Date), Value::parse(at, FieldType::DateTime)]);
+    }
+    d.push(None, vec![Value::Null, Value::Null]);
+    assert_eq!(select("issued >= '2026-01-01'", &d).unwrap(), vec![1, 2]);
+    assert_eq!(select("issued BETWEEN '2026-01-01' AND '2026-03-31'", &d).unwrap(), vec![1]);
+    assert_eq!(select("issued IN ('2026-06-30', '2025-12-31')", &d).unwrap(), vec![0, 2]);
+    // A date-time equals a date's midnight; offsets compare by instant (09:00+02:00 is 07:00Z).
+    assert_eq!(select("ts = '2026-03-05'", &d).unwrap(), vec![0]);
+    assert_eq!(select("ts < '2026-03-05T08:00Z'", &d).unwrap(), vec![0, 1, 2]);
+    assert_eq!(select("ts > '2026-03-05T04:00:00Z'", &d).unwrap(), vec![1]);
+    assert_eq!(select("ts > issued", &d).unwrap(), vec![0, 1]);
+    // Text that isn't a full date still compares as text, as saved clauses did.
+    assert_eq!(select("issued > '2026'", &d).unwrap(), vec![1, 2]);
+    assert_eq!(select("issued LIKE '2026-%'", &d).unwrap(), vec![1, 2]);
+    // Arithmetic on dates is an error, not a column of nulls.
+    assert_eq!(parse("issued + 30", &d).err().unwrap_or_default(), "'issued' holds dates, and arithmetic on dates isn't supported yet");
+    // Also a date reached through a function or CASE, or given to a number's function: each
+    // would be null for every row.
+    for e in ["coalesce(issued) + 1", "-nullif(issued, '2026-01-01')", "CASE WHEN 1 = 1 THEN issued END * 2", "if(true, 1, issued) + 1"] {
+        assert_eq!(parse(e, &d).err().unwrap_or_default(), "'issued' holds dates, and arithmetic on dates isn't supported yet", "{e}");
+    }
+    assert_eq!(parse("abs(issued)", &d).err().unwrap_or_default(), "'issued' holds dates, and abs on dates isn't supported yet");
+    // A date against anything that gives a number would compare text with digits: an error.
+    for e in [
+        "issued >= 20260101",
+        "20260101 < issued",
+        "issued = 20260305",
+        "ts IN (1, 2)",
+        "issued BETWEEN 20260101 AND 20261231",
+        "issued >= 2026 * 10000 + 101",
+        "issued > @row_number",
+        "nullif(issued, 20260101) IS NULL",
+        "CASE issued WHEN 20260101 THEN 1 ELSE 0 END = 1",
+        "20260101 = if(true, issued, 1)",
+        "nullif(20260101, if(true, issued, 1)) IS NULL",
+        "CASE 20260101 WHEN if(true, issued, 1) THEN 1 ELSE 0 END = 1",
+        "issued < pi()",
+        "issued >= if(true, 20260101, 20250101)",
+        "issued = CASE WHEN true THEN 20260305 END",
+        "issued = coalesce(20260305, 1)",
+        "issued = (1 = 1)",
+    ] {
+        assert!(parse(e, &d).err().unwrap_or_default().contains("not a number"), "{e}");
+    }
+    // Also a number a field holds or a function gives; text still compares.
+    let n = Dataset::new(
+        "t",
+        GeometryType::None,
+        vec![Field::new("issued", FieldType::Date), Field::new("n", FieldType::Integer), Field::new("s", FieldType::Text)],
+    );
+    // Also every branch of if, coalesce and CASE, and arithmetic, which reads text that is a number
+    // as one.
+    for e in [
+        "issued > n",
+        "issued = abs(n)",
+        "n < issued",
+        "issued >= if(n > 0, n * 10000 + 101, issued)",
+        "issued = coalesce(n, issued)",
+        "issued = CASE WHEN n > 0 THEN n ELSE issued END",
+        "issued > s + 1",
+        "issued = s + 'x'",
+    ] {
+        assert!(parse(e, &n).err().unwrap_or_default().contains("not a number"), "{e}");
+    }
+    for e in ["issued > s", "issued >= '2026-' || '01-01'", "issued = coalesce(s, '2026-01-01')", "issued >= upper(s)", "issued = NULL"] {
+        assert!(parse(e, &n).is_ok(), "{e}");
+    }
+    assert!(parse("issued > ts", &d).is_ok(), "two dates compare");
+    assert!(parse("issued = @page_name", &d).is_ok(), "the name of a page can be date text");
+    assert!(parse("issued = @page_number", &d).is_err(), "the page number is numeric");
+    // A date without dashes is text no date reads as: an error asking for YYYY-MM-DD. A shorter
+    // partial date still compares as text.
+    for e in [
+        "issued >= '20260101'",
+        "issued = '20260305'",
+        "'20260101' < issued",
+        "issued IN ('2026-01-01', '20260101')",
+        "issued >= '2026/03/05'",
+        "issued >= '2026-1-1'",
+        "issued = '05.03.2026'",
+        "ts >= '2026/03/05 14:30'",
+    ] {
+        assert!(parse(e, &d).err().unwrap_or_default().contains("write the date as YYYY-MM-DD"), "{e}");
+    }
+    for e in [
+        "issued > '2026'",
+        "issued >= '2026-03'",
+        "issued LIKE '2026-%'",
+        "ts >= '2026-03-05 14:30'",
+        "issued < '2026-03-05 revision 2'",
+        "issued < '2026-03-05 14:30 revision 2'",
+        "issued < '2026 report 03 page 05'",
+        "issued < '2026-03/05'",
+    ] {
+        assert!(parse(e, &d).is_ok(), "{e}");
+    }
+    for e in ["to_int(issued)", "to_real(ts)", "color_rgb(issued, 0, 0)"] {
+        assert!(parse(e, &d).err().unwrap_or_default().contains("on dates isn't supported yet"), "{e}");
+    }
+    assert!(parse("coalesce(issued, '2026-01-01')", &d).is_ok(), "a date passed through is no arithmetic");
+    assert!(parse("-ts", &d).is_err());
+    assert_eq!(value(&parse("issued || ''", &d).unwrap(), &d, 0, &Env::default()), Value::Text("2025-12-31".into()));
+}
+
+/// Layers every catalog example fits on: a table, a polygon and a line, each with one feature.
+fn catalog_layers() -> Vec<Dataset> {
+    use crate::Geometry;
+    use rustgis_geom::Coord;
+    let ring = vec![Coord::new(0.0, 0.0), Coord::new(0.01, 0.0), Coord::new(0.01, 0.01), Coord::new(0.0, 0.01), Coord::new(0.0, 0.0)];
+    let mut table = Dataset::new("table", GeometryType::None, vec![]);
+    table.push(None, vec![]);
+    let mut polygons = Dataset::new("polygons", GeometryType::Polygon, vec![]);
+    polygons.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+    let mut lines = Dataset::new("lines", GeometryType::Polyline, vec![]);
+    lines.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(0.01, 0.0)]])), vec![]);
+    vec![table, polygons, lines]
+}
+
+/// The value `text` gives on the first layer of `layers` it parses on.
+fn catalog_value(text: &str, layers: &[Dataset]) -> Option<Value> {
+    let env =
+        Env { map_scale: Some(25_000.0), page: Some(std::sync::Arc::new(SeriesPage { feature_id: 42, name: "North".into(), number: 1 })) };
+    layers.iter().find_map(|d| parse(text, d).ok().map(|e| value(&e, d, 0, &env)))
+}
+
+#[test]
+fn every_function_has_one_catalog_entry_that_works() {
+    let layers = catalog_layers();
+    let mut names = std::collections::HashSet::new();
+    for &f in Func::ALL {
+        let s = f.spec();
+        assert_eq!(s.func, f);
+        assert!(names.insert(s.name), "{} is listed twice", s.name);
+        assert_eq!(s.name, s.name.to_ascii_lowercase());
+        assert!(s.signature.starts_with(&format!("{}(", s.name)) && s.signature.ends_with(')'), "{}", s.signature);
+        assert!(s.min <= s.max && s.max <= MAX_ARGS, "{}", s.name);
+        assert!(!s.description.is_empty(), "{} has no description", s.name);
+        assert!(s.example.starts_with(&format!("{}(", s.name)), "{}'s example calls another function", s.name);
+        // The example parses where the function fits and gives a value.
+        let v = catalog_value(s.example, &layers);
+        assert!(v.is_some_and(|v| v != Value::Null), "{} gives nothing", s.example);
+    }
+    // A call resolves through the catalog, in any letter case.
+    assert!(catalog_value("ROUND(1.5)", &layers).is_some());
+    assert!(parse("nonesuch(1)", &layers[0]).is_err_and(|e| e.contains("unknown function")));
+}
+
+#[test]
+fn every_variable_has_one_catalog_entry_that_works() {
+    let layers = catalog_layers();
+    let mut names = std::collections::HashSet::new();
+    for s in VARS {
+        assert!(!s.names.is_empty() && !s.description.is_empty());
+        for name in s.names {
+            assert!(names.insert(name.to_ascii_lowercase()), "{name} is listed twice");
+            assert!(name.starts_with(['@', '$']), "{name}");
+            assert!(catalog_value(name, &layers).is_some_and(|v| v != Value::Null), "{name} gives nothing");
+            assert!(catalog_value(&name.to_ascii_uppercase(), &layers).is_some(), "{name} in upper case");
+        }
+    }
+    assert!(parse("@nonesuch", &layers[0]).is_err_and(|e| e.contains("unknown variable")));
+}
+
+#[test]
+fn every_keyword_is_listed_once_and_read() {
+    let mut words = std::collections::HashSet::new();
+    for k in Kw::ALL {
+        assert!(words.insert(k.word()), "{} is listed twice", k.word());
+        assert_eq!(k.word(), k.word().to_ascii_uppercase());
+        assert!(!k.description().is_empty());
+    }
+    // Each one in a clause that uses it, in lower case.
+    let d = ds();
+    let clause = "NOT pop IS NULL AND (name LIKE 'p%' OR name ILIKE 'l%') AND pop IN (1, 2100000) \
+                  AND pop BETWEEN 1 AND 3000000 AND TRUE AND NOT FALSE \
+                  AND CASE WHEN pop > 1 THEN TRUE ELSE FALSE END";
+    let used: Vec<Kw> =
+        Kw::ALL.iter().copied().filter(|k| clause.split_whitespace().any(|w| w.trim_matches(['(', ')']) == k.word())).collect();
+    assert_eq!(used, Kw::ALL, "the clause should use every keyword");
+    assert_eq!(select(&clause.to_ascii_lowercase(), &d).unwrap(), vec![0]);
+}
+
+/// The user guide's section headed `## {heading}`, up to the next one. A Windows checkout may
+/// give the guide CRLF line endings (`core.autocrlf`), so they are read as LF.
+fn guide_section(heading: &str) -> String {
+    let guide = include_str!("../../../../docs/user-guide/expressions.md").replace("\r\n", "\n");
+    let start = guide.find(&format!("\n## {heading}\n")).unwrap_or_else(|| panic!("no {heading} section"));
+    let rest = guide.get(start + 1..).unwrap_or_default();
+    rest.get(3..).and_then(|r| r.find("\n## ")).map_or(rest, |end| rest.get(..end + 3).unwrap_or(rest)).to_string()
+}
+
+#[test]
+fn the_user_guide_lists_what_the_catalogs_hold() {
+    let listed = guide_section("Functions");
+    for s in super::functions() {
+        assert!(listed.contains(&format!("`{}`", s.signature)), "docs/user-guide/expressions.md: Functions should list `{}`", s.signature);
+    }
+    // And nothing else: every call written in the table's first column is a catalog function.
+    for row in listed.lines().filter(|l| l.starts_with("| `")) {
+        let first = row.split('|').nth(1).unwrap_or_default();
+        for call in first.split('`').skip(1).step_by(2) {
+            let name = call.split('(').next().unwrap_or_default();
+            assert!(super::functions().any(|s| s.name == name), "the guide lists `{call}`, which isn't a function");
+        }
+    }
+    // The units the measures take.
+    for m in [Measure::Area, Measure::Perimeter, Measure::Length] {
+        for (unit, _) in m.units() {
+            assert!(listed.contains(&format!("'{unit}'")), "Functions should name the unit '{unit}'");
+        }
+    }
+    let values = guide_section("Values");
+    for name in VARS.iter().flat_map(|s| s.names) {
+        assert!(values.contains(&format!("`{name}`")), "Values should list `{name}`");
+    }
+    let grammar = guide_section("Grammar");
+    for k in Kw::ALL {
+        assert!(grammar.contains(&format!("\"{}\"", k.word())), "the grammar should use \"{}\"", k.word());
+    }
+}
+
+#[test]
+fn page_variables_are_typed_and_null_without_a_series() {
+    let mut ds = ds();
+    let id = 1_u64 << 53;
+    ds.features[0].id = id;
+    ds.features[1].id = id + 1;
+    let env = Env { page: Some(std::sync::Arc::new(SeriesPage { feature_id: id, name: "North".into(), number: 2 })), ..Env::default() };
+    for (text, expected) in [
+        ("@PAGE_FEATURE_ID", Value::Int(i64::try_from(id).unwrap())),
+        ("@page_name", Value::Text("North".into())),
+        ("@page_number", Value::Int(2)),
+    ] {
+        let e = parse(text, &ds).unwrap();
+        assert_eq!(value(&e, &ds, 0, &env), expected);
+        assert_eq!(value(&e, &ds, 0, &Env::default()), Value::Null);
+        assert!(reads_series_page(text));
+    }
+    let same = parse("$id = @page_feature_id", &ds).unwrap();
+    assert!(matches(&same, &ds, 0, &env));
+    assert!(!matches(&same, &ds, 1, &env), "adjacent large feature IDs have different pages");
+    let different = parse("@page_feature_id <> $id", &ds).unwrap();
+    assert!(!matches(&different, &ds, 0, &env));
+    assert!(matches(&different, &ds, 1, &env));
+    let listed = parse("$id IN (@page_feature_id)", &ds).unwrap();
+    assert!(matches(&listed, &ds, 0, &env));
+    assert!(!matches(&listed, &ds, 1, &env), "IN keeps adjacent large IDs apart too");
+    let after = parse("$id > @page_feature_id", &ds).unwrap();
+    assert_eq!((matches(&after, &ds, 0, &env), matches(&after, &ds, 1, &env)), (false, true), "ordering is exact too");
+    let written = parse("$id = '9007199254740993'", &ds).unwrap();
+    assert_eq!((eval(&written, &ds, 0), eval(&written, &ds, 1)), (false, true), "an id written as text is that id");
+    assert!(!eval(&same, &ds, 0));
+    assert!(!reads_series_page("'@page_feature_id' = !@page_number!"));
+}
+
+/// Each error that gives null says which it was; a null read from a field, written, or left by
+/// a guarded branch, and an error whose null a later step replaced, say nothing.
+#[test]
+fn errors_say_why_they_are_null() {
+    let d = ds();
+    let why = |text: &str, row: usize| {
+        let e = parse(text, &d).unwrap_or_else(|e| panic!("{text}: {e}"));
+        value_or_fault(&e, &d, row, &Env::default())
+    };
+    for (text, fault) in [
+        ("pop / 0", Fault::DivisionByZero),
+        ("pop % 0", Fault::DivisionByZero),
+        ("1.5 % 0", Fault::DivisionByZero),
+        ("0 ^ -1", Fault::DivisionByZero),
+        ("sqrt(0 - pop)", Fault::NegativeRoot),
+        ("ln(0)", Fault::Logarithm),
+        ("log10(0 - 1)", Fault::Logarithm),
+        ("exp(1000)", Fault::Overflow),
+        ("10 ^ 400", Fault::Overflow),
+        ("(0 - 8) ^ 0.5", Fault::NotANumber),
+        ("name * 2", Fault::Text),
+        ("sqrt(name)", Fault::Text),
+        ("to_real(name)", Fault::Text),
+        ("clamp(10, pop, 0)", Fault::ClampBounds),
+        ("scale_exp(0, 0, 10, 1, 2, -1)", Fault::DivisionByZero),
+        ("round(pop / 0) + 1", Fault::DivisionByZero),
+        // An error's null in either position of an operator still reports.
+        ("(1 / 0) * 2", Fault::DivisionByZero),
+        ("2 * (1 / 0)", Fault::DivisionByZero),
+        ("1 / 0 * 2", Fault::DivisionByZero),
+        ("sqrt(1 / 0)", Fault::DivisionByZero),
+        ("round(1 / 0, 0)", Fault::DivisionByZero),
+        ("nullif(pop / 0, 1)", Fault::DivisionByZero),
+        ("'(' || (pop / 0) || ')'", Fault::DivisionByZero),
+    ] {
+        assert_eq!(why(text, 0), (Value::Null, Some(fault)), "{text}");
+    }
+    // A function that skips nulls has each null argument as a cause: fixing the error alone gives
+    // a value, so the error is said even beside a missing argument.
+    for text in ["coalesce(1 / 0, pop)", "max(1 / 0, pop)", "min(pop, sqrt(-1))"] {
+        assert!(why(text, 3).1.is_some(), "{text}");
+    }
+    // Null in, null out, without an error; what an expression asks for or guards against.
+    for (text, row) in [
+        ("pop / 2", 3),
+        ("null", 0),
+        ("if(pop > 0, 1)", 3),
+        ("if(pop / 0 > 1, 1, null)", 0),
+        ("CASE WHEN pop / 0 > 1 THEN 1 END", 0),
+        ("CASE pop WHEN 1 / 0 THEN 1 END", 0),
+        ("nullif(pop, pop)", 0),
+        // The division's null was replaced; the result is null because `pop` is.
+        ("coalesce(1 / 0, 0) / pop", 3),
+        // An error that only decided a condition, a CASE's arm or what nullif compares with.
+        ("if((1 / 0 IS NULL) AND NULL, 1)", 0),
+        ("CASE 1 / 0 WHEN 1 THEN 2 ELSE NULL END", 0),
+        ("nullif(NULL, 1 / 0)", 0),
+        // A missing operand makes an operator's result null whatever else failed.
+        ("1 / 0 + pop", 3),
+        ("pop * (1 / 0)", 3),
+        ("(1 / 0) || pop", 3),
+        ("clamp(pop, 1 / 0, 5)", 3),
+        // Empty or `<null>` text is missing, not text that isn't a number.
+        ("'' * 2", 0),
+        ("'' * (1 / 0)", 0),
+        ("(1 / 0) - '<null>'", 0),
+        ("sqrt('<null>')", 0),
+        ("clamp('', 1 / 0, 5)", 0),
+        ("'' + '' - (1 / 0)", 0),
+        ("round('', 1 / 0)", 0),
+    ] {
+        assert_eq!(why(text, row), (Value::Null, None), "{text}");
+    }
+    assert_eq!(why("coalesce(pop / 0, 7)", 0), (Value::Int(7), None));
+    // The arm a CASE takes keeps its own error.
+    assert_eq!(why("CASE 1 / 0 WHEN 1 THEN 2 ELSE sqrt(-1) END", 0), (Value::Null, Some(Fault::NegativeRoot)));
+    assert_eq!(why("(1 / 0 IS NULL) AND NULL", 0), (Value::Null, None));
+    assert_eq!(arith(Arith::Mod, &Value::Int(i64::MIN), &Value::Int(-1)), Ok(Value::Int(0)));
+    // A stored infinity or NaN isn't joined as text: `+` on it is null, and says why.
+    let mut odd = Dataset::new("odd", GeometryType::None, vec![Field::new("x", FieldType::Double)]);
+    odd.push(None, vec![Value::Float(f64::INFINITY)]);
+    odd.push(None, vec![Value::Float(f64::NAN)]);
+    for (text, row) in [("x + 1", 0), ("x + 1", 1), ("'pop ' + x", 0)] {
+        let e = parse(text, &odd).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(value_or_fault(&e, &odd, row, &Env::default()), (Value::Null, Some(Fault::NotANumber)), "{text}, row {row}");
+    }
+    assert_eq!(why("sqrt(0)", 0), (Value::Float(0.0), None));
 }

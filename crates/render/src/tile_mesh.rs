@@ -49,6 +49,8 @@ pub struct TileMesh {
     /// Made while the sprite was on its way, without the pattern fills: made again once it has
     /// arrived.
     pub waiting: bool,
+    /// The ids of the style's sprites its pattern fills were made from, if it has any.
+    pub sheets: Option<Vec<String>>,
 }
 
 /// The indices of one or more style layers showing at the same zooms.
@@ -253,7 +255,7 @@ pub fn tessellate(tile: &Tile, runs: &[Run], z: u8) -> TileMesh {
             _ => mesh_runs.push(MeshRun { first, count, min_zoom: run.min_zoom, max_zoom: run.max_zoom }),
         }
     }
-    TileMesh { vertices: out.vertices, indices: out.indices, runs: mesh_runs, waiting: false }
+    TileMesh { vertices: out.vertices, indices: out.indices, runs: mesh_runs, waiting: false, sheets: None }
 }
 
 /// The most points of a ring fanned rather than given to lyon: the walk round it stays cheap,
@@ -350,6 +352,16 @@ struct Entry {
     /// Made while the sprite was on its way: made again once it has arrived (or failed), not
     /// before.
     waiting: bool,
+    /// The ids of the style's sprites its pattern fills were made from, if it has any.
+    sheets: Option<Vec<String>>,
+}
+
+/// Whether a mesh made from the sprites `sheets`, `waiting` for them or not, still serves while
+/// `pending` of them are on their way and `read` have been read. Other sprites read (one that
+/// failed read after all, or another failing instead) make those with pattern fills again, once;
+/// until then they stand, however long one keeps failing.
+fn still_serves(waiting: bool, sheets: Option<&[String]>, pending: bool, read: &[String]) -> bool {
+    pending || (!waiting && sheets.is_none_or(|ids| ids == read))
 }
 
 #[derive(Default)]
@@ -368,18 +380,28 @@ fn lock() -> MutexGuard<'static, Store> {
 /// (while its tile and the style are, and within a memory budget; one made while the sprite was
 /// on its way until it has arrived); `None` for one that is no vector tile, or not made
 /// yet: with `until`, those missing are made nearest `centre` first until then (a round of them
-/// at least). Natively, they are made on several threads.
+/// at least). Natively, they are made on several threads. Also whether the sprites of its pattern
+/// fills are on their way, as a mesh kept meanwhile (one made when a sprite failed, which is now
+/// tried again) doesn't say so itself.
 pub fn meshes(
     style: &Arc<Resolved>,
     source: &str,
     tiles: &[DataTile],
     level: u8,
     until: Option<(web_time::Instant, [f64; 2])>,
-) -> Vec<Option<Arc<TileMesh>>> {
+) -> (Vec<Option<Arc<TileMesh>>>, bool) {
     // Whether the style's sprite is still on its way, asked before the store is locked (a
     // lookup in the sprites the tile cache keeps).
-    let sprite_pending =
-        style.sprite.as_deref().is_some_and(|b| matches!(rustgis_tiles::sprite::load(b, false), rustgis_tiles::sprite::Load::Pending));
+    let (sprite_pending, sprites_read) = if rustgis_tiles::shapes::draws_patterns(style, level) {
+        match style.load_sprites(false) {
+            rustgis_tiles::sprite::Load::Pending => (true, Vec::new()),
+            rustgis_tiles::sprite::Load::Ready(s) => (false, s.sheet_ids()),
+            rustgis_tiles::sprite::Load::Failed => (false, Vec::new()),
+        }
+    } else {
+        // No pattern fills here: nothing to load the sprites for.
+        (false, Vec::new())
+    };
     let key = |t: &DataTile| Key { payload: Arc::as_ptr(&t.payload) as usize, style: Arc::as_ptr(style) as usize, level };
     let mut out: Vec<Option<Arc<TileMesh>>> = Vec::with_capacity(tiles.len());
     let mut missing = Vec::new();
@@ -394,7 +416,7 @@ pub fn meshes(
             let found = s.entries.get_mut(&key(t)).filter(|e| {
                 e.payload.upgrade().is_some_and(|p| Arc::ptr_eq(&p, &t.payload))
                     && e.style.upgrade().is_some_and(|x| Arc::ptr_eq(&x, style))
-                    && (!e.waiting || sprite_pending)
+                    && still_serves(e.waiting, e.sheets.as_deref(), sprite_pending, &sprites_read)
             });
             match found {
                 Some(e) => {
@@ -420,7 +442,7 @@ pub fn meshes(
         let t = tiles.get(*i)?;
         let Payload::Vector(tile) = &*t.payload else { return None };
         let s = shapes(style, source, tile, level);
-        Some(Arc::new(TileMesh { waiting: s.waiting, ..tessellate(tile, &s.runs, t.z) }))
+        Some(Arc::new(TileMesh { waiting: s.waiting, sheets: s.sheets, ..tessellate(tile, &s.runs, t.z) }))
     };
     // A tile that panicked (hostile data) is done: an empty mesh, kept, so it isn't made again
     // every frame, and the map settles.
@@ -436,7 +458,7 @@ pub fn meshes(
             };
             let mut order: Vec<usize> = (0..missing.len()).collect();
             order.sort_by(|a, b| far(&missing[*a]).total_cmp(&far(&missing[*b])));
-            let round = if cfg!(target_arch = "wasm32") { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get()).min(16) };
+            let round = rustgis_data::threads::max();
             let mut made: Vec<Option<Arc<TileMesh>>> = vec![None; missing.len()];
             for (n, some) in order.chunks(round).enumerate() {
                 if n > 0 && web_time::Instant::now() >= until {
@@ -461,6 +483,7 @@ pub fn meshes(
             mesh: mesh.clone(),
             used: tick,
             waiting: mesh.waiting,
+            sheets: mesh.sheets.clone(),
         };
         // The bytes are counted again by `evict`, below.
         s.entries.insert(key(t), entry);
@@ -476,7 +499,7 @@ pub fn meshes(
     }
     // Every call, so meshes of tiles the cache let go go as the map moves over others.
     evict(&mut s, tick);
-    out
+    (out, sprite_pending)
 }
 
 /// `f` of every item (`None` for one that panicked), natively shared among threads. In the
@@ -485,24 +508,27 @@ pub fn meshes(
 fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<Option<R>> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(items.len()).min(16);
+        let threads = rustgis_data::threads::for_items(items.len());
         if threads > 1 {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let out: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
-            std::thread::scope(|scope| {
-                for _ in 0..threads {
-                    scope.spawn(|| {
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(item) = items.get(i) else { break };
-                            // A tile that panics (hostile data) gives no mesh, rather than the frame.
-                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item))).ok();
-                            if let Some(slot) = out.lock().unwrap_or_else(|e| e.into_inner()).get_mut(i) {
-                                *slot = r;
-                            }
-                        }
-                    });
+            let work = || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    // A tile that panics (hostile data) gives no mesh, rather than the frame.
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item))).ok();
+                    if let Some(slot) = out.lock().unwrap_or_else(|e| e.into_inner()).get_mut(i) {
+                        *slot = r;
+                    }
                 }
+            };
+            std::thread::scope(|scope| {
+                // A thread the OS refuses costs speed, not the frame: this one takes items too.
+                for _ in 1..threads {
+                    let _ = std::thread::Builder::new().spawn_scoped(scope, work);
+                }
+                work();
             });
             return out.into_inner().unwrap_or_else(|e| e.into_inner());
         }
@@ -629,6 +655,78 @@ mod tests {
     }
 
     #[test]
+    fn a_mesh_is_made_again_when_other_sprites_are_read() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let (none, a, b, both) = (ids(&[]), ids(&["a"]), ids(&["b"]), ids(&["a", "b"]));
+        // Without pattern fills it stands, whatever the sprites do.
+        assert!(still_serves(false, None, false, &none) && still_serves(false, None, false, &both));
+        // Made from all that could be read: it stands while the other keeps failing...
+        assert!(still_serves(false, Some(&a), false, &a));
+        // ...and while that one is asked for again...
+        assert!(still_serves(false, Some(&a), true, &none));
+        // ...and is made again, once, when it is read.
+        assert!(!still_serves(false, Some(&a), false, &both));
+        assert!(still_serves(false, Some(&both), false, &both));
+        // As many sprites, but another one: made again.
+        assert!(!still_serves(false, Some(&a), false, &b));
+        // Made while they were on their way: until they've come.
+        assert!(still_serves(true, Some(&none), true, &none));
+        assert!(!still_serves(true, Some(&none), false, &both) && !still_serves(true, Some(&none), false, &none));
+        // None could be read: it stands, not made again on every frame.
+        assert!(still_serves(false, Some(&none), false, &none));
+    }
+
+    #[test]
+    fn meshes_say_a_sprite_is_on_its_way() {
+        use rustgis_tiles::style::{Source, Style, StyleLayer};
+        // Left unanswered, so the sprite stays on its way.
+        crate::tiles::tests::serve();
+        let address = "https://stuck.test/mesh-sprite".to_owned();
+        let resolved = |paint: serde_json::Value| {
+            let layer = serde_json::json!({"id": "p", "type": "fill", "source": "s", "source-layer": "l", "paint": paint});
+            let sprites = vec![("default".to_owned(), address.clone())];
+            Arc::new(Resolved {
+                from: None,
+                style: Style {
+                    name: String::new(),
+                    sources: vec![("s".into(), Source::parse(&serde_json::json!({"type": "vector", "tiles": ["x/{z}/{x}/{y}"]})))],
+                    layers: StyleLayer::parse(&layer).into_iter().collect(),
+                    glyphs: None,
+                    sprites: sprites.clone(),
+                    sprites_left_out: Vec::new(),
+                    sprites_listed: 1,
+                    view: Default::default(),
+                },
+                sprites,
+                attribution: Vec::new(),
+                left_out: Vec::new(),
+                made: std::sync::Mutex::new(web_time::Instant::now()),
+                waiting: false,
+                retry: false,
+            })
+        };
+        assert!(meshes(&resolved(serde_json::json!({"fill-pattern": "dots"})), "s", &[], 3, None).1);
+        // Without pattern fills, a mesh doesn't wait for sprites.
+        assert!(!meshes(&resolved(serde_json::json!({"fill-color": "#f00"})), "s", &[], 3, None).1);
+        // A public style's private sprite must be refused synchronously, not queued by
+        // this preliminary GPU lookup. `serve` answers without opening any sockets.
+        let mut private = resolved(serde_json::json!({"fill-pattern":"dots"}));
+        let style = Arc::get_mut(&mut private).unwrap();
+        style.from = Some(rustgis_tiles::address::Origin::named("https://mesh-style.example/style.json"));
+        style.sprites = vec![("default".into(), "http://127.0.0.1/mesh-private-only".into())];
+        let id = TileId { z: 3, x: 0, y: 0 };
+        let tiles = [DataTile { payload: Arc::new(Payload::Vector(tile())), at: id.extent(), z: id.z, clip: id.extent() }];
+        let (made, waiting) = meshes(&private, "s", &tiles, 3, None);
+        assert!(!waiting, "a refused sprite must never become a pending fetch");
+        assert!(made.first().and_then(Option::as_ref).is_some_and(|m| !m.waiting));
+        assert_eq!(
+            crate::tiles::tests::PRIVATE_SPRITE_REQUESTS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "neither sprite JSON nor PNG may reach the fetcher"
+        );
+    }
+
+    #[test]
     fn meshes_are_made_once() {
         let mut t = tile();
         t.layers[0].name = "parks".into();
@@ -636,33 +734,37 @@ mod tests {
         use rustgis_tiles::style::{Source, Style, StyleLayer};
         let layer = serde_json::json!({"id": "p", "type": "fill", "source": "s", "source-layer": "parks", "paint": {"fill-color": "#f00"}});
         let style = Arc::new(Resolved {
+            from: None,
             style: Style {
                 name: String::new(),
                 sources: vec![("s".into(), Source::parse(&serde_json::json!({"type": "vector", "tiles": ["x/{z}/{x}/{y}"]})))],
                 layers: StyleLayer::parse(&layer).into_iter().collect(),
                 glyphs: None,
-                sprite: None,
+                sprites: Vec::new(),
+                sprites_left_out: Vec::new(),
+                sprites_listed: 0,
                 view: Default::default(),
             },
-            sprite: None,
+            sprites: Vec::new(),
             attribution: Vec::new(),
             left_out: Vec::new(),
             made: std::sync::Mutex::new(web_time::Instant::now()),
             waiting: false,
+            retry: false,
         });
         let at = Extent::new(0.0, 0.0, 1.0, 1.0);
         let tiles =
             [DataTile { payload: payload.clone(), at, z: 1, clip: at }, DataTile { payload: Arc::new(Payload::Empty), at, z: 1, clip: at }];
-        let a = meshes(&style, "s", &tiles, 3, None);
+        let (a, _) = meshes(&style, "s", &tiles, 3, None);
         assert!(a[0].as_ref().is_some_and(|m| !m.indices.is_empty()) && a[1].is_none());
-        let b = meshes(&style, "s", &tiles, 3, None);
+        let (b, _) = meshes(&style, "s", &tiles, 3, None);
         // A payload standing in twice is made once, for both.
         let twice = [tiles[0].clone(), tiles[0].clone()];
-        let t = meshes(&style, "s", &twice, 6, None);
+        let (t, _) = meshes(&style, "s", &twice, 6, None);
         assert!(Arc::ptr_eq(t[0].as_ref().unwrap(), t[1].as_ref().unwrap()));
         assert!(Arc::ptr_eq(a[0].as_ref().unwrap(), b[0].as_ref().unwrap()), "kept");
         // Another level is another mesh.
-        let c = meshes(&style, "s", &tiles, 4, None);
+        let (c, _) = meshes(&style, "s", &tiles, 4, None);
         assert!(!Arc::ptr_eq(a[0].as_ref().unwrap(), c[0].as_ref().unwrap()));
         // Out of time before it starts: a round made, nearest the centre first; the rest later.
         let many: Vec<DataTile> = (0..64)
@@ -671,10 +773,10 @@ mod tests {
                 DataTile { payload: Arc::new(Payload::Vector(tile_named("parks"))), at, z: 1, clip: at }
             })
             .collect();
-        let some = meshes(&style, "s", &many, 5, Some((web_time::Instant::now(), [63.5, 0.5])));
+        let (some, _) = meshes(&style, "s", &many, 5, Some((web_time::Instant::now(), [63.5, 0.5])));
         let made = some.iter().filter(|m| m.is_some()).count();
         assert!(made >= 1 && made < many.len() && some[63].is_some() && some[0].is_none(), "{made} made");
-        let all = meshes(&style, "s", &many, 5, Some((web_time::Instant::now() + std::time::Duration::from_secs(60), [0.0, 0.0])));
+        let (all, _) = meshes(&style, "s", &many, 5, Some((web_time::Instant::now() + std::time::Duration::from_secs(60), [0.0, 0.0])));
         assert!(all.iter().all(Option::is_some));
     }
 

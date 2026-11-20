@@ -76,6 +76,9 @@ pub struct AssistantState {
     /// may block or ask (desktop only).
     #[cfg(not(target_arch = "wasm32"))]
     sign_in_read: Option<SignInRead>,
+    /// A refused saved-account store is reported once through this app session's notices.
+    #[cfg(not(target_arch = "wasm32"))]
+    sign_in_store_error_said: bool,
     /// The first sign-in's confirmation that the ChatGPT plan is in use, until dismissed.
     welcome: bool,
     /// A failed request to send again: its generation and when.
@@ -260,25 +263,49 @@ fn sync_skills(app: &mut RustGisApp, force: bool) {
     }
 }
 
-/// A sign-in read under way: the account it checks (`None`: take whichever is selected) and
-/// where the worker leaves what it read.
+/// A saved account and the reason its store or tokens could not be read.
 #[cfg(not(target_arch = "wasm32"))]
-type SignInRead = (Option<chatgpt::Binding>, Slot<Option<chatgpt::Credentials>>);
+type SignInResult = (Option<chatgpt::Credentials>, Option<rustgis_assistant::Error>);
+/// A read under way: the account checked (`None`: whichever is selected) and its result slot.
+#[cfg(not(target_arch = "wasm32"))]
+type SignInRead = (Option<chatgpt::Binding>, Slot<SignInResult>);
 
 /// Starts reading the selected ChatGPT sign-in on a worker; [`poll_sign_in`] applies it. With
 /// `checking`, it only says whether that sign-in is still there (after a failed request).
 #[cfg(not(target_arch = "wasm32"))]
 fn read_sign_in(app: &mut RustGisApp, checking: Option<chatgpt::Binding>, ctx: &egui::Context) {
-    let slot: Slot<Option<chatgpt::Credentials>> = Slot::default();
+    let slot: Slot<SignInResult> = Slot::default();
     let (out, ctx) = (slot.clone(), ctx.clone());
     std::thread::spawn(move || {
-        let c = chatgpt::load_any();
+        let c = chatgpt::load_any_report();
         if let Ok(mut s) = out.lock() {
             *s = Some(c);
         }
         ctx.request_repaint();
     });
     app.assistant.sign_in_read = Some((checking, slot));
+}
+
+/// Keeps account-store refusal visible without emitting the same failure on every poll.
+#[cfg(not(target_arch = "wasm32"))]
+fn sign_in_store_error(app: &mut RustGisApp, error: rustgis_assistant::Error) {
+    if !app.assistant.sign_in_store_error_said {
+        app.assistant.sign_in_store_error_said = true;
+        app.session.warn(crate::i18n::fmt("Could not read saved ChatGPT sign-ins: {reason}", &[("reason", &error.to_string())]));
+    }
+    app.assistant.login_error = Some(error.auth_context());
+}
+
+/// Reads the account list while preserving the same refusal notice as the background read.
+#[cfg(not(target_arch = "wasm32"))]
+fn saved_accounts(app: &mut RustGisApp) -> Vec<chatgpt::Credentials> {
+    match chatgpt::accounts() {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            sign_in_store_error(app, error);
+            Vec::new()
+        }
+    }
 }
 
 /// Applies a finished sign-in read, if the sign-in provider is still the one chosen (account
@@ -293,6 +320,10 @@ fn poll_sign_in(app: &mut RustGisApp, ctx: &egui::Context) {
     let checking = checking.clone();
     app.assistant.sign_in_read = None;
     let Some(cfg) = app.assistant.agent.as_ref().map(|a| a.config.clone()).filter(Config::login) else { return };
+    let (read, warning) = read;
+    if let Some(warning) = warning {
+        sign_in_store_error(app, warning);
+    }
     let usable = read.filter(|c| c.signed_in() && c.plan_allowed());
     if let Some(binding) = checking {
         // Still signed in, or another account selected and signed in (requests for this one
@@ -414,7 +445,10 @@ fn dispatch(app: &mut RustGisApp, req: HttpRequest, login: Option<chatgpt::Bindi
     if !provider::allowed_url(&req.url) {
         fail(
             &slot,
-            crate::i18n::fmt("{url}: only HTTPS addresses, or plain HTTP on this computer or network, are allowed", &[("url", &req.url)]),
+            crate::i18n::fmt(
+                "{url}: only HTTPS addresses, or plain HTTP on this computer or network, are allowed",
+                &[("url", &rustgis_engine::sources::address_in_message(&req.url))],
+            ),
         );
         return slot;
     }
@@ -487,7 +521,7 @@ fn signed_in(app: &mut RustGisApp, c: &chatgpt::Credentials, ctx: &egui::Context
     app.assistant.sign_in_read = None;
     app.assistant.account = Some(c.account());
     app.assistant.login_error = None;
-    let saved = chatgpt::accounts().unwrap_or_default();
+    let saved = saved_accounts(app);
     // "Use another account" with an account already saved registers RustGIS for it again.
     app.assistant.duplicate = saved.iter().any(|a| a.subject == c.subject && a.client_id != c.client_id);
     app.assistant.accounts = Some(saved);
@@ -1107,7 +1141,10 @@ fn account_row(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, cfg: &mut Config) 
         }
         return;
     }
-    let saved = app.assistant.accounts.get_or_insert_with(|| chatgpt::accounts().unwrap_or_default()).clone();
+    if app.assistant.accounts.is_none() {
+        app.assistant.accounts = Some(saved_accounts(app));
+    }
+    let saved = app.assistant.accounts.clone().unwrap_or_default();
     let active = saved.iter().find(|c| c.client_id == cfg.client_id && c.subject == cfg.account);
     let label = active.map(chatgpt::Credentials::label).unwrap_or_else(|| tl!("Choose an account").into());
     let picker = egui::ComboBox::from_id_salt("assistant_account").selected_text(label).width(180.0).truncate().show_ui(ui, |ui| {
@@ -1319,6 +1356,9 @@ fn local_agents_setting(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         );
     }
     if app.assistant.local_agents && ui.checkbox(&mut app.assistant.agents_auto, tl!("Approve agents' actions without asking")).changed() {
+        // Publish the change before returning from the widget: a held ACP reply can arrive
+        // before the next frame polls threads.
+        app.assistant.threads.set_auto(app.assistant.agents_auto);
         save_pref(app, "assistant_agents_auto", if app.assistant.agents_auto { "on" } else { "off" });
         if let Some(a) = app.assistant.agent.as_mut() {
             a.set_agents_auto(app.assistant.agents_auto);
@@ -1371,13 +1411,13 @@ fn skills_setting(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         ui.horizontal_wrapped(|ui| {
             let mut picked = None;
             if ui.button(tl!("Add skill…")).clicked() {
-                picked = rfd::FileDialog::new()
+                picked = crate::filedialog::FileDialog::new()
                     .set_title(tl!("Add skill…"))
                     .add_filter(tl!("Skill (SKILL.md or .zip)"), &["md", "zip"])
                     .pick_file();
             }
             if ui.button(tl!("Add folder…")).clicked() {
-                picked = rfd::FileDialog::new().set_title(tl!("Add folder…")).pick_folder();
+                picked = crate::filedialog::FileDialog::new().set_title(tl!("Add folder…")).pick_folder();
             }
             if let Some(path) = picked {
                 done = Some(
@@ -1481,14 +1521,28 @@ fn composer(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, busy: bool, ctx: &egu
     #[cfg(not(target_arch = "wasm32"))]
     crate::agentthreads::list(app, ui, t);
     // An action waiting for approval comes first.
-    let pending = app.assistant.agent.as_ref().and_then(|a| a.pending(&app.session));
-    if let Some((what, why, can_always)) = pending {
+    let pending = app
+        .assistant
+        .agent
+        .as_ref()
+        .and_then(|a| a.pending(&app.session).map(|(what, why, always)| (what, why, always, a.pending_review().cloned())));
+    if let Some((what, why, can_always, review)) = pending {
         egui::Frame::NONE.fill(t.amber.gamma_multiply(0.15)).corner_radius(6).inner_margin(8).stroke(egui::Stroke::new(1.0, t.amber)).show(
             ui,
             |ui| {
                 ui.label(RichText::new(tl!("Allow this action?")).font(semibold(12.5)));
-                ui.label(RichText::new(crate::i18n::fmt("The assistant wants to run this, and {why}:", &[("why", tl_raw!(&why))])).small());
-                ui.label(RichText::new(what).monospace().small());
+                egui::ScrollArea::vertical().max_height(280.0).id_salt(("assistant_approval", &what, &why)).show(ui, |ui| {
+                    if let Some(review) = &review {
+                        crate::approvalcard::show(ui, &app.session.registry, review);
+                    } else {
+                        // Legacy requests have no structured review: keep all their context visible.
+                        ui.label(
+                            RichText::new(crate::i18n::fmt("The assistant wants to run this, and {why}:", &[("why", tl_raw!(&why))]))
+                                .small(),
+                        );
+                        ui.add(egui::Label::new(RichText::new(&what).monospace().small()).wrap());
+                    }
+                });
                 // Plugin commands, scripts and replacing the project are asked about every time.
                 if can_always {
                     ui.checkbox(&mut app.assistant.always, tl!("Allow such actions for this conversation"));
@@ -1790,8 +1844,19 @@ fn inline(ui: &Ui, text: &str, t: &Tokens, size: f32, heading: bool) -> egui::te
     job
 }
 
+/// A peer's project cannot inherit a pending approval, provider reply or queued user action.
+pub(crate) fn peer_replaced(app: &mut RustGisApp) {
+    if let Some(agent) = &mut app.assistant.agent {
+        agent.project_replaced();
+    }
+    app.assistant.inflight = None;
+    app.assistant.chunks = None;
+    app.assistant.queued = None;
+    app.assistant.always = false;
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1847,7 +1912,7 @@ mod tests {
                 return;
             }
             assert!(std::time::Instant::now() < end, "fake keychain timed out");
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(1)); // test-wait: legacy polling for the fake keychain
         }
     }
 
@@ -2058,6 +2123,28 @@ mod tests {
         )
     }
 
+    /// Render the real local-agent settings without polling threads, preserving the interval
+    /// between a checkbox callback and the next poll while the fake ACP agent replies.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn local_agents_harness(mut app: RustGisApp) -> egui_kittest::Harness<'static, RustGisApp> {
+        app.assistant.local_agents = true;
+        app.assistant.agents_auto = true;
+        app.assistant.agents_found = Some((Vec::new(), Vec::new()));
+        let mut fonts = false;
+        egui_kittest::Harness::builder().with_size(vec2(700.0, 350.0)).build_ui_state(
+            move |ui, app| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                local_agents_setting(app, ui, &Tokens::light());
+            },
+            app,
+        )
+    }
+
     /// The actual Remember checkbox goes through the deferred save path and deletes the stored key.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -2177,7 +2264,7 @@ mod tests {
             .any(|p| matches!(app.assistant.keys.status(p), Some(crate::assistantkeys::Status::Pending { .. })))
         {
             assert!(std::time::Instant::now() < end);
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(1)); // test-wait: legacy polling for migrated provider keys
             poll_keys(&mut app, &ctx);
         }
         assert!(app.assistant.agent.is_none());
@@ -2234,6 +2321,92 @@ mod tests {
         assert!(h.state().assistant.chunks.is_none());
         assert!(h.state().assistant.inflight.is_none());
         assert!(!h.state().assistant.agent.as_ref().unwrap().busy());
+    }
+
+    /// Real pending reviews keep their reach visible while exact requests wait under Details.
+    #[test]
+    fn compact_approval_details_preserve_frozen_request_and_defaults() {
+        use egui_kittest::kittest::Queryable;
+        use serde_json::json;
+
+        for (tool, args, expected) in [
+            (
+                "run",
+                json!({"script": concat!(
+                    "layer.visibility {\"layer\":\"Countries\",\"visible\":false}\n",
+                    "layer.visibility {\"visible\":false}\n",
+                    "map.addTiles {\"name\":\"Synthetic tiles\",\"url\":\"https://tiles.invalid/{z}/{x}/{y}.png\"}"
+                )}),
+                vec!["3 project edits", "line 3 (map.addTiles)", "World / Countries", "https://tiles.invalid/{z}/{x}/{y}.png"],
+            ),
+            (
+                "run_command",
+                json!({"command":"layer.addSql","params":{"sql":"FROM t","database":"/synthetic/views.duckdb"}}),
+                vec!["views in the database /synthetic/views.duckdb", "Destinations"],
+            ),
+        ] {
+            let mut app = RustGisApp::with_sample();
+            app.session.run("map.basemap", &json!({"name":"ocean"})).unwrap();
+            app.session.run("layer.select", &json!({"layer":"Cities"})).unwrap();
+            let config = Config {
+                provider: "custom".into(),
+                base_url: "https://provider.invalid/v1".into(),
+                model: "synthetic".into(),
+                key: String::new(),
+                account: String::new(),
+                client_id: String::new(),
+                session: String::new(),
+                reasoning: None,
+                tool_output_token_limit: rustgis_assistant::tools::DEFAULT_OUTPUT_TOKENS,
+            };
+            let mut agent = Agent::new(config, &app.session);
+            assert!(matches!(agent.ask("Review only", &app.session), Step::Send(_)));
+            let body = json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+                "id":"compact-card","type":"function","function":{"name":tool,"arguments":args.to_string()}
+            }]},"finish_reason":"tool_calls"}]})
+            .to_string()
+            .into_bytes();
+            assert_eq!(
+                agent.receive(agent.generation(), Ok(HttpResponse { status: 200, body, headers: vec![] }), &mut app.session),
+                Step::Confirm
+            );
+            let exact = agent.pending_review().unwrap().what.clone();
+            let can_always = agent.pending(&app.session).unwrap().2;
+            let project = serde_json::to_value(&app.session.project).unwrap();
+            app.assistant.agent = Some(agent);
+            let mut fonts = false;
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(680.0, 600.0)).build_ui_state(
+                move |ui, app: &mut RustGisApp| {
+                    if !fonts {
+                        crate::theme::install_fonts(ui.ctx(), &[], None);
+                        fonts = true;
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    let ctx = ui.ctx().clone();
+                    composer(app, ui, &Tokens::light(), true, &ctx);
+                },
+                app,
+            );
+            h.run();
+            assert!(h.query_by_label(&exact).is_none(), "raw vehicle starts collapsed");
+            for text in expected {
+                assert!(h.query_by_label_contains(text).is_some(), "missing overview context: {text}");
+            }
+            assert!(h.query_by_label_contains("Starting active layer: Cities; selected layers: [Cities]").is_some());
+            assert_eq!(h.query_by_label("Allow such actions for this conversation").is_some(), can_always);
+            h.get_by_label("Details").click();
+            h.run();
+            h.get_by_label(&exact);
+            h.get_by_label("Allow");
+            h.get_by_label("Decline");
+            h.get_by_label("Details").click();
+            h.run();
+            assert!(h.query_by_label(&exact).is_none());
+            assert_eq!(h.state().assistant.agent.as_ref().unwrap().pending_review().unwrap().what, exact);
+            assert_eq!(serde_json::to_value(&h.state().session.project).unwrap(), project);
+            assert!(!h.state().assistant.always);
+        }
     }
 
     #[test]
@@ -2425,7 +2598,7 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while app.assistant.models_slot.is_none() && app.assistant.models_error.is_none() {
             assert!(std::time::Instant::now() < end, "the sign-in read never finished");
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(1)); // test-wait: legacy polling for saved-account models
             poll(&mut app, &ctx);
         }
         assert_eq!(app.assistant.account.as_ref().map(|a| a.kept), Some(chatgpt::Kept::SettingsFile));
@@ -2460,22 +2633,51 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while h.state().assistant.models_slot.is_none() {
             assert!(std::time::Instant::now() < end, "the sign-in read never finished");
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(1)); // test-wait: legacy polling for switched-account models
             h.run_steps(1);
         }
         h.state_mut().assistant.models_slot = None;
         // A read begun before choosing an account must not undo the choice when it finishes.
-        let stale: Slot<Option<chatgpt::Credentials>> = Slot::default();
+        let stale: Slot<SignInResult> = Slot::default();
         h.state_mut().assistant.sign_in_read = Some((None, stale.clone()));
         h.get_by_value(&a.label()).click();
         h.run_steps(4);
         h.get_by_label(&b.label()).click();
         h.run_steps(4);
-        *stale.lock().unwrap() = Some(Some(a.clone()));
+        *stale.lock().unwrap() = Some((Some(a.clone()), None));
         h.run_steps(4);
         assert!(h.state().assistant.models_slot.is_some());
         assert_eq!(h.state().assistant.agent.as_ref().unwrap().config.client_id, b.client_id);
         assert_eq!(chatgpt::load_any().unwrap().client_id, b.client_id);
+    }
+
+    /// A refused store is distinct from no saved account and reaches notices once, not just logs.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_refused_sign_in_read_is_visible_once_and_a_clean_read_is_quiet() {
+        let ctx = egui::Context::default();
+        let mut app = plan_app();
+        app.session.notices.clear();
+        let finish = |app: &mut RustGisApp, warning: Option<rustgis_assistant::Error>| {
+            let slot: Slot<SignInResult> = Slot::default();
+            *slot.lock().unwrap() = Some((None, warning));
+            app.assistant.sign_in_read = Some((None, slot));
+            poll_sign_in(app, &ctx);
+        };
+        finish(&mut app, None);
+        assert!(app.session.notices.is_empty());
+        let warning =
+            rustgis_assistant::Error::new(rustgis_assistant::Recovery::Auth, "the ChatGPT sign-ins were saved by a newer RustGIS");
+        finish(&mut app, Some(warning.clone()));
+        finish(&mut app, Some(warning));
+        assert_eq!(app.session.notices.len(), 1);
+        assert!(app.session.notices[0].text.contains("newer RustGIS"));
+        assert!(app.assistant.login_error.as_ref().unwrap().detail.contains("newer RustGIS"));
+        let mut other = plan_app();
+        other.assistant.agent.as_mut().unwrap().config = Config::from_env("custom");
+        other.session.notices.clear();
+        finish(&mut other, Some("a stale read for another provider".into()));
+        assert!(other.session.notices.is_empty() && other.assistant.login_error.is_none());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2494,8 +2696,8 @@ mod tests {
             ..Default::default()
         };
         let finish = |app: &mut RustGisApp, checking: Option<chatgpt::Binding>, read: Option<chatgpt::Credentials>| {
-            let slot: Slot<Option<chatgpt::Credentials>> = Slot::default();
-            *slot.lock().unwrap() = Some(read);
+            let slot: Slot<SignInResult> = Slot::default();
+            *slot.lock().unwrap() = Some((read, None));
             app.assistant.sign_in_read = Some((checking, slot));
             poll_sign_in(app, &ctx);
         };

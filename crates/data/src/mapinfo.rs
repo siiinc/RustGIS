@@ -21,10 +21,6 @@ const MAX_COORDS: usize = 10_000_000;
 /// The most rings of a region whose holes are found by nesting (the test is quadratic).
 const MAX_NESTED_RINGS: usize = 5_000;
 
-pub fn is_mif_name(name: &str) -> bool {
-    std::path::Path::new(name).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("mif"))
-}
-
 /// The words of the file, with quoted strings as single words (quotes dropped).
 fn words(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -96,7 +92,7 @@ fn coordsys(w: &[String]) -> std::result::Result<Option<Crs>, String> {
     };
     let proj4 = format!("{proj} {datum_proj} {unit} +no_defs");
     let label = format!("MapInfo projection {ty}");
-    Crs::custom(CustomCrs { proj4, label, geokeys: Vec::new(), doubles: Vec::new(), ascii: String::new() }).map(Some)
+    Crs::custom(CustomCrs { proj4, label, geokeys: Vec::new(), doubles: Vec::new(), ascii: String::new(), wkt: None }).map(Some)
 }
 
 /// Even-odd point in ring.
@@ -386,7 +382,7 @@ pub fn read(mif: &str, mid: Option<&str>, name: &str) -> Result<(Dataset, ReadRe
             }
         },
     };
-    let mut lost = 0usize;
+    let (mut lost, mut null_text) = (0usize, Vec::new());
     for (k, g) in geoms.into_iter().enumerate() {
         let g = match (&t, g) {
             (Some(t), Some(g)) => {
@@ -403,13 +399,20 @@ pub fn read(mif: &str, mid: Option<&str>, name: &str) -> Result<(Dataset, ReadRe
             .fields
             .iter()
             .enumerate()
-            .map(|(c, f)| Value::parse(row.and_then(|r| r.get(c)).map(String::as_str).unwrap_or(""), f.ty))
+            .map(|(c, f)| {
+                let text = row.and_then(|r| r.get(c)).map(String::as_str).unwrap_or("");
+                if Value::is_null_marker(text) {
+                    crate::source::null_text_at(&mut null_text, c);
+                }
+                Value::parse_file(text, f.ty)
+            })
             .collect();
         ds.push_next(g, attrs);
     }
     if lost > 0 {
         report.messages.push(format!("{lost} objects couldn't be converted to longitude/latitude"));
     }
+    report.messages.extend(crate::source::null_text_note(&ds.fields, &null_text));
     ds.geometry_type = crate::io::dominant_type(&ds);
     Ok((ds, report))
 }
@@ -420,6 +423,30 @@ mod tests {
 
     const MIF: &str = "Version 300\nCharset \"WindowsLatin1\"\nDelimiter \",\"\nCoordSys Earth Projection 1, 104\nColumns 3\n  name Char(20)\n  pop Integer\n  area Decimal(10,2)\nData\n\nPoint 10 20\n    Symbol (35,0,12)\nPline 3\n10 20\n11 21\n12 20\n    Pen (1,2,0)\nRegion 2\n  5\n0 0\n10 0\n10 10\n0 10\n0 0\n  4\n2 2\n4 2\n3 4\n2 2\n    Pen (1,2,0)\n    Brush (2,16777215,16777215)\n    Center 5 5\nPline Multiple 2\n  2\n0 0\n1 1\n  2\n2 2\n3 3\nText \"Hello world\"\n 1 1 2 2\nNone\nRect 0 0 1 1\n";
     const MID: &str = "\"A\",1,1.5\n\"B, c\",2,2.5\n\"C\",3,3.5\n\"D\",4,4.5\n\"E\",5,5.5\n\"F\",6,6.5\n\"G\",7,7.5\n";
+
+    #[test]
+    fn integer_source_numbers_are_not_truncated_or_clamped() {
+        let mif = "Version 300\nCoordSys Earth Projection 1, 104\nColumns 1\n n Integer\nData\nPoint 0 0\nPoint 1 1\nPoint 2 2\n";
+        let (ds, report) = read(mif, Some("2.7\n1e30\n3\n"), "numbers").unwrap();
+        assert_eq!(ds.fields[0].ty, FieldType::Integer);
+        assert_eq!(ds.value(0, 0), &Value::Float(2.7));
+        assert_eq!(ds.value(1, 0), &Value::Float(1e30));
+        assert_eq!(ds.value(2, 0), &Value::Int(3));
+        assert!(report.messages.is_empty(), "{:?}", report.messages);
+    }
+
+    /// `.mid` text read as the file has it (#2059): spaces kept, `<Null>` null and counted.
+    #[test]
+    fn mid_text_keeps_its_spaces_and_counts_null_markers() {
+        let mif = "Version 300\nDelimiter \",\"\nCoordSys Earth Projection 1, 104\nColumns 2\n code Char(8)\n n Integer\nData\nPoint 0 0\nPoint 1 1\n";
+        let (ds, report) = read(mif, Some("\" 2535 \", 7 \n\"<Null>\",8\n"), "t").unwrap();
+        assert_eq!(ds.value(0, 0), &Value::Text(" 2535 ".into()));
+        assert_eq!(ds.value(0, 1), &Value::Int(7));
+        assert_eq!(ds.value(1, 0), &Value::Null);
+        assert_eq!(report.messages, ["1 value written as Null was read as empty, in 'code'"]);
+        let (_, clean) = read(mif, Some("\" 2535 \", 7 \n\"b\",8\n"), "t").unwrap();
+        assert!(clean.messages.is_empty(), "no marker, no notice: {:?}", clean.messages);
+    }
 
     #[test]
     fn widths_with_spaces_and_bad_mid_rows() {

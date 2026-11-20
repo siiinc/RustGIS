@@ -9,21 +9,27 @@ description = "RustGIS L1: feature model, attribute values, vector I/O (GeoJSON,
 workspace = true
 
 [dependencies]
+hayro = { workspace = true, optional = true }
 rustgis-geom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { workspace = true, optional = true }
 thiserror = { workspace = true }
 csv = { workspace = true }
+# Streaming gzip text imports; use the pure-Rust backend in the browser too.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 shapefile = { workspace = true }
 encoding_rs = { workspace = true }
+# Coordinate column names compared in one Unicode form (NFC), whatever form a file saved them in.
+unicode-normalization = "0.1"
 # Zstandard, the usual compression of COGs, is C code that compiles to WebAssembly with clang
 # (on the CI runners), so the browser decodes it too.
 tiff = { workspace = true, features = ["zstd"] }
 weezl.workspace = true
-proj4rs = { workspace = true }
-crs-definitions = { workspace = true }
+terrio-crs = { workspace = true }
 miniz_oxide = { workspace = true }
 roxmltree = { workspace = true }
+quick-xml = { workspace = true }
 # zstd, the usual compression of GeoParquet, compiles to WebAssembly like the GeoTIFF one above.
 parquet = { workspace = true, features = ["zstd"] }
 url = { workspace = true }
@@ -41,11 +47,10 @@ image = { workspace = true, features = ["jpeg"] }
 base64 = { workspace = true }
 lz4_flex = { workspace = true }
 ruzstd = { workspace = true }
+lerc-reader = { workspace = true }
+lerc-core = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Azimuthal equidistant systems (Equi7's EPSG 27701–27707, ESRI's polar ones) need proj4rs' `aeqd`,
-# native only as in rustgis-map: its geodesic routines need libm, which wasm32-unknown-unknown lacks.
-proj4rs = { workspace = true, features = ["aeqd"] }
 rusqlite = { workspace = true }
 postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
@@ -55,18 +60,43 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
+# Native web clients verify servers with the system's trust (see `http`).
+# Hashes a source's files, to tell whether they changed since a layer was read (`sync`).
+sha2 = { workspace = true }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip", "platform-verifier"] }
 # Private temporary workspaces for downloaded JPEG 2000 conversion through GDAL.
 tempfile = "3"
+# The computer's physical memory, for the limits that scale with it (`memory`, #1291 step 2).
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+
+# Whether a Linux or BSD system has any CA certificates (see `http`); the platform verifier reads
+# the same.
+[target.'cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))'.dependencies]
+rustls-native-certs = "0.8"
 
 [target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
 # Safe effective-UID and no-follow operations for private Shapefile index caches.
 rustix = { version = "1.1", features = ["process", "fs"] }
+
+[features]
+# PDF pages read as rasters, GeoPDFs placed by their coordinates (#2336): the desktop, command line
+# and Python apps turn it on; the browser and phone apps leave it off, where it would add megabytes
+# for a format seldom opened there. An app built on the engine may turn it on anywhere.
+pdf = ["dep:hayro"]
+# The JSON Schema of the saved types (`cargo xtask schema`).
+schema = ["dep:schemars", "rustgis-geom/schema"]
+# Marks direct uses of the row vector and of `Feature`'s fields as deprecated, so that
+# `cargo xtask rows` can count them outside this crate (#2431). Nothing else turns it on.
+count-row-uses = []
 
 [dev-dependencies]
 # Writing sample GeoParquet files.
 parquet = { workspace = true, features = ["arrow"] }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+proptest = { workspace = true }
+# Writing LERC blobs with masks, band sets and padded strips that GDAL never writes.
+lerc-writer = "0.5"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Writing Zstandard-compressed GeoTIFFs.

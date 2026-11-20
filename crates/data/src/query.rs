@@ -12,17 +12,30 @@
 //!
 //! Fields are bare names, `"quoted"` or `!quoted!`; text uses single quotes (`''` is a quote).
 //! Text matching (`=`, `LIKE`, `IN`) is case-insensitive; two values that read as numbers compare
-//! as numbers. Logic is SQL's three-valued: a comparison with a null is unknown. One exception,
+//! as numbers. A date or date-time compares with another, or with text that reads as one
+//! (`issued >= '2026-01-01'`, a date-time at midnight); text that isn't a full date compares as
+//! text. Logic is SQL's three-valued: a comparison with a null is unknown. One exception,
 //! kept from the WHERE language this replaced so saved clauses keep their rows: a NULL in an `IN`
 //! list matches nothing, so `2 NOT IN (1, NULL)` is true where SQL makes it unknown. A `LIKE`
-//! too costly to match ([`MAX_LIKE_STEPS`]) is unknown. Arithmetic on a
-//! null, a division by zero or an overflow gives null; `+` joins text that isn't a number.
+//! too costly to match ([`MAX_LIKE_STEPS`]) is unknown, as is any that would take an expression's
+//! `LIKE`s past what they may take for one row together ([`MAX_ROW_LIKE_STEPS`]). Arithmetic on a
+//! null, a division by zero or an overflow gives null ([`value_or_fault`] says which error it
+//! was); `+` joins text that isn't a number.
+//!
+//! The vocabulary lives in catalogs the parser reads, with a signature and description for
+//! each entry: [`functions`], [`VARS`] and [`Kw`]. Whatever helps write expressions reads them too,
+//! and [`complete_at`] asks the parser itself what may come next at a point of the text.
 
 use crate::{Dataset, Measure, Value};
 use std::borrow::Cow;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::ops::Range;
 
+mod complete;
 #[cfg(test)]
 mod legacy;
+
+pub use complete::{Call, Completion, Place, complete_at};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -110,6 +123,12 @@ pub enum Arith {
 pub enum Var {
     /// `@map_scale`, `$scale`: the scale denominator of the map being drawn (null elsewhere).
     MapScale,
+    /// The index feature's id on a map series page.
+    PageFeatureId,
+    /// The displayed map series page name.
+    PageName,
+    /// The one-based map series page number.
+    PageNumber,
     /// `@row_number`: the row's position, from 1.
     RowNumber,
     /// `$id`: the feature's id.
@@ -119,12 +138,103 @@ pub enum Var {
     Measure(Measure, f64),
 }
 
-/// Values an expression reads from where it runs.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Env {
-    pub map_scale: Option<f64>,
+/// Why an expression's value is null although nothing it read was: the errors that give null
+/// rather than stop the expression ([`value_or_fault`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fault {
+    /// `x / 0`, `x % 0`, `0 ^ -1`.
+    DivisionByZero,
+    /// `sqrt` of a number below zero.
+    NegativeRoot,
+    /// `ln` or `log10` of zero or a number below zero.
+    Logarithm,
+    /// A result past the largest number a value holds (`exp(1000)`, `10 ^ 400`).
+    Overflow,
+    /// A result that isn't a number (`(-8) ^ 0.5`), or a stored one that isn't (NaN, infinity).
+    NotANumber,
+    /// Text that isn't a number where one is needed: `-`, `*`, `/`, `%` or `^`, or a number
+    /// argument (`sqrt(name)`, `to_real('abc')`).
+    Text,
+    /// A date where a number is needed: arithmetic, or a number argument.
+    Date,
+    /// `clamp(low, x, high)` with `low` above `high`.
+    ClampBounds,
+    /// `$area`, `$perimeter` or `$length` of a feature with a place its system can't give in
+    /// longitude/latitude, where it is measured.
+    Unmeasurable,
 }
 
+impl Fault {
+    /// What happened, to follow "because of" in a notice.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Fault::DivisionByZero => "a division by zero",
+            Fault::NegativeRoot => "the square root of a negative number",
+            Fault::Logarithm => "the logarithm of zero or a negative number",
+            Fault::Overflow => "a result too large to represent",
+            Fault::NotANumber => "a value that isn't a finite number",
+            Fault::Text => "text that isn't a number",
+            Fault::Date => "a date used as a number",
+            Fault::ClampBounds => "a clamp whose low bound is above its high bound",
+            Fault::Unmeasurable => "a feature with a place that can't be given in longitude/latitude",
+        }
+    }
+
+    /// The fault of using `v` as a number, when it isn't missing and doesn't read as one. Empty
+    /// or `<null>` text is missing, as a write reads it ([`Value::asks_null`]), not an error.
+    pub fn of_non_number(v: &Value) -> Option<Fault> {
+        match v {
+            _ if v.asks_null() => None,
+            _ if v.as_f64().is_some() => None,
+            Value::Text(_) => Some(Fault::Text),
+            Value::Date(_) | Value::DateTime(_) => Some(Fault::Date),
+            _ => Some(Fault::NotANumber),
+        }
+    }
+}
+
+/// Values an expression reads from where it runs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Env {
+    pub map_scale: Option<f64>,
+    /// Shared by all expressions and source reads for a layout page.
+    pub page: Option<std::sync::Arc<SeriesPage>>,
+}
+
+/// The index feature and displayed name and number of a map series page.
+#[derive(Debug, PartialEq)]
+pub struct SeriesPage {
+    pub feature_id: u64,
+    pub name: String,
+    /// One-based, as shown in the layout.
+    pub number: usize,
+}
+
+impl Env {
+    /// Use the same page at the drawing scale of the frame, band or labels.
+    pub fn at_scale(&self, map_scale: Option<f64>) -> Self {
+        Self { map_scale: map_scale.filter(|s| s.is_finite() && *s > 0.0), page: self.page.clone() }
+    }
+}
+
+/// Declares an enum and its `ALL`, every variant in the order declared, from one list, so a
+/// new variant can't be left out of `ALL`.
+macro_rules! listed_enum {
+    ($(#[$meta:meta])* pub enum $name:ident { $($(#[$vmeta:meta])* $variant:ident,)* }) => {
+        $(#[$meta])*
+        pub enum $name {
+            $($(#[$vmeta])* $variant,)*
+        }
+
+        impl $name {
+            /// Every variant, in the order declared.
+            pub const ALL: &'static [$name] = &[$($name::$variant,)*];
+        }
+    };
+}
+
+listed_enum! {
+/// A function of the language. Its catalog entry is [`Func::spec`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Func {
     If,
@@ -163,44 +273,312 @@ pub enum Func {
     Perimeter,
     LineLength,
 }
+}
 
-/// Functions by name, with their fewest and most arguments.
-const FUNCS: &[(&str, Func, usize, usize)] = &[
-    ("if", Func::If, 2, 3),
-    ("coalesce", Func::Coalesce, 1, MAX_ARGS),
-    ("nullif", Func::NullIf, 2, 2),
-    ("abs", Func::Abs, 1, 1),
-    ("round", Func::Round, 1, 2),
-    ("floor", Func::Floor, 1, 1),
-    ("ceil", Func::Ceil, 1, 1),
-    ("sqrt", Func::Sqrt, 1, 1),
-    ("exp", Func::Exp, 1, 1),
-    ("ln", Func::Ln, 1, 1),
-    ("log10", Func::Log10, 1, 1),
-    ("pi", Func::Pi, 0, 0),
-    ("min", Func::Min, 1, MAX_ARGS),
-    ("max", Func::Max, 1, MAX_ARGS),
-    ("clamp", Func::Clamp, 3, 3),
-    ("scale_linear", Func::ScaleLinear, 5, 5),
-    ("scale_exp", Func::ScaleExp, 6, 6),
-    ("to_string", Func::ToString, 1, 1),
-    ("to_int", Func::ToInt, 1, 1),
-    ("to_real", Func::ToReal, 1, 1),
-    ("length", Func::Length, 1, 1),
-    ("upper", Func::Upper, 1, 1),
-    ("lower", Func::Lower, 1, 1),
-    ("trim", Func::Trim, 1, 1),
-    ("substr", Func::Substr, 2, 3),
-    ("left", Func::Left, 2, 2),
-    ("right", Func::Right, 2, 2),
-    ("replace", Func::Replace, 3, 3),
-    ("concat", Func::Concat, 1, MAX_ARGS),
-    ("color_rgb", Func::ColorRgb, 3, 3),
-    ("color_rgba", Func::ColorRgba, 4, 4),
-    ("area", Func::Area, 0, 1),
-    ("perimeter", Func::Perimeter, 0, 1),
-    ("line_length", Func::LineLength, 0, 1),
+/// Whether `t` is a whole date in a form other than ISO 8601: digits only, five or more
+/// (`20260101`), or year, month and day as three numbers in either order joined by one `-`, `/`
+/// or `.` (`2026/03/05`, `2026-1-1`, `05.03.2026`), alone or before a time (`2026/03/05 14:30`),
+/// that doesn't read as an ISO date. Other text (`2026-03-05 revision 2`) isn't a date.
+fn other_date_form(t: &str) -> bool {
+    if t.len() >= 5 && t.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    if crate::DateTime::parse(t).is_some() {
+        return false;
+    }
+    // The date: up to a space or `T` that starts a time.
+    let (date, time) = match t.find([' ', 'T', 't']) {
+        Some(i) => (t.get(..i).unwrap_or(t), t.get(i + 1..)),
+        None => (t, None),
+    };
+    // A time is a clock and an optional zone, and nothing else: `14:30`, `14:30:00.5 +02:00`, `14:30Z`.
+    let clock = |time: &str| {
+        time.starts_with(|c: char| c.is_ascii_digit())
+            && time.contains(':')
+            && time.chars().all(|c| c.is_ascii_digit() || matches!(c, ':' | '.' | '+' | '-' | ' ' | 'Z' | 'z'))
+    };
+    if time.is_some_and(|time| !clock(time)) {
+        return false;
+    }
+    let Some(sep) = date.chars().find(|c| !c.is_ascii_digit()) else { return false };
+    if !['-', '/', '.'].contains(&sep) {
+        return false;
+    }
+    let parts: Vec<&str> = date.split(sep).collect();
+    let digits = |p: &&str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let lens: Vec<usize> = parts.iter().map(|p| p.len()).collect();
+    parts.iter().all(digits) && matches!(lens.as_slice(), [4, 1..=2, 1..=2] | [1..=2, 1..=2, 4])
+}
+
+/// Whether `f` works on numbers, so it gives null for a date.
+fn number_func(f: Func) -> bool {
+    match f {
+        Func::Abs
+        | Func::Round
+        | Func::Floor
+        | Func::Ceil
+        | Func::Sqrt
+        | Func::Exp
+        | Func::Ln
+        | Func::Log10
+        | Func::Min
+        | Func::Max
+        | Func::Clamp
+        | Func::ScaleLinear
+        | Func::ScaleExp
+        | Func::ToInt
+        | Func::ToReal
+        | Func::ColorRgb
+        | Func::ColorRgba => true,
+        // Keep this exhaustive: a new function must decide whether dates are valid arguments.
+        // text_or_date separately excludes numeric-result functions that do not take numbers.
+        Func::If
+        | Func::Coalesce
+        | Func::NullIf
+        | Func::Pi
+        | Func::ToString
+        | Func::Length
+        | Func::Upper
+        | Func::Lower
+        | Func::Trim
+        | Func::Substr
+        | Func::Left
+        | Func::Right
+        | Func::Replace
+        | Func::Concat
+        | Func::Area
+        | Func::Perimeter
+        | Func::LineLength => false,
+    }
+}
+
+/// A function's catalog entry: how it is called and what it gives. The parser reads it (a call
+/// resolves by `name` and its arguments are counted against `min` and `max`), and so does
+/// whatever helps write expressions, so the two can't disagree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FuncSpec {
+    pub func: Func,
+    /// The name it is called by (any letter case).
+    pub name: &'static str,
+    /// Fewest and most arguments.
+    pub min: usize,
+    pub max: usize,
+    /// How it is written, optional arguments in brackets: `round(x[, places])`.
+    pub signature: &'static str,
+    /// What it gives, in English (the interface translates it).
+    pub description: &'static str,
+    /// A call that parses and evaluates on a layer it fits.
+    pub example: &'static str,
+}
+
+impl Func {
+    /// Its catalog entry. One arm per function, so a new [`Func`] doesn't compile without its
+    /// name, signature, description and example.
+    pub const fn spec(self) -> FuncSpec {
+        let (name, min, max, signature, description, example) = match self {
+            Func::If => {
+                ("if", 2, 3, "if(condition, a[, b])", "a when the condition is true, otherwise b (or null)", "if(1 > 0, 'yes', 'no')")
+            }
+            Func::Coalesce => ("coalesce", 1, MAX_ARGS, "coalesce(a, b, …)", "The first value that isn't null", "coalesce(NULL, 'none')"),
+            Func::NullIf => ("nullif", 2, 2, "nullif(a, b)", "Null when a equals b, otherwise a", "nullif(5, 0)"),
+            Func::Abs => ("abs", 1, 1, "abs(x)", "Absolute value", "abs(-3)"),
+            Func::Round => (
+                "round",
+                1,
+                2,
+                "round(x[, places])",
+                "Rounded half away from zero to places decimals (0 by default; negative rounds to tens, hundreds…)",
+                "round(3.14159, 2)",
+            ),
+            Func::Floor => ("floor", 1, 1, "floor(x)", "Rounded down", "floor(2.7)"),
+            Func::Ceil => ("ceil", 1, 1, "ceil(x)", "Rounded up", "ceil(2.1)"),
+            Func::Sqrt => ("sqrt", 1, 1, "sqrt(x)", "Square root; null for a negative number", "sqrt(16)"),
+            Func::Exp => ("exp", 1, 1, "exp(x)", "e to the power x; null when too large to represent", "exp(1)"),
+            Func::Ln => ("ln", 1, 1, "ln(x)", "Natural logarithm; null for zero or a negative number", "ln(10)"),
+            Func::Log10 => ("log10", 1, 1, "log10(x)", "Base-10 logarithm; null for zero or a negative number", "log10(1000)"),
+            Func::Pi => ("pi", 0, 0, "pi()", "π", "pi()"),
+            Func::Min => {
+                ("min", 1, MAX_ARGS, "min(a, b, …)", "The smallest number; values that aren't numbers are skipped", "min(3, 1, 2)")
+            }
+            Func::Max => ("max", 1, MAX_ARGS, "max(a, b, …)", "The largest number; values that aren't numbers are skipped", "max(3, 1, 2)"),
+            Func::Clamp => {
+                ("clamp", 3, 3, "clamp(low, x, high)", "x kept within low…high; null when low is above high", "clamp(0, 15, 10)")
+            }
+            Func::ScaleLinear => (
+                "scale_linear",
+                5,
+                5,
+                "scale_linear(x, d0, d1, r0, r1)",
+                "x mapped from the domain d0…d1 to the range r0…r1, clamped to the domain",
+                "scale_linear(50, 0, 100, 2, 12)",
+            ),
+            Func::ScaleExp => (
+                "scale_exp",
+                6,
+                6,
+                "scale_exp(x, d0, d1, r0, r1, exponent)",
+                "As scale_linear, along a curve: 0.5 grows fast then slowly, 2 slowly then fast; null with a negative exponent at the domain's start",
+                "scale_exp(50, 0, 100, 2, 12, 0.5)",
+            ),
+            Func::ToString => ("to_string", 1, 1, "to_string(x)", "x as text", "to_string(42)"),
+            Func::ToInt => {
+                ("to_int", 1, 1, "to_int(x)", "x as a whole number (cut toward zero); null if it isn't a number", "to_int('12.7')")
+            }
+            Func::ToReal => ("to_real", 1, 1, "to_real(x)", "x as a decimal number; null if it isn't a number", "to_real('3.5')"),
+            Func::Length => ("length", 1, 1, "length(s)", "Number of characters", "length('Paris')"),
+            Func::Upper => ("upper", 1, 1, "upper(s)", "Upper case", "upper('paris')"),
+            Func::Lower => ("lower", 1, 1, "lower(s)", "Lower case", "lower('PARIS')"),
+            Func::Trim => ("trim", 1, 1, "trim(s)", "Without surrounding spaces", "trim('  Paris  ')"),
+            Func::Substr => (
+                "substr",
+                2,
+                3,
+                "substr(s, start[, length])",
+                "Part of s from character start (1 is the first; negative counts from the end); a negative length leaves that many characters off the end",
+                "substr('Paris', 2, 3)",
+            ),
+            Func::Left => ("left", 2, 2, "left(s, n)", "The first n characters", "left('Paris', 2)"),
+            Func::Right => ("right", 2, 2, "right(s, n)", "The last n characters", "right('Paris', 2)"),
+            Func::Replace => ("replace", 3, 3, "replace(s, find, with)", "Every find in s replaced by with", "replace('a-b-c', '-', ' ')"),
+            Func::Concat => {
+                ("concat", 1, MAX_ARGS, "concat(a, b, …)", "The values joined as text, nulls skipped", "concat('a', NULL, 'b')")
+            }
+            Func::ColorRgb => {
+                ("color_rgb", 3, 3, "color_rgb(r, g, b)", "A colour as the text 'r,g,b', each channel 0–255", "color_rgb(255, 128, 0)")
+            }
+            Func::ColorRgba => (
+                "color_rgba",
+                4,
+                4,
+                "color_rgba(r, g, b, a)",
+                "A colour as the text 'r,g,b,a', each channel 0–255",
+                "color_rgba(255, 128, 0, 128)",
+            ),
+            Func::Area => ("area", 0, 1, "area([unit])", "A polygon's area, in square metres or the unit given", "area('ha')"),
+            Func::Perimeter => {
+                ("perimeter", 0, 1, "perimeter([unit])", "The length of a polygon's rings, in metres or the unit given", "perimeter('km')")
+            }
+            Func::LineLength => {
+                ("line_length", 0, 1, "line_length([unit])", "A line's length, in metres or the unit given", "line_length('km')")
+            }
+        };
+        FuncSpec { func: self, name, min, max, signature, description, example }
+    }
+}
+
+/// Every function of the language, with its catalog entry.
+pub fn functions() -> impl Iterator<Item = FuncSpec> {
+    Func::ALL.iter().map(|f| f.spec())
+}
+
+/// A variable's catalog entry. The parser resolves `@…` and `$…` through [`VARS`], so a variable
+/// can be written only once it is listed there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VarSpec {
+    /// The names it is written by (any letter case), the usual one first.
+    pub names: &'static [&'static str],
+    pub var: Var,
+    /// What it reads, in English (the interface translates it).
+    pub description: &'static str,
+}
+
+/// Every variable of the language.
+pub const VARS: &[VarSpec] = &[
+    VarSpec {
+        names: &["@map_scale", "$scale"],
+        var: Var::MapScale,
+        description: "The scale denominator of the map being drawn; null in queries and Calculate Field",
+    },
+    VarSpec {
+        names: &["@page_feature_id"],
+        var: Var::PageFeatureId,
+        description: "The map series index feature's id (integer), null outside a series page",
+    },
+    VarSpec { names: &["@page_name"], var: Var::PageName, description: "The map series page's name (text), null outside a series page" },
+    VarSpec {
+        names: &["@page_number"],
+        var: Var::PageNumber,
+        description: "The map series page's number (integer, from 1), null outside a series page",
+    },
+    VarSpec { names: &["@row_number"], var: Var::RowNumber, description: "The feature's position in the layer, from 1" },
+    VarSpec { names: &["$id"], var: Var::Id, description: "The feature's id" },
+    VarSpec { names: &["$area"], var: Var::Measure(Measure::Area, 1.0), description: "A polygon's area in square metres (holes subtract)" },
+    VarSpec {
+        names: &["$perimeter"],
+        var: Var::Measure(Measure::Perimeter, 1.0),
+        description: "The length of a polygon's rings in metres",
+    },
+    VarSpec { names: &["$length"], var: Var::Measure(Measure::Length, 1.0), description: "A line's length in metres" },
 ];
+
+listed_enum! {
+/// A keyword of the language. The parser matches keywords only through [`Kw::word`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kw {
+    And,
+    Or,
+    Not,
+    Is,
+    Null,
+    Like,
+    Ilike,
+    In,
+    Between,
+    True,
+    False,
+    Case,
+    When,
+    Then,
+    Else,
+    End,
+}
+}
+
+impl Kw {
+    /// How it is written (any letter case is read).
+    pub const fn word(self) -> &'static str {
+        match self {
+            Kw::And => "AND",
+            Kw::Or => "OR",
+            Kw::Not => "NOT",
+            Kw::Is => "IS",
+            Kw::Null => "NULL",
+            Kw::Like => "LIKE",
+            Kw::Ilike => "ILIKE",
+            Kw::In => "IN",
+            Kw::Between => "BETWEEN",
+            Kw::True => "TRUE",
+            Kw::False => "FALSE",
+            Kw::Case => "CASE",
+            Kw::When => "WHEN",
+            Kw::Then => "THEN",
+            Kw::Else => "ELSE",
+            Kw::End => "END",
+        }
+    }
+
+    /// What it does, in English (the interface translates it).
+    pub const fn description(self) -> &'static str {
+        match self {
+            Kw::And => "True when both sides are true",
+            Kw::Or => "True when either side is true",
+            Kw::Not => "The opposite of a condition; also NOT LIKE, NOT IN, NOT BETWEEN",
+            Kw::Is => "IS NULL, IS NOT NULL: whether the value is missing",
+            Kw::Null => "The missing value",
+            Kw::Like => "Text pattern, ignoring letter case: % matches any run of characters, _ one character",
+            Kw::Ilike => "The same as LIKE",
+            Kw::In => "Equal to one of the values in brackets",
+            Kw::Between => "BETWEEN a AND b: at least a and at most b",
+            Kw::True => "The boolean true",
+            Kw::False => "The boolean false",
+            Kw::Case => "Starts a choice: CASE WHEN … THEN … ELSE … END",
+            Kw::When => "In CASE, a condition, or a value to match",
+            Kw::Then => "In CASE, the value given for the WHEN before it",
+            Kw::Else => "In CASE, the value given when no WHEN matches",
+            Kw::End => "Ends a CASE",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
@@ -231,13 +609,54 @@ const MAX_ARGS: usize = 32;
 /// Longest text an expression makes (bytes); longer results are cut.
 pub const MAX_TEXT: usize = 64 * 1024;
 
+/// Whether a source query can depend on the series page. Quoted text and field names
+/// cannot make the source window depend on a page.
+pub fn reads_series_page(text: &str) -> bool {
+    text.contains('@')
+        && lex(text).is_ok_and(|tokens| {
+            tokens.iter().any(|t| {
+                let Tok::Var(name) = t else { return false };
+                VARS.iter().any(|s| {
+                    matches!(s.var, Var::PageFeatureId | Var::PageName | Var::PageNumber)
+                        && s.names.iter().any(|n| n.eq_ignore_ascii_case(name))
+                })
+            })
+        })
+}
+
 fn lex(s: &str) -> Result<Vec<Tok>, String> {
+    lex_spans(s, false).map(|l| l.toks)
+}
+
+/// A quote left open at the end of what was read, by [`lex_spans`] when it tolerates one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Open {
+    /// `'text`.
+    Text,
+    /// `"field` or `!field`, with its quote.
+    Field(char),
+}
+
+/// Tokens with where each is in the text (in characters), and a quote left open at the end.
+struct Lexed {
+    toks: Vec<Tok>,
+    spans: Vec<Range<usize>>,
+    /// The quote's kind and where it starts.
+    open: Option<(Open, usize)>,
+}
+
+/// Reads `s` into tokens. `tolerant` reads text being typed: a quote left open at the end, or an
+/// `@` or `$` that is the last character, ends it instead of being an error. Anything else that
+/// can't be read is an error either way.
+fn lex_spans(s: &str, tolerant: bool) -> Result<Lexed, String> {
     if s.chars().count() > MAX_LEN {
         return Err("the expression is too long".into());
     }
     let cs: Vec<char> = s.chars().collect();
     let mut i = 0;
     let mut out = Vec::new();
+    let mut spans = Vec::new();
+    let mut open = None;
     let word = |i: &mut usize| -> String {
         let st = *i;
         while cs.get(*i).is_some_and(|c| c.is_alphanumeric() || *c == '_') {
@@ -246,6 +665,8 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
         cs.get(st..*i).map(|s| s.iter().collect()).unwrap_or_default()
     };
     while let Some(&c) = cs.get(i) {
+        let start = i;
+        let before = out.len();
         match c {
             c if c.is_whitespace() => i += 1,
             '(' => {
@@ -266,6 +687,10 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
                 loop {
                     match cs.get(i) {
+                        None if tolerant => {
+                            open = Some((if q == '"' { Open::Field(q) } else { Open::Text }, start));
+                            break;
+                        }
                         None => return Err("unterminated quote".into()),
                         Some(&ch) if ch == q => {
                             if cs.get(i + 1) == Some(&q) {
@@ -282,11 +707,20 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
                         }
                     }
                 }
+                if open.is_some() {
+                    break;
+                }
                 out.push(if q == '"' { Tok::QuotedIdent(v) } else { Tok::Str(v) });
             }
             '!' if cs.get(i + 1) != Some(&'=') => {
                 let st = i + 1;
-                let end = cs.get(st..).and_then(|r| r.iter().position(|c| *c == '!')).ok_or("unexpected '!'")?;
+                let Some(end) = cs.get(st..).and_then(|r| r.iter().position(|c| *c == '!')) else {
+                    if tolerant {
+                        open = Some((Open::Field('!'), start));
+                        break;
+                    }
+                    return Err("unexpected '!'".into());
+                };
                 out.push(Tok::QuotedIdent(cs.get(st..st + end).map(|s| s.iter().collect()).unwrap_or_default()));
                 i = st + end + 1;
             }
@@ -337,7 +771,8 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             '@' | '$' => {
                 i += 1;
                 let name = word(&mut i);
-                if name.is_empty() {
+                // A sigil alone is a variable's name being typed.
+                if name.is_empty() && !(tolerant && i == cs.len()) {
                     return Err(format!("unexpected '{c}'"));
                 }
                 out.push(Tok::Var(format!("{c}{name}")));
@@ -345,8 +780,11 @@ fn lex(s: &str) -> Result<Vec<Tok>, String> {
             c if c.is_alphanumeric() || c == '_' => out.push(Tok::Ident(word(&mut i))),
             other => return Err(format!("unexpected '{other}'")),
         }
+        if out.len() > before {
+            spans.push(start..i);
+        }
     }
-    Ok(out)
+    Ok(Lexed { toks: out, spans, open })
 }
 
 /// A number literal: whole numbers are integers.
@@ -359,16 +797,88 @@ struct Parser<'a> {
     pos: usize,
     ds: &'a Dataset,
     depth: usize,
+    area_check: OnceCell<Option<String>>,
+    validate_areas: bool,
+    /// Set by [`complete_at`]: what the parser looks for at the end of the tokens is noted
+    /// there, and what is wrong in what was typed before (a field no layer has, a date against
+    /// a number) doesn't stop it. `None` everywhere else, which changes nothing.
+    probe: Option<RefCell<Probe>>,
+    /// The calls being read, innermost last: the function (`None` for a name no function has),
+    /// which argument, and the token of its `(`.
+    calls: Vec<(Option<Func>, usize, usize)>,
 }
 
+/// What the parser looked for at the end of the tokens: what may come next there.
+#[derive(Debug, Default)]
+struct Probe {
+    reached: bool,
+    operand: bool,
+    keywords: Vec<Kw>,
+    symbols: Vec<&'static str>,
+    /// The call the end is in, when it was first reached (as in `Parser::calls`).
+    call: Option<(Option<Func>, usize, usize)>,
+    /// The field a value at the end is compared with (`name = ▮`, `name IN (▮`).
+    field: Option<usize>,
+}
+
+/// How a token is written, for the symbols [`Probe`] notes.
+fn symbol(t: &Tok) -> Option<&'static str> {
+    Some(match t {
+        Tok::LParen => "(",
+        Tok::RParen => ")",
+        Tok::Comma => ",",
+        Tok::Concat => "||",
+        Tok::Arith(a) => arith_symbol(*a),
+        _ => return None,
+    })
+}
+
+fn arith_symbol(a: Arith) -> &'static str {
+    match a {
+        Arith::Add => "+",
+        Arith::Sub => "-",
+        Arith::Mul => "*",
+        Arith::Div => "/",
+        Arith::Mod => "%",
+        Arith::Pow => "^",
+    }
+}
+
+/// The comparison operators, as [`Probe`] offers them.
+const COMPARISONS: [&str; 6] = ["=", "<>", "<", "<=", ">", ">="];
+
 impl Parser<'_> {
-    fn peek_kw(&self, kw: &str) -> bool {
+    /// Notes in the probe, when there is one and `i` is the end of the tokens, what the parser
+    /// looks for there.
+    fn note(&self, i: usize, what: impl FnOnce(&mut Probe)) {
+        if i == self.toks.len()
+            && let Some(probe) = &self.probe
+        {
+            let mut p = probe.borrow_mut();
+            if !p.reached {
+                p.reached = true;
+                p.call = self.calls.last().copied();
+            }
+            what(&mut p);
+        }
+    }
+    /// Notes that a value at the end would be compared with `l`, when `l` is a field.
+    fn note_compared(&self, l: &Expr) {
+        if let Expr::Field(f) = l {
+            self.note(self.pos, |p| p.field = Some(*f));
+        }
+    }
+    fn probing(&self) -> bool {
+        self.probe.is_some()
+    }
+    fn peek_kw(&self, kw: Kw) -> bool {
         self.kw_at(self.pos, kw)
     }
-    fn kw_at(&self, i: usize, kw: &str) -> bool {
-        matches!(self.toks.get(i), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw))
+    fn kw_at(&self, i: usize, kw: Kw) -> bool {
+        self.note(i, |p| p.keywords.push(kw));
+        matches!(self.toks.get(i), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(kw.word()))
     }
-    fn eat_kw(&mut self, kw: &str) -> bool {
+    fn eat_kw(&mut self, kw: Kw) -> bool {
         let y = self.peek_kw(kw);
         if y {
             self.pos += 1;
@@ -376,6 +886,9 @@ impl Parser<'_> {
         y
     }
     fn eat(&mut self, t: &Tok) -> bool {
+        if let Some(s) = symbol(t) {
+            self.note(self.pos, |p| p.symbols.push(s));
+        }
         let y = self.toks.get(self.pos) == Some(t);
         if y {
             self.pos += 1;
@@ -400,7 +913,7 @@ impl Parser<'_> {
     fn or(&mut self) -> Result<Expr, String> {
         self.deeper()?;
         let mut terms = vec![self.and()?];
-        while self.eat_kw("OR") {
+        while self.eat_kw(Kw::Or) {
             if terms.len() >= MAX_TERMS {
                 return Err("the expression has too many terms".into());
             }
@@ -419,7 +932,7 @@ impl Parser<'_> {
     }
     fn and(&mut self) -> Result<Expr, String> {
         let mut terms = vec![self.not()?];
-        while self.eat_kw("AND") {
+        while self.eat_kw(Kw::And) {
             if terms.len() >= MAX_TERMS {
                 return Err("the expression has too many terms".into());
             }
@@ -436,7 +949,7 @@ impl Parser<'_> {
         )
     }
     fn not(&mut self) -> Result<Expr, String> {
-        if self.eat_kw("NOT") {
+        if self.eat_kw(Kw::Not) {
             self.deeper()?;
             let e = self.not()?;
             self.depth -= 1;
@@ -446,9 +959,9 @@ impl Parser<'_> {
     }
     fn cmp(&mut self) -> Result<Expr, String> {
         let l = self.concat()?;
-        if self.eat_kw("IS") {
-            let negate = self.eat_kw("NOT");
-            if !self.eat_kw("NULL") {
+        if self.eat_kw(Kw::Is) {
+            let negate = self.eat_kw(Kw::Not);
+            if !self.eat_kw(Kw::Null) {
                 return Err("expected NULL after IS".into());
             }
             return Ok(match l {
@@ -456,23 +969,32 @@ impl Parser<'_> {
                 e => Expr::IsNullExpr { e: Box::new(e), negate },
             });
         }
-        let negate = self.eat_kw("NOT");
-        if self.eat_kw("LIKE") || self.eat_kw("ILIKE") {
+        let negate = self.eat_kw(Kw::Not);
+        if self.eat_kw(Kw::Like) || self.eat_kw(Kw::Ilike) {
+            self.note_compared(&l);
             let p = self.concat()?;
             return Ok(match (l, p) {
                 (Expr::Field(field), Expr::Lit(Value::Text(pattern))) => Expr::Like { field, pattern, negate },
                 (e, p) => Expr::LikeExpr { e: Box::new(e), pattern: Box::new(p), negate },
             });
         }
-        if self.eat_kw("IN") {
+        if self.eat_kw(Kw::In) {
             self.expect(Tok::LParen, "'(' after IN")?;
+            self.note_compared(&l);
             let mut list = vec![self.item()?];
             loop {
+                self.note(self.pos, |p| p.symbols.extend([",", ")"]));
                 match self.next() {
-                    Some(Tok::Comma) => list.push(self.item()?),
+                    Some(Tok::Comma) => {
+                        self.note_compared(&l);
+                        list.push(self.item()?)
+                    }
                     Some(Tok::RParen) => break,
                     other => return Err(format!("expected ',' or ')', found {}", show(other.as_ref()))),
                 }
+            }
+            for e in &list {
+                self.date_against_number(&l, e)?;
             }
             return Ok(match l {
                 Expr::Field(field) if list.iter().all(|e| matches!(e, Expr::Lit(_))) => {
@@ -482,17 +1004,22 @@ impl Parser<'_> {
                 e => Expr::InExpr { e: Box::new(e), list, negate },
             });
         }
-        if self.eat_kw("BETWEEN") {
+        if self.eat_kw(Kw::Between) {
+            self.note_compared(&l);
             let lo = self.concat()?;
-            if !self.eat_kw("AND") {
+            if !self.eat_kw(Kw::And) {
                 return Err("expected AND after BETWEEN …".into());
             }
+            self.note_compared(&l);
             let hi = self.concat()?;
+            self.date_against_number(&l, &lo)?;
+            self.date_against_number(&l, &hi)?;
             return Ok(Expr::Between { e: Box::new(l), lo: Box::new(lo), hi: Box::new(hi), negate });
         }
         if negate {
             return Err("expected LIKE, IN or BETWEEN after NOT".into());
         }
+        self.note(self.pos, |p| p.symbols.extend(COMPARISONS));
         let op = match self.toks.get(self.pos) {
             Some(Tok::Op(o)) => match o.as_str() {
                 "=" | "==" => Op::Eq,
@@ -506,7 +1033,9 @@ impl Parser<'_> {
             _ => return Ok(l),
         };
         self.pos += 1;
+        self.note_compared(&l);
         let r = self.concat()?;
+        self.date_against_number(&l, &r)?;
         Ok(match (l, r) {
             (Expr::Field(field), Expr::Lit(lit)) => Expr::Cmp { field, op, lit },
             (l, r) => Expr::Compare(op, Box::new(l), Box::new(r)),
@@ -547,6 +1076,8 @@ impl Parser<'_> {
     fn chain(&mut self, ops: &[Arith], term: fn(&mut Self) -> Result<Expr, String>) -> Result<Expr, String> {
         let first = term(self)?;
         let mut rest = Vec::new();
+        let note = |p: &Self| p.note(p.pos, |probe| probe.symbols.extend(ops.iter().map(|a| arith_symbol(*a))));
+        note(self);
         while let Some(Tok::Arith(a)) = self.toks.get(self.pos).cloned()
             && ops.contains(&a)
         {
@@ -555,8 +1086,82 @@ impl Parser<'_> {
                 return Err("the expression has too many terms".into());
             }
             rest.push((a, term(self)?));
+            note(self);
         }
-        Ok(if rest.is_empty() { first } else { Expr::Chain(Box::new(first), rest) })
+        if rest.is_empty() { Ok(first) } else { self.arithmetic(first, rest) }
+    }
+    /// `first op term …`, unless a term can be a date: date arithmetic (`issued + 30`,
+    /// `coalesce(issued) + 1`) is an error until the language has it, rather than a column of
+    /// nulls.
+    fn arithmetic(&self, first: Expr, rest: Vec<(Arith, Expr)>) -> Result<Expr, String> {
+        for e in std::iter::once(&first).chain(rest.iter().map(|(_, e)| e)) {
+            if !self.probing()
+                && let Some(f) = self.date_field(e)
+            {
+                return Err(format!("'{}' holds dates, and arithmetic on dates isn't supported yet", f.name));
+            }
+        }
+        Ok(Expr::Chain(Box::new(first), rest))
+    }
+    /// An error when one side is a date and the other a number (`issued >= 20260101`,
+    /// `issued > year`), which would compare the date's text with the number's digits and match
+    /// the wrong rows.
+    fn date_against_number(&self, a: &Expr, b: &Expr) -> Result<(), String> {
+        if self.probing() {
+            return Ok(());
+        }
+        // Each way round: either side can be the date, whatever the other is.
+        let date_against = |d: &Expr, other: &Expr| if self.text_or_date(other) { None } else { self.date_field(d) };
+        let date = date_against(a, b).or_else(|| date_against(b, a));
+        if let Some(f) = date {
+            return Err(format!("'{}' holds dates, so it compares with a date in quotes ('2026-01-01') or text, not a number", f.name));
+        }
+        // A whole date written another way ('20260101', '2026/03/05', '2026-1-1', '05/03/2026')
+        // is text that no date reads as, so it would compare with the date's text and match the
+        // wrong rows. A partial date ('2026', '2026-03') still compares as text, in order.
+        let compact = |e: &Expr| match e {
+            Expr::Lit(Value::Text(t)) if other_date_form(t.trim()) => Some(t.trim().to_string()),
+            _ => None,
+        };
+        let date =
+            compact(b).and_then(|t| Some((self.date_field(a)?, t))).or_else(|| compact(a).and_then(|t| Some((self.date_field(b)?, t))));
+        match date {
+            Some((f, t)) => Err(format!("'{}' holds dates: write the date as YYYY-MM-DD ('2026-01-01'), not '{t}'", f.name)),
+            None => Ok(()),
+        }
+    }
+    /// Whether `e` can only give text or a date, which a date compares with: a text or date literal
+    /// or field, null, `||`, a function that gives text, or `if`, `coalesce`, `nullif` or `CASE`
+    /// whose every branch is one of these. Anything else can give a number or yes/no, arithmetic
+    /// included (`+` reads text that is a number as one: `'12' + 1` is 13).
+    fn text_or_date(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Lit(v) => !matches!(v, Value::Int(_) | Value::Float(_) | Value::Bool(_)),
+            Expr::Field(i) => self.ds.fields.get(*i).is_some_and(|f| matches!(f.ty, crate::FieldType::Text) || f.ty.is_temporal()),
+            Expr::Concat(_) | Expr::Var(Var::PageName) => true,
+            Expr::Call(Func::If, args) => args.iter().skip(1).all(|a| self.text_or_date(a)),
+            Expr::Call(Func::Coalesce, args) => args.iter().all(|a| self.text_or_date(a)),
+            Expr::Call(Func::NullIf, args) => args.first().is_some_and(|a| self.text_or_date(a)),
+            Expr::Case { arms, otherwise, .. } => {
+                arms.iter().map(|(_, then)| then).chain(otherwise.as_deref()).all(|a| self.text_or_date(a))
+            }
+            Expr::Call(f, _) => !number_func(*f) && !matches!(f, Func::Length | Func::Pi | Func::Area | Func::Perimeter | Func::LineLength),
+            _ => false,
+        }
+    }
+    /// The date field `e` can give a value of: the field itself, or one passed through `if`,
+    /// `coalesce`, `nullif` or `CASE`. Other functions give numbers or text.
+    fn date_field(&self, e: &Expr) -> Option<&crate::Field> {
+        match e {
+            Expr::Field(i) => self.ds.fields.get(*i).filter(|f| f.ty.is_temporal()),
+            Expr::Call(Func::If, args) => args.iter().skip(1).find_map(|a| self.date_field(a)),
+            Expr::Call(Func::Coalesce, args) => args.iter().find_map(|a| self.date_field(a)),
+            Expr::Call(Func::NullIf, args) => args.first().and_then(|a| self.date_field(a)),
+            Expr::Case { arms, otherwise, .. } => {
+                arms.iter().map(|(_, then)| then).chain(otherwise.as_deref()).find_map(|a| self.date_field(a))
+            }
+            _ => None,
+        }
     }
     fn sum(&mut self) -> Result<Expr, String> {
         self.chain(&[Arith::Add, Arith::Sub], Self::product)
@@ -585,7 +1190,7 @@ impl Parser<'_> {
             // A negative number stays a literal, so `pop > -5` keeps the fast comparison.
             (_, Expr::Lit(Value::Int(i))) => Expr::Lit(i.checked_neg().map(Value::Int).unwrap_or(Value::Float(-(i as f64)))),
             (_, Expr::Lit(Value::Float(f))) => Expr::Lit(Value::Float(-f)),
-            (_, e) => Expr::Chain(Box::new(Expr::Lit(Value::Int(0))), vec![(Arith::Sub, e)]),
+            (_, e) => self.arithmetic(Expr::Lit(Value::Int(0)), vec![(Arith::Sub, e)])?,
         })
     }
     fn power(&mut self) -> Result<Expr, String> {
@@ -596,30 +1201,47 @@ impl Parser<'_> {
         self.deeper()?;
         let exp = self.unary()?;
         self.depth -= 1;
-        Ok(Expr::Chain(Box::new(base), vec![(Arith::Pow, exp)]))
+        self.arithmetic(base, vec![(Arith::Pow, exp)])
     }
     /// Whether the token at `i` starts the operator of a comparison.
     fn comparison_at(&self, i: usize) -> bool {
-        matches!(self.toks.get(i), Some(Tok::Op(_))) || ["IS", "LIKE", "ILIKE", "IN", "NOT", "BETWEEN"].iter().any(|k| self.kw_at(i, k))
+        matches!(self.toks.get(i), Some(Tok::Op(_)))
+            || [Kw::Is, Kw::Like, Kw::Ilike, Kw::In, Kw::Not, Kw::Between].into_iter().any(|k| self.kw_at(i, k))
     }
     fn field(&self, name: &str) -> Result<Expr, String> {
-        self.ds.field_index(name).map(Expr::Field).ok_or_else(|| format!("no field named '{name}'"))
+        match self.ds.field_index(name) {
+            Some(i) => Ok(Expr::Field(i)),
+            None if self.probing() => Ok(Expr::Lit(Value::Null)),
+            None => Err(format!("no field named '{name}'")),
+        }
     }
     /// `m` in units of `size`, on a layer of the kind it measures.
     fn measure(&self, name: &str, m: Measure, size: f64) -> Result<Expr, String> {
         let want = m.geometry_type();
+        if self.probing() {
+            return Ok(Expr::Var(Var::Measure(m, size)));
+        }
         if self.ds.geometry_type != want {
             let hint = if m == Measure::Length { " (use perimeter on polygons)" } else { "" };
             return Err(format!("'{name}' measures {} layers{hint}", want.label().to_ascii_lowercase()));
+        }
+        if self.validate_areas
+            && m == Measure::Area
+            && let Some(message) =
+                self.area_check.get_or_init(|| self.ds.ambiguous_area_message(self.ds.features.iter().filter_map(|f| f.geometry.as_ref())))
+        {
+            return Err(format!("{}: {message}", self.ds.name));
         }
         Ok(Expr::Var(Var::Measure(m, size)))
     }
     /// A value: a literal, a field, a variable (a measure only on a layer it fits), a call, a
     /// `CASE` or a bracketed expression.
     fn primary(&mut self) -> Result<Expr, String> {
+        self.note(self.pos, |p| p.operand = true);
         match self.next() {
             Some(Tok::LParen) => {
                 let e = self.or()?;
+                self.note(self.pos, |p| p.symbols.push(")"));
                 if self.next() != Some(Tok::RParen) {
                     return Err("missing ')'".into());
                 }
@@ -630,14 +1252,11 @@ impl Parser<'_> {
             Some(Tok::Num(_)) => Err("the number is too large".into()),
             Some(Tok::Str(s)) => Ok(Expr::Lit(Value::Text(s))),
             Some(Tok::QuotedIdent(s)) => self.field(&s),
-            Some(Tok::Var(v)) => match v.to_ascii_lowercase().as_str() {
-                "@map_scale" | "$scale" => Ok(Expr::Var(Var::MapScale)),
-                "@row_number" => Ok(Expr::Var(Var::RowNumber)),
-                "$id" => Ok(Expr::Var(Var::Id)),
-                name => match name.strip_prefix('$').and_then(Measure::from_key) {
-                    Some(m) => self.measure(&v, m, 1.0),
-                    None => Err(format!("unknown variable '{v}'")),
-                },
+            Some(Tok::Var(v)) => match VARS.iter().find(|s| s.names.iter().any(|n| n.eq_ignore_ascii_case(&v))).map(|s| s.var) {
+                Some(Var::Measure(m, size)) => self.measure(&v, m, size),
+                Some(var) => Ok(Expr::Var(var)),
+                None if self.probing() => Ok(Expr::Lit(Value::Null)),
+                None => Err(format!("unknown variable '{v}'")),
             },
             Some(Tok::Ident(s)) => {
                 if self.toks.get(self.pos) == Some(&Tok::LParen) {
@@ -645,15 +1264,16 @@ impl Parser<'_> {
                 }
                 // A field named like a keyword is still read as the field before a comparison
                 // (`null = 'x'`), as the WHERE language always has.
-                let lower = s.to_ascii_lowercase();
-                let keyword = matches!(lower.as_str(), "true" | "false" | "null" | "case")
-                    && !(self.ds.field_index(&s).is_some() && self.comparison_at(self.pos));
-                match (keyword, lower.as_str()) {
-                    (true, "true") => Ok(Expr::Lit(Value::Bool(true))),
-                    (true, "false") => Ok(Expr::Lit(Value::Bool(false))),
-                    (true, "null") => Ok(Expr::Lit(Value::Null)),
-                    (true, _) => self.case(),
-                    _ => self.field(&s),
+                let keyword = [Kw::True, Kw::False, Kw::Null, Kw::Case]
+                    .into_iter()
+                    .find(|k| k.word().eq_ignore_ascii_case(&s))
+                    .filter(|_| !(self.ds.field_index(&s).is_some() && self.comparison_at(self.pos)));
+                match keyword {
+                    Some(Kw::True) => Ok(Expr::Lit(Value::Bool(true))),
+                    Some(Kw::False) => Ok(Expr::Lit(Value::Bool(false))),
+                    Some(Kw::Null) => Ok(Expr::Lit(Value::Null)),
+                    Some(_) => self.case(),
+                    None => self.field(&s),
                 }
             }
             other => Err(format!("expected a value, found {}", show(other.as_ref()))),
@@ -662,16 +1282,23 @@ impl Parser<'_> {
     /// A call of the function `name`, its arguments counted; a measure's call becomes the
     /// variable it reads, its unit (fixed text) checked here.
     fn call(&mut self, name: &str) -> Result<Expr, String> {
-        let &(fname, f, min, max) =
-            FUNCS.iter().find(|(n, ..)| n.eq_ignore_ascii_case(name)).ok_or_else(|| format!("unknown function '{name}'"))?;
+        let spec = functions().find(|s| s.name.eq_ignore_ascii_case(name));
+        if spec.is_none() && !self.probing() {
+            return Err(format!("unknown function '{name}'"));
+        }
+        self.calls.push((spec.map(|s| s.func), 0, self.pos));
         self.pos += 1; // '('
         let mut args = Vec::new();
         if !self.eat(&Tok::RParen) {
             loop {
                 if args.len() >= MAX_ARGS {
-                    return Err(format!("{fname} has too many arguments"));
+                    return Err(format!("{} has too many arguments", spec.map_or(name, |s| s.name)));
+                }
+                if let Some(c) = self.calls.last_mut() {
+                    c.1 = args.len();
                 }
                 args.push(self.or()?);
+                self.note(self.pos, |p| p.symbols.extend([",", ")"]));
                 match self.next() {
                     Some(Tok::Comma) => {}
                     Some(Tok::RParen) => break,
@@ -679,6 +1306,11 @@ impl Parser<'_> {
                 }
             }
         }
+        self.calls.pop();
+        // What was typed is only being read for what may come next: its arguments aren't checked.
+        let Some(FuncSpec { name: fname, func: f, min, max, .. }) = spec.filter(|_| !self.probing()) else {
+            return Ok(Expr::Lit(Value::Null));
+        };
         if args.len() < min || args.len() > max {
             let n = if min == max {
                 min.to_string()
@@ -688,6 +1320,19 @@ impl Parser<'_> {
                 format!("{min} to {max}")
             };
             return Err(format!("{fname} takes {n} argument{}", if n == "1" { "" } else { "s" }));
+        }
+        // A number's functions would give null for every date, so a date there is an error, as
+        // date arithmetic is.
+        if number_func(f)
+            && let Some(d) = args.iter().find_map(|a| self.date_field(a))
+        {
+            return Err(format!("'{}' holds dates, and {fname} on dates isn't supported yet", d.name));
+        }
+        // `nullif(a, b)` compares its two arguments, as `a = b` would.
+        if f == Func::NullIf
+            && let [a, b] = args.as_slice()
+        {
+            self.date_against_number(a, b)?;
         }
         let m = match f {
             Func::Area => Measure::Area,
@@ -712,14 +1357,18 @@ impl Parser<'_> {
     }
     fn case(&mut self) -> Result<Expr, String> {
         self.deeper()?;
-        let subject = if self.peek_kw("WHEN") { None } else { Some(Box::new(self.or()?)) };
+        let subject = if self.peek_kw(Kw::When) { None } else { Some(Box::new(self.or()?)) };
         let mut arms = Vec::new();
-        while self.eat_kw("WHEN") {
+        while self.eat_kw(Kw::When) {
             if arms.len() >= MAX_TERMS {
                 return Err("the expression has too many terms".into());
             }
             let when = self.or()?;
-            if !self.eat_kw("THEN") {
+            // `CASE subject WHEN value` compares the two, as `subject = value` would.
+            if let Some(s) = &subject {
+                self.date_against_number(s, &when)?;
+            }
+            if !self.eat_kw(Kw::Then) {
                 return Err(format!("expected THEN, found {}", show(self.toks.get(self.pos))));
             }
             arms.push((when, self.or()?));
@@ -727,8 +1376,8 @@ impl Parser<'_> {
         if arms.is_empty() {
             return Err(format!("expected WHEN, found {}", show(self.toks.get(self.pos))));
         }
-        let otherwise = if self.eat_kw("ELSE") { Some(Box::new(self.or()?)) } else { None };
-        if !self.eat_kw("END") {
+        let otherwise = if self.eat_kw(Kw::Else) { Some(Box::new(self.or()?)) } else { None };
+        if !self.eat_kw(Kw::End) {
             return Err(format!("expected END, found {}", show(self.toks.get(self.pos))));
         }
         self.depth -= 1;
@@ -765,11 +1414,46 @@ fn show(t: Option<&Tok>) -> String {
 
 /// Parses an expression (a clause, or a value) against a dataset's schema.
 pub fn parse(text: &str, ds: &Dataset) -> Result<Expr, String> {
+    parse_expression(text, ds, true)
+}
+
+/// Whether `e` reads field `field` (by its index in the dataset it was parsed against) anywhere.
+pub fn reads_field(e: &Expr, field: usize) -> bool {
+    let any = |es: &[Expr]| es.iter().any(|e| reads_field(e, field));
+    match e {
+        Expr::Field(f)
+        | Expr::Cmp { field: f, .. }
+        | Expr::Like { field: f, .. }
+        | Expr::IsNull { field: f, .. }
+        | Expr::In { field: f, .. } => *f == field,
+        Expr::Lit(_) | Expr::Var(_) => false,
+        Expr::And(es) | Expr::Or(es) | Expr::Concat(es) | Expr::Call(_, es) => any(es),
+        Expr::Not(e) | Expr::IsNullExpr { e, .. } => reads_field(e, field),
+        Expr::Compare(_, a, b) | Expr::LikeExpr { e: a, pattern: b, .. } => reads_field(a, field) || reads_field(b, field),
+        Expr::InExpr { e, list, .. } => reads_field(e, field) || any(list),
+        Expr::Between { e, lo, hi, .. } => reads_field(e, field) || reads_field(lo, field) || reads_field(hi, field),
+        Expr::Chain(first, rest) => reads_field(first, field) || rest.iter().any(|(_, e)| reads_field(e, field)),
+        Expr::Case { subject, arms, otherwise } => {
+            subject.as_deref().is_some_and(|e| reads_field(e, field))
+                || arms.iter().any(|(w, t)| reads_field(w, field) || reads_field(t, field))
+                || otherwise.as_deref().is_some_and(|e| reads_field(e, field))
+        }
+    }
+}
+
+/// Parse retained expressions against fields and geometry type, without checking current areas.
+/// Drawing and stale-field checks use this path and report unavailable areas separately; new
+/// user calculations and filters use [`parse`] so ambiguous measurements are refused.
+pub fn parse_fields(text: &str, ds: &Dataset) -> Result<Expr, String> {
+    parse_expression(text, ds, false)
+}
+
+fn parse_expression(text: &str, ds: &Dataset, validate_areas: bool) -> Result<Expr, String> {
     let toks = lex(text)?;
     if toks.is_empty() {
         return Err("the expression is empty".into());
     }
-    let mut p = Parser { toks, pos: 0, ds, depth: 0 };
+    let mut p = Parser { toks, pos: 0, ds, depth: 0, area_check: OnceCell::new(), validate_areas, probe: None, calls: Vec::new() };
     let e = p.or()?;
     if p.pos < p.toks.len() {
         return Err(format!("unexpected {}", show(p.toks.get(p.pos))));
@@ -777,8 +1461,21 @@ pub fn parse(text: &str, ds: &Dataset) -> Result<Expr, String> {
     Ok(e)
 }
 
+/// SQL `=`: dates by instant (against dates or date text), numbers as numbers, otherwise text
+/// ignoring case.
 fn eq(a: &Value, b: &Value) -> bool {
+    if let Some((x, y)) = a.temporal_keys(b) {
+        return x == y;
+    }
+    // Whole numbers compare exactly: through f64, neighbours above 2^53 would be equal.
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return x == y;
+    }
     match (a.as_f64(), b.as_f64()) {
+        // A whole number against another number: equal exactly when the order says so.
+        (Some(_), Some(_)) if matches!(a, Value::Int(_)) || matches!(b, Value::Int(_)) => {
+            a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+        }
         (Some(x), Some(y)) if !matches!(a, Value::Text(_)) || !matches!(b, Value::Text(_)) => x == y,
         _ => a.to_string().eq_ignore_ascii_case(&b.to_string()),
     }
@@ -807,29 +1504,46 @@ fn compare(a: &Value, op: Op, b: &Value) -> Option<bool> {
 
 /// The most steps one `LIKE` takes to match. A long text against a pattern of many `%`s costs
 /// up to text × pattern steps (64 KiB of text and a 10,000-character pattern, 6.5 × 10⁸); past
-/// this (a tenth of a second or so), the match is unknown rather than holding up the map.
+/// this (some 15 ms), the match is unknown rather than holding up the map.
 pub const MAX_LIKE_STEPS: usize = 1 << 24;
+
+/// The most steps all of an expression's `LIKE`s take together for one row: four at their cap. A
+/// clause can hold hundreds of `LIKE`s, each up to [`MAX_LIKE_STEPS`]; once they've spent this, the
+/// rest are unknown. A single costly `LIKE` doesn't affect the others.
+pub const MAX_ROW_LIKE_STEPS: usize = 4 * MAX_LIKE_STEPS;
 
 /// SQL LIKE with `%` and `_`, case-insensitive; no match when it would take more than
 /// [`MAX_LIKE_STEPS`].
 pub fn like(text: &str, pat: &str) -> bool {
-    like_within(text, pat).unwrap_or(false)
+    like_within(text, pat, &Cell::new(MAX_LIKE_STEPS)).unwrap_or(false)
 }
 
-/// SQL LIKE with `%` and `_`, case-insensitive: `None` when it would take more than
-/// [`MAX_LIKE_STEPS`].
-fn like_within(text: &str, pat: &str) -> Option<bool> {
+/// SQL LIKE with `%` and `_`, case-insensitive, taking up to [`MAX_LIKE_STEPS`] from `budget`:
+/// `None` when it would take more than that or than `budget` holds, at once when it's empty.
+fn like_within(text: &str, pat: &str, budget: &Cell<usize>) -> Option<bool> {
+    let had = budget.get();
+    if had == 0 {
+        return None;
+    }
+    let mut left = had.min(MAX_LIKE_STEPS);
+    let start = left;
+    let m = like_steps(text, pat, &mut left);
+    budget.set(had - (start - left));
+    m
+}
+
+/// [`like_within`], counting its steps down in `left`.
+fn like_steps(text: &str, pat: &str, left: &mut usize) -> Option<bool> {
     let t: Vec<char> = text.to_lowercase().chars().collect();
     let p: Vec<char> = pat.to_lowercase().chars().collect();
     // Iterative wildcard matching with backtracking on the last '%'.
     let (mut ti, mut pi) = (0usize, 0usize);
     let (mut star, mut mark) = (None::<usize>, 0usize);
-    let mut steps = 0usize;
     while ti < t.len() {
-        steps += 1;
-        if steps > MAX_LIKE_STEPS {
+        if *left == 0 {
             return None;
         }
+        *left -= 1;
         match p.get(pi) {
             Some('%') => {
                 star = Some(pi);
@@ -853,6 +1567,29 @@ fn like_within(text: &str, pat: &str) -> Option<bool> {
     Some(p.get(pi..).is_some_and(|rest| rest.iter().all(|c| *c == '%')))
 }
 
+/// Whether any branch can read polygon area, including unit-converted area functions.
+/// Source workers use this after parsing against metadata, before evaluating actual chunks.
+pub fn uses_area(e: &Expr) -> bool {
+    let any = |es: &[Expr]| es.iter().any(uses_area);
+    match e {
+        Expr::Var(Var::Measure(Measure::Area, _)) => true,
+        Expr::And(es) | Expr::Or(es) | Expr::Concat(es) | Expr::Call(_, es) => any(es),
+        Expr::Not(e) | Expr::IsNullExpr { e, .. } => uses_area(e),
+        Expr::Compare(_, a, b) | Expr::LikeExpr { e: a, pattern: b, .. } => uses_area(a) || uses_area(b),
+        Expr::InExpr { e, list, .. } => uses_area(e) || any(list),
+        Expr::Between { e, lo, hi, .. } => uses_area(e) || uses_area(lo) || uses_area(hi),
+        Expr::Chain(first, rest) => uses_area(first) || rest.iter().any(|(_, e)| uses_area(e)),
+        Expr::Case { subject, arms, otherwise } => {
+            subject.as_deref().is_some_and(uses_area)
+                || arms.iter().any(|(w, t)| uses_area(w) || uses_area(t))
+                || otherwise.as_deref().is_some_and(uses_area)
+        }
+        Expr::Cmp { .. } | Expr::Like { .. } | Expr::IsNull { .. } | Expr::In { .. } | Expr::Lit(_) | Expr::Field(_) | Expr::Var(_) => {
+            false
+        }
+    }
+}
+
 /// Evaluates for one row: whether the row matches.
 pub fn eval(e: &Expr, ds: &Dataset, row: usize) -> bool {
     matches(e, ds, row, &Env::default())
@@ -860,12 +1597,31 @@ pub fn eval(e: &Expr, ds: &Dataset, row: usize) -> bool {
 
 /// Whether the row matches, with variables from `env`.
 pub fn matches(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> bool {
-    Eval { ds, row, env }.cond(e) == Some(true)
+    Eval::new(ds, row, env).cond(e) == Some(true)
+}
+
+/// Tests a row in a chunk whose first row has `offset` preceding rows in the source.
+pub(crate) fn eval_in_chunk(e: &Expr, ds: &Dataset, row: usize, offset: usize) -> bool {
+    let env = Env::default();
+    let mut eval = Eval::new(ds, row, &env);
+    eval.row_offset = offset;
+    eval.cond(e) == Some(true)
 }
 
 /// The expression's value for one row.
 pub fn value(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> Value {
-    Eval { ds, row, env }.value(e).into_owned()
+    Eval::new(ds, row, env).value(e).into_owned()
+}
+
+/// [`value`], with the error that made it null: `None` for any other value, and for a null the
+/// expression wrote, read from a field or took from an unmet condition. An error inside an `if`
+/// or `CASE` condition only picks the branch, so it isn't the result's. Where several errors
+/// reach the result, the first one met is given.
+pub fn value_or_fault(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> (Value, Option<Fault>) {
+    let eval = Eval::new(ds, row, env);
+    let v = eval.value(e).into_owned();
+    let fault = if v.is_null() { eval.fault.get() } else { None };
+    (v, fault)
 }
 
 /// Whether a value counts as true: a non-zero number, non-empty text; null is unknown.
@@ -876,6 +1632,7 @@ fn truth(v: &Value) -> Option<bool> {
         Value::Int(i) => Some(*i != 0),
         Value::Float(f) => (!f.is_nan()).then_some(*f != 0.0),
         Value::Text(s) => Some(!s.is_empty()),
+        Value::Date(_) | Value::DateTime(_) => Some(true),
     }
 }
 
@@ -902,33 +1659,69 @@ fn whole(f: f64) -> Value {
     if f.is_finite() && f.abs() < 9e15 { Value::Int(f as i64) } else { real(f) }
 }
 
-fn arith(op: Arith, a: &Value, b: &Value) -> Value {
+/// Whether `v` is empty or `<null>` text, which a number read takes as missing
+/// ([`Value::asks_null`]); a null is told apart by whether it carries an error.
+fn blank_text(v: &Value) -> bool {
+    matches!(v, Value::Text(_)) && v.asks_null()
+}
+
+/// A float result, or why it is null: too large, or not a number.
+fn checked(f: f64) -> Result<Value, Fault> {
+    if f.is_finite() {
+        Ok(Value::Float(f))
+    } else if f.is_nan() {
+        Err(Fault::NotANumber)
+    } else {
+        Err(Fault::Overflow)
+    }
+}
+
+/// `a op b`: null with a null, exact on whole numbers where it can be, `+` joining text. An
+/// error (a date, text that isn't a number, a division by zero, an overflow) gives null too,
+/// and says which it was.
+fn arith(op: Arith, a: &Value, b: &Value) -> Result<Value, Fault> {
     if a.is_null() || b.is_null() {
-        return Value::Null;
+        return Ok(Value::Null);
+    }
+    // Arithmetic on dates, which the parser refuses on a date field, is null from anything else
+    // that gives a date (`coalesce(issued, closed) + 1`).
+    if a.temporal_key().is_some() || b.temporal_key().is_some() {
+        return Err(Fault::Date);
     }
     let (Some(x), Some(y)) = (a.as_f64(), b.as_f64()) else {
-        return if op == Arith::Add { text(format!("{a}{b}")) } else { Value::Null };
+        // `+` joins text, but a stored NaN or infinity isn't text to join (`inf + 1` isn't `inf1`).
+        if op == Arith::Add {
+            if a.is_non_finite() || b.is_non_finite() {
+                return Err(Fault::NotANumber);
+            }
+            return Ok(text(format!("{a}{b}")));
+        }
+        // Neither is at fault when the one that isn't a number is missing (empty text).
+        return Fault::of_non_number(a).or(Fault::of_non_number(b)).map_or(Ok(Value::Null), Err);
     };
     if let (Value::Int(i), Value::Int(j)) = (a, b) {
         let exact = match op {
             Arith::Add => i.checked_add(*j),
             Arith::Sub => i.checked_sub(*j),
             Arith::Mul => i.checked_mul(*j),
-            Arith::Mod => return i.checked_rem(*j).map(Value::Int).unwrap_or(Value::Null),
+            Arith::Mod if *j == 0 => return Err(Fault::DivisionByZero),
+            // Exact with a divisor that isn't 0: `i64::MIN % -1` is 0.
+            Arith::Mod => return Ok(Value::Int(i.wrapping_rem(*j))),
             _ => None,
         };
         if let Some(v) = exact {
-            return Value::Int(v);
+            return Ok(Value::Int(v));
         }
     }
     match op {
-        Arith::Add => real(x + y),
-        Arith::Sub => real(x - y),
-        Arith::Mul => real(x * y),
-        Arith::Div if y != 0.0 => real(x / y),
-        Arith::Mod if y != 0.0 => real(x % y),
-        Arith::Pow => real(x.powf(y)),
-        _ => Value::Null,
+        Arith::Add => checked(x + y),
+        Arith::Sub => checked(x - y),
+        Arith::Mul => checked(x * y),
+        Arith::Div | Arith::Mod if y == 0.0 => Err(Fault::DivisionByZero),
+        Arith::Div => checked(x / y),
+        Arith::Mod => checked(x % y),
+        Arith::Pow if x == 0.0 && y < 0.0 => Err(Fault::DivisionByZero),
+        Arith::Pow => checked(x.powf(y)),
     }
 }
 
@@ -958,13 +1751,78 @@ fn channel(v: f64) -> u8 {
 struct Eval<'a> {
     ds: &'a Dataset,
     row: usize,
+    row_offset: usize,
     env: &'a Env,
+    /// The steps left for the expression's `LIKE`s on this row ([`MAX_ROW_LIKE_STEPS`] in all).
+    like_steps: Cell<usize>,
+    /// The first error that gave null on this row ([`value_or_fault`]).
+    fault: Cell<Option<Fault>>,
 }
 
 impl<'a> Eval<'a> {
+    fn new(ds: &'a Dataset, row: usize, env: &'a Env) -> Self {
+        Eval { ds, row, row_offset: 0, env, like_steps: Cell::new(MAX_ROW_LIKE_STEPS), fault: Cell::new(None) }
+    }
+
+    /// Null, for the error `fault`, kept when it is the row's first.
+    fn fail(&self, fault: Fault) -> Value {
+        if self.fault.get().is_none() {
+            self.fault.set(Some(fault));
+        }
+        Value::Null
+    }
+
+    /// A result that may have failed ([`checked`], [`arith`]): its value, or null and the fault kept.
+    fn or_fail(&self, v: Result<Value, Fault>) -> Value {
+        v.unwrap_or_else(|f| self.fail(f))
+    }
+
+    /// An operator's operand `e`: its value, and whether it is missing (null without an error of
+    /// its own). Its error, if any, joins the errors met so far.
+    fn operand(&self, e: &'a Expr) -> (Cow<'a, Value>, bool) {
+        let before = self.fault.take();
+        let v = self.value(e);
+        let own = self.fault.get();
+        self.fault.set(before.or(own));
+        let missing = v.is_null() && own.is_none();
+        (v, missing)
+    }
+
+    /// `v` as a number argument: text or a date that isn't one is an error, a null just null.
+    fn num(&self, v: &Value) -> Option<f64> {
+        if let Some(fault) = Fault::of_non_number(v) {
+            self.fail(fault);
+        }
+        v.as_f64()
+    }
+
+    /// `f`, whose errors only decide something (a branch, an arm, what `nullif` compares with)
+    /// and so aren't kept as the result's.
+    fn deciding<T>(&self, f: impl FnOnce() -> T) -> T {
+        let kept = self.fault.get();
+        let out = f();
+        self.fault.set(kept);
+        out
+    }
+
+    /// Whether the condition `e` holds, for choosing a branch ([`deciding`](Self::deciding)).
+    fn branch(&self, e: &'a Expr) -> Option<bool> {
+        self.deciding(|| self.cond(e))
+    }
+
     /// SQL's three-valued logic: `None` is "unknown", what a comparison with a null gives. `NOT`
-    /// leaves it unknown, so `NOT (pop > 100)` doesn't match a row whose `pop` is null.
+    /// leaves it unknown, so `NOT (pop > 100)` doesn't match a row whose `pop` is null. An error
+    /// inside `e` stays the row's only while `e` is unknown, as [`value`](Self::value) keeps one.
     fn cond(&self, e: &'a Expr) -> Option<bool> {
+        let outer = self.fault.take();
+        let hit = self.cond_of(e);
+        let inner = self.fault.get();
+        self.fault.set(if hit.is_none() { outer.or(inner) } else { outer });
+        hit
+    }
+
+    /// [`cond`](Self::cond), before keeping or dropping the errors met inside it.
+    fn cond_of(&self, e: &'a Expr) -> Option<bool> {
         let (ds, row) = (self.ds, self.row);
         match e {
             Expr::And(terms) => {
@@ -993,19 +1851,27 @@ impl<'a> Eval<'a> {
             Expr::IsNull { field, negate } => Some(ds.value(row, *field).is_null() != *negate),
             Expr::Like { field, pattern, negate } => {
                 let v = ds.value(row, *field);
-                if v.is_null() {
+                // Out of steps for this row: unknown, without copying the text.
+                if v.is_null() || self.like_steps.get() == 0 {
                     return None;
                 }
-                like_within(&v.to_string(), pattern).map(|m| m != *negate)
+                like_within(&v.to_string(), pattern, &self.like_steps).map(|m| m != *negate)
             }
             Expr::In { field, values, negate } => {
                 let v = ds.value(row, *field);
                 (!v.is_null()).then(|| values.iter().any(|x| !x.is_null() && eq(v, x)) != *negate)
             }
             Expr::Cmp { field, op, lit } => compare(ds.value(row, *field), *op, lit),
-            Expr::Compare(op, l, r) => compare(&self.value(l), *op, &self.value(r)),
+            Expr::Compare(op, l, r) => {
+                let (a, b) = (self.value(l), self.value(r));
+                compare(&a, *op, &b)
+            }
             Expr::IsNullExpr { e, negate } => Some(self.value(e).is_null() != *negate),
             Expr::LikeExpr { e, pattern, negate } => {
+                // Out of steps for this row: unknown, without building the text or the pattern.
+                if self.like_steps.get() == 0 {
+                    return None;
+                }
                 let (v, p) = (self.value(e), self.value(pattern));
                 // A pattern no longer than a clause, as a written one is: matching costs text × pattern.
                 if v.is_null() || p.is_null() {
@@ -1016,7 +1882,7 @@ impl<'a> Eval<'a> {
                 if p.chars().count() > MAX_LEN {
                     return Some(*negate);
                 }
-                like_within(&v.to_string(), &p).map(|m| m != *negate)
+                like_within(&v.to_string(), &p, &self.like_steps).map(|m| m != *negate)
             }
             Expr::InExpr { e, list, negate } => {
                 let v = self.value(e);
@@ -1041,51 +1907,86 @@ impl<'a> Eval<'a> {
     }
 
     /// `e`'s value on this row: null where it can't be worked out (a missing field, an error).
+    /// An error inside `e` stays the row's only while `e` is null: `coalesce(a / 0, 0) / b`, with
+    /// `b` null, is null because of `b`, not the division `coalesce` replaced.
     fn value(&self, e: &'a Expr) -> Cow<'a, Value> {
+        let outer = self.fault.take();
+        let v = self.value_of(e);
+        let inner = self.fault.get();
+        self.fault.set(if v.is_null() { outer.or(inner) } else { outer });
+        v
+    }
+
+    /// [`value`](Self::value), before keeping or dropping the errors met inside it.
+    fn value_of(&self, e: &'a Expr) -> Cow<'a, Value> {
         match e {
             Expr::Lit(v) => Cow::Borrowed(v),
             Expr::Field(i) => Cow::Borrowed(self.ds.value(self.row, *i)),
             Expr::Var(v) => Cow::Owned(match v {
                 Var::MapScale => self.env.map_scale.map(real).unwrap_or(Value::Null),
-                Var::RowNumber => i64::try_from(self.row).ok().and_then(|r| r.checked_add(1)).map(Value::Int).unwrap_or(Value::Null),
-                Var::Id => self.ds.features.get(self.row).and_then(|f| i64::try_from(f.id).ok()).map(Value::Int).unwrap_or(Value::Null),
-                Var::Measure(m, size) => self
-                    .ds
-                    .features
-                    .get(self.row)
-                    .and_then(|f| f.geometry.as_ref())
-                    .and_then(|g| g.wgs84_measure(*m))
-                    // A hole larger than its polygon measures below zero: no sensible area.
-                    .filter(|v| *v >= 0.0)
-                    .map(|v| real(v / size))
+                Var::PageFeatureId => {
+                    self.env.page.as_ref().and_then(|p| i64::try_from(p.feature_id).ok()).map(Value::Int).unwrap_or(Value::Null)
+                }
+                Var::PageName => self.env.page.as_ref().map(|p| Value::Text(p.name.clone())).unwrap_or(Value::Null),
+                Var::PageNumber => self.env.page.as_ref().and_then(|p| i64::try_from(p.number).ok()).map(Value::Int).unwrap_or(Value::Null),
+                Var::RowNumber => i64::try_from(self.row.saturating_add(self.row_offset))
+                    .ok()
+                    .and_then(|r| r.checked_add(1))
+                    .map(Value::Int)
                     .unwrap_or(Value::Null),
+                Var::Id => self.ds.features.get(self.row).and_then(|f| i64::try_from(f.id).ok()).map(Value::Int).unwrap_or(Value::Null),
+                Var::Measure(m, size) => match self.ds.features.get(self.row).and_then(|f| f.geometry.as_ref()) {
+                    None => Value::Null,
+                    // Measured in longitude/latitude: a place that can't be converted is an error.
+                    Some(g) => match self.ds.wgs84_measure(g, *m) {
+                        Err(_) => self.fail(Fault::Unmeasurable),
+                        // A hole larger than its polygon measures below zero: no sensible area.
+                        Ok(v) => v.filter(|v| *v >= 0.0).map(|v| real(v / size)).unwrap_or(Value::Null),
+                    },
+                },
             }),
+            // An operand that is missing (null without an error) makes the result null whatever
+            // else failed, so an error is the result's only when no operand is missing:
+            // `1 / 0 + pop`, with `pop` null, is null because of `pop`.
+            // Empty or `<null>` text is missing to every operator but `+`, which joins it.
             Expr::Chain(first, rest) => {
-                let mut acc = self.value(first).into_owned();
+                let (first, mut missing) = self.operand(first);
+                let mut acc = first.into_owned();
                 for (op, t) in rest {
-                    acc = arith(*op, &acc, &self.value(t));
+                    let (v, m) = self.operand(t);
+                    // The result so far counts too: `'' + '' - x` takes `-` on empty text.
+                    missing |= m || (*op != Arith::Add && (blank_text(&acc) || blank_text(&v)));
+                    acc = self.or_fail(arith(*op, &acc, &v));
+                }
+                if missing {
+                    self.fault.set(None);
                 }
                 Cow::Owned(acc)
             }
             Expr::Concat(terms) => {
                 let mut s = String::new();
+                let mut null = false;
                 for t in terms {
-                    let v = self.value(t);
-                    if v.is_null() {
+                    let (v, missing) = self.operand(t);
+                    if missing {
+                        self.fault.set(None);
                         return Cow::Owned(Value::Null);
                     }
-                    if s.len() <= MAX_TEXT {
+                    // Null from an error: the rest are read only to see whether one is missing.
+                    null |= v.is_null();
+                    if !null && s.len() <= MAX_TEXT {
                         s.push_str(&v.to_string());
                     }
                 }
-                Cow::Owned(text(s))
+                Cow::Owned(if null { Value::Null } else { text(s) })
             }
             Expr::Case { subject, arms, otherwise } => {
-                let subject = subject.as_ref().map(|s| self.value(s));
+                // The subject only picks the arm.
+                let subject = subject.as_ref().map(|s| self.deciding(|| self.value(s)));
                 for (when, then) in arms {
                     let hit = match &subject {
-                        Some(s) => compare(s, Op::Eq, &self.value(when)),
-                        None => self.cond(when),
+                        Some(s) => self.deciding(|| compare(s, Op::Eq, &self.value(when))),
+                        None => self.branch(when),
                     };
                     if hit == Some(true) {
                         return self.value(then);
@@ -1102,23 +2003,59 @@ impl<'a> Eval<'a> {
     }
 
     /// The value of the function `f` over `args` on this row.
+    /// As for an operator, a missing argument (null without an error of its own) is why a null
+    /// result is null, whatever else failed: `clamp(pop, 1 / 0, 5)`, with `pop` null. Not for
+    /// the functions that skip nulls (`coalesce`, `min`, `max`): there each null argument is a
+    /// cause, and fixing the error alone gives a value (`coalesce(1 / 0, pop)`).
     fn call(&self, f: Func, args: &'a [Expr]) -> Cow<'a, Value> {
-        let arg = |i: usize| args.get(i).map(|a| self.value(a)).unwrap_or(Cow::Owned(Value::Null));
-        let n = |i: usize| arg(i).as_f64();
+        let missing = Cell::new(false);
+        let v = self.call_with(f, args, &missing);
+        if missing.get() && v.is_null() && !matches!(f, Func::Coalesce | Func::Min | Func::Max) {
+            self.fault.set(None);
+        }
+        v
+    }
+
+    /// [`call`](Self::call), noting in `missing` an argument read that was missing.
+    fn call_with(&self, f: Func, args: &'a [Expr], missing: &Cell<bool>) -> Cow<'a, Value> {
+        let read = |a: &'a Expr| {
+            let (v, m) = self.operand(a);
+            if m {
+                missing.set(true);
+            }
+            v
+        };
+        let arg = |i: usize| args.get(i).map(read).unwrap_or(Cow::Owned(Value::Null));
+        // A number argument; empty or `<null>` text there is missing, as a null is.
+        let number = |v: &Value| {
+            if blank_text(v) {
+                missing.set(true);
+            }
+            self.num(v)
+        };
+        let n = |i: usize| number(&arg(i));
         let txt = |i: usize| {
             let v = arg(i);
             (!v.is_null()).then(|| v.to_string())
         };
-        let num1 = |g: fn(f64) -> f64| Cow::Owned(n(0).map(|x| real(g(x))).unwrap_or(Value::Null));
+        let num1 = |g: fn(f64) -> f64| Cow::Owned(n(0).map(|x| self.or_fail(checked(g(x)))).unwrap_or(Value::Null));
+        // A function of positive numbers only (`sqrt`, `ln`): `fault` below its domain.
+        let num_from = |g: fn(f64) -> f64, zero_ok: bool, fault: Fault| {
+            Cow::Owned(match n(0) {
+                Some(x) if x < 0.0 || (x == 0.0 && !zero_ok) => self.fail(fault),
+                Some(x) => self.or_fail(checked(g(x))),
+                None => Value::Null,
+            })
+        };
         let text1 = |g: fn(&str) -> String| Cow::Owned(txt(0).map(|s| text(g(&s))).unwrap_or(Value::Null));
         Cow::Owned(match f {
             Func::If => {
-                let pick = if args.first().and_then(|c| self.cond(c)) == Some(true) { 1 } else { 2 };
+                let pick = if args.first().and_then(|c| self.branch(c)) == Some(true) { 1 } else { 2 };
                 return arg(pick);
             }
             Func::Coalesce => {
                 for a in args {
-                    let v = self.value(a);
+                    let v = read(a);
                     if !v.is_null() {
                         return v;
                     }
@@ -1126,7 +2063,9 @@ impl<'a> Eval<'a> {
                 Value::Null
             }
             Func::NullIf => {
-                let (a, b) = (arg(0), arg(1));
+                // `b` is only compared with.
+                let b = || args.get(1).map(|b| self.value(b)).unwrap_or(Cow::Owned(Value::Null));
+                let (a, b) = (arg(0), self.deciding(b));
                 if compare(&a, Op::Eq, &b) == Some(true) {
                     Value::Null
                 } else {
@@ -1134,14 +2073,18 @@ impl<'a> Eval<'a> {
                 }
             }
             Func::Abs => match &*arg(0) {
-                Value::Int(i) => i.checked_abs().map(Value::Int).unwrap_or(Value::Null),
-                v => v.as_f64().map(|x| real(x.abs())).unwrap_or(Value::Null),
+                Value::Int(i) => i.checked_abs().map(Value::Int).unwrap_or_else(|| self.fail(Fault::Overflow)),
+                v => number(v).map(|x| real(x.abs())).unwrap_or(Value::Null),
             },
             Func::Round => {
+                let x = arg(0).into_owned();
+                if blank_text(&x) {
+                    missing.set(true);
+                }
                 let places = if args.len() > 1 { n(1).map(|p| p.clamp(-15.0, 15.0) as i32) } else { Some(0) };
-                match (arg(0).into_owned(), places) {
+                match (x, places) {
                     (Value::Int(i), Some(p)) if p >= 0 => Value::Int(i),
-                    (v, Some(p)) => match v.as_f64() {
+                    (v, Some(p)) => match number(&v) {
                         Some(x) => {
                             let m = 10f64.powi(p);
                             // So large it has no places to round: as it is.
@@ -1155,15 +2098,15 @@ impl<'a> Eval<'a> {
             }
             Func::Floor => n(0).map(|x| whole(x.floor())).unwrap_or(Value::Null),
             Func::Ceil => n(0).map(|x| whole(x.ceil())).unwrap_or(Value::Null),
-            Func::Sqrt => return num1(f64::sqrt),
+            Func::Sqrt => return num_from(f64::sqrt, true, Fault::NegativeRoot),
             Func::Exp => return num1(f64::exp),
-            Func::Ln => return num1(f64::ln),
-            Func::Log10 => return num1(f64::log10),
+            Func::Ln => return num_from(f64::ln, false, Fault::Logarithm),
+            Func::Log10 => return num_from(f64::log10, false, Fault::Logarithm),
             Func::Pi => Value::Float(std::f64::consts::PI),
             Func::Min | Func::Max => {
                 let mut best: Option<(f64, Cow<'a, Value>)> = None;
                 for a in args {
-                    let v = self.value(a);
+                    let v = read(a);
                     let Some(x) = v.as_f64() else { continue };
                     let better = match &best {
                         None => true,
@@ -1178,7 +2121,7 @@ impl<'a> Eval<'a> {
             Func::Clamp => {
                 // Each argument once: evaluated again, nested clamps would cost 2^depth.
                 let (lo, x, hi) = (arg(0), arg(1), arg(2));
-                match (lo.as_f64(), x.as_f64(), hi.as_f64()) {
+                match (number(&lo), number(&x), number(&hi)) {
                     (Some(l), Some(v), Some(h)) if l <= h => {
                         return if v < l {
                             lo
@@ -1188,6 +2131,7 @@ impl<'a> Eval<'a> {
                             x
                         };
                     }
+                    (Some(_), Some(_), Some(_)) => self.fail(Fault::ClampBounds),
                     _ => Value::Null,
                 }
             }
@@ -1196,7 +2140,11 @@ impl<'a> Eval<'a> {
                 match (n(0), n(1), n(2), n(3), n(4), exponent) {
                     (Some(x), Some(d0), Some(d1), Some(r0), Some(r1), Some(e)) => {
                         let t = if d1 == d0 { if x <= d0 { 0.0 } else { 1.0 } } else { ((x - d0) / (d1 - d0)).clamp(0.0, 1.0) };
-                        real(r0 + (r1 - r0) * t.powf(e))
+                        // As `0 ^ -1`: a negative exponent at the domain's start divides by zero.
+                        if t == 0.0 && e < 0.0 {
+                            return Cow::Owned(self.fail(Fault::DivisionByZero));
+                        }
+                        self.or_fail(checked(r0 + (r1 - r0) * t.powf(e)))
                     }
                     _ => Value::Null,
                 }
@@ -1204,7 +2152,7 @@ impl<'a> Eval<'a> {
             Func::ToString => txt(0).map(text).unwrap_or(Value::Null),
             Func::ToInt => match &*arg(0) {
                 Value::Int(i) => Value::Int(*i),
-                v => v.as_f64().map(|x| whole(x.trunc())).unwrap_or(Value::Null),
+                v => number(v).map(|x| whole(x.trunc())).unwrap_or(Value::Null),
             },
             Func::ToReal => n(0).map(Value::Float).unwrap_or(Value::Null),
             Func::Length => txt(0).map(|s| Value::Int(s.chars().count() as i64)).unwrap_or(Value::Null),

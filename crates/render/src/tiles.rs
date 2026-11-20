@@ -27,6 +27,11 @@ pub(crate) struct TileOutput {
     pub attribution: Vec<String>,
     pub pending: bool,
     pub errors: Vec<String>,
+    /// Raster layers read in place drawn from less than the view needs (a coarser level, tiles
+    /// they couldn't read), by id: shown, with the error among `errors`; an export refuses them.
+    pub partial: Vec<u32>,
+    /// Raster layers read in place whose tiles are still on their way, by id.
+    pub pending_in_place: Vec<u32>,
 }
 
 impl TileOutput {
@@ -73,7 +78,8 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
     let (th, em) = (crate::text::block_height(&text, size), l.size);
     let x = l.x + l.offset[0] * em;
     let y = l.y + l.anchor[1] * th + l.offset[1] * em;
-    let icon = l.icon.map(|i| PlacedIcon { image: i.image, x: l.x + i.dx, y: l.y + i.dy, w: i.width, h: i.height, angle: i.angle });
+    let icon =
+        l.icon.map(|i| PlacedIcon { image: i.image, x: l.x + i.dx, y: l.y + i.dy, w: i.width, h: i.height, angle: i.angle, alpha: 1.0 });
     let line_align = match l.justify {
         j if j < -0.25 => TextAlign::Left,
         j if j > 0.25 => TextAlign::Right,
@@ -103,6 +109,25 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
         },
         l.priority,
     ))
+}
+
+/// A colour with its alpha times `k`.
+fn faded(c: Rgba, k: f32) -> Rgba {
+    Rgba([c.0[0], c.0[1], c.0[2], (f32::from(c.0[3]) * k).round() as u8])
+}
+
+/// A tile layer's label at the layer's opacity: its text, halo and icon fainter by it.
+fn fade(mut l: PlacedLabel, opacity: f32) -> PlacedLabel {
+    if !opacity.is_finite() || opacity >= 1.0 {
+        return l;
+    }
+    let k = opacity.max(0.0);
+    l.color = faded(l.color, k);
+    l.halo = l.halo.map(|c| faded(c, k));
+    if let Some(i) = &mut l.icon {
+        i.alpha *= k;
+    }
+    l
 }
 
 /// How the tiles crate sees a tile layer.
@@ -164,13 +189,13 @@ type LastTile = (std::sync::Weak<crate::tile_mesh::TileMesh>, [f64; 2], [f32; 4]
 type Last = std::collections::HashMap<usize, (std::sync::Weak<rustgis_tiles::source::Resolved>, Vec<LastTile>)>;
 static LAST: std::sync::OnceLock<std::sync::Mutex<Last>> = std::sync::OnceLock::new();
 
-/// The meshes of `v`'s tiles, and whether some were made while the sprite was on its way. A map
+/// The meshes of `v`'s tiles, and whether a sprite they use is on its way. A map
 /// drawn for the screen at a pace (see `rustgis_tiles::Pace`) makes those missing a frame's worth
 /// at a time, nearest `centre` first, the tiles drawn last standing in for the rest meanwhile,
 /// clipped to their squares.
 fn mesh_tiles(v: &rustgis_tiles::shapes::VectorTiles, centre: [f64; 2]) -> (Vec<MeshTile>, bool) {
     let pace = rustgis_tiles::pace();
-    let meshes = crate::tile_mesh::meshes(&v.style, &v.source, &v.tiles, v.level, pace.map(|(_, until)| (until, centre)));
+    let (meshes, mut waiting) = crate::tile_mesh::meshes(&v.style, &v.source, &v.tiles, v.level, pace.map(|(_, until)| (until, centre)));
     let lock = || LAST.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     let key = std::sync::Arc::as_ptr(&v.style) as usize;
     let last: Vec<MeshTile> = lock()
@@ -183,7 +208,7 @@ fn mesh_tiles(v: &rustgis_tiles::shapes::VectorTiles, centre: [f64; 2]) -> (Vec<
                 .collect()
         })
         .unwrap_or_default();
-    let (mut stood_in, mut tiles, mut waiting) = (Vec::new(), Vec::new(), false);
+    let (mut stood_in, mut tiles) = (Vec::new(), Vec::new());
     for (d, m) in v.tiles.iter().zip(meshes) {
         let o = [d.at.min_x, d.at.max_y];
         match m {
@@ -255,6 +280,8 @@ pub struct Live {
     pub quads: Vec<TileQuad>,
     /// Tiles in view are still on their way.
     pub pending: bool,
+    /// What resolving or placing these tiles left out, reported just as for a full drawing.
+    pub error: Option<String>,
 }
 
 /// A live raster tile layer's tiles for `view` ([`DrawCmd::LiveTiles`]): over the view, fetching
@@ -263,6 +290,13 @@ pub struct Live {
 /// `None` when the layer draws anything but raster tiles (its style changed since the scene was
 /// drawn). Cheap: cache lookups.
 pub fn live(spec: &Spec, opacity: f32, view: &View) -> Option<Live> {
+    let archive = matches!(spec.kind, Kind::PmTiles | Kind::MbTiles).then_some(spec.url.as_str());
+    let revision = rustgis_tiles::cache::archive_revision(archive);
+    let output = live_inner(spec, opacity, view);
+    (revision == rustgis_tiles::cache::archive_revision(archive)).then_some(output).flatten()
+}
+
+fn live_inner(spec: &Spec, opacity: f32, view: &View) -> Option<Live> {
     let res = view.camera.res;
     let ppp = view.pixels_per_point as f32;
     let frame = Frame {
@@ -282,7 +316,7 @@ pub fn live(spec: &Spec, opacity: f32, view: &View) -> Option<Live> {
     let coarse = Frame { m_per_px: frame.m_per_px * 8.0, ..frame };
     let _ = rustgis_tiles::place_raster(spec, opacity, &coarse, &fetch, &fetch);
     let origin = [view.camera.center.x, view.camera.center.y];
-    Some(Live { quads: p.tiles.iter().map(|q| quad(q, origin)).collect(), pending: p.pending })
+    Some(Live { quads: p.tiles.iter().map(|q| quad(q, origin)).collect(), pending: p.pending, error: p.error })
 }
 
 /// Draws the map's visible tile layers at `which` (indices, top first), bottom first. With
@@ -328,7 +362,7 @@ pub(crate) fn draw(
                     *g.dirty = true;
                 }
                 let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
-                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, t, &mut out);
                 continue;
             }
             // A vector tile style as meshes, made once a tile and level and drawn at any zoom
@@ -346,8 +380,9 @@ pub(crate) fn draw(
                 if !tiles.is_empty() {
                     g.cmds.push(DrawCmd::TileMeshes { tiles });
                 }
-                let d = rustgis_tiles::Drawn { labels: v.labels, attribution: v.attribution, pending: v.pending || waiting, error: None };
-                collect(d, &t.name, &mut out);
+                let d =
+                    rustgis_tiles::Drawn { labels: v.labels, attribution: v.attribution, pending: v.pending || waiting, error: v.error };
+                collect(d, t, &mut out);
                 continue;
             }
             // A raster tile layer placed for every frame by the GPU map: the scene holds the layer.
@@ -361,9 +396,14 @@ pub(crate) fn draw(
                 && let Some(p) = rustgis_tiles::place_raster(&s, t.opacity, &frame, &fetch, &reach)
                 && crate::flush_acc(pm, g.cmds, g.dirty).is_some()
             {
-                g.cmds.push(DrawCmd::LiveTiles { spec: s, opacity: t.opacity });
+                let archive_revision = if matches!(s.kind, Kind::PmTiles | Kind::MbTiles) {
+                    rustgis_tiles::cache::archive_revision([s.url.as_str()])
+                } else {
+                    0
+                };
+                g.cmds.push(DrawCmd::LiveTiles { name: t.name.clone(), spec: s, opacity: t.opacity, archive_revision });
                 let d = rustgis_tiles::Drawn { labels: Vec::new(), attribution: p.attribution, pending: p.pending, error: p.error };
-                collect(d, &t.name, &mut out);
+                collect(d, t, &mut out);
                 continue;
             }
             if let Some(g) = gpu.as_mut()
@@ -379,7 +419,7 @@ pub(crate) fn draw(
                         g.cmds.push(DrawCmd::Tiles { origin, tiles: p.tiles.iter().map(|q| quad(q, origin)).collect() });
                     }
                     let d = rustgis_tiles::Drawn { labels: p.labels, attribution: p.attribution, pending: p.pending, error: p.error };
-                    collect(d, &t.name, &mut out);
+                    collect(d, t, &mut out);
                     continue;
                 }
             }
@@ -387,7 +427,7 @@ pub(crate) fn draw(
             if let Some(g) = gpu.as_mut() {
                 *g.dirty = true;
             }
-            collect(d, &t.name, &mut out);
+            collect(d, t, &mut out);
         }
         return out;
     }
@@ -417,7 +457,7 @@ pub(crate) fn draw(
             run.clear();
             if let Some((pending, error)) = crate::single_image::draw(pm, &req, t, view, flat) {
                 let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
-                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, t, &mut out);
                 continue;
             }
         }
@@ -432,7 +472,7 @@ pub(crate) fn draw(
         run.clear();
         let (pending, error) = crate::native_tiles::draw(pm, &n, t, view, flat);
         let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
-        collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+        collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, t, &mut out);
     }
     mosaic(pm, &run, view, place, &mut out);
     out
@@ -440,7 +480,8 @@ pub(crate) fn draw(
 
 /// What a tile layer drew, into what the map's tile layers drew: tiles on their way, credits,
 /// errors and labels.
-fn collect(d: rustgis_tiles::Drawn, name: &str, out: &mut TileOutput) {
+fn collect(d: rustgis_tiles::Drawn, t: &TileLayer, out: &mut TileOutput) {
+    let name = &t.name;
     out.pending |= d.pending;
     for a in d.attribution {
         if !out.attribution.contains(&a) {
@@ -450,7 +491,8 @@ fn collect(d: rustgis_tiles::Drawn, name: &str, out: &mut TileOutput) {
     if let Some(e) = d.error {
         out.errors.push(format!("{name}: {e}"));
     }
-    out.labels.extend(d.labels.into_iter().filter_map(tile_label));
+    // The layer's opacity fades its text and icons as it fades the rest of what it draws (#1358).
+    out.labels.extend(d.labels.into_iter().filter_map(tile_label).map(|(l, p)| (fade(l, t.opacity), p)));
 }
 
 /// Tile layers (bottom first) on a map in another projection than Web Mercator, or the globe:
@@ -546,7 +588,7 @@ fn mosaic(pm: &mut Pixmap, layers: &[&TileLayer], view: &View, place: Place, out
     let mut scratch = None;
     for t in layers {
         let d = draw_layer(&mut mosaic, t, &frame, false, &mut scratch);
-        collect(d, &t.name, out);
+        collect(d, t, out);
     }
     warp(pm, &mosaic, &frame, &to_lonlat, &to_merc);
 }
@@ -693,6 +735,84 @@ pub(crate) mod tests {
 
     use crate::View;
 
+    /// A tile layer's opacity fades its labels' text, halo and icon with the rest of the layer
+    /// (#1358), and leaves them as they are at full opacity.
+    #[test]
+    fn a_tile_layers_opacity_fades_its_labels_and_icons() {
+        use super::{PlacedIcon, PlacedLabel, Rgba, fade};
+        let icon = PlacedIcon {
+            image: std::sync::Arc::new(tiny_skia::Pixmap::new(2, 2).unwrap()),
+            x: 5.0,
+            y: 5.0,
+            w: 2.0,
+            h: 2.0,
+            angle: None,
+            alpha: 1.0,
+        };
+        let label = PlacedLabel {
+            color: Rgba([10, 20, 30, 255]),
+            halo: Some(Rgba([255, 255, 255, 200])),
+            icon: Some(icon),
+            ..crate::tests::label("Hoek", 5.0, None, 0.0)
+        };
+        assert_eq!(fade(label.clone(), 1.0), label);
+        let half = fade(label.clone(), 0.5);
+        assert_eq!(half.color, Rgba([10, 20, 30, 128]));
+        assert_eq!(half.halo, Some(Rgba([255, 255, 255, 100])));
+        assert_eq!(half.icon.as_ref().map(|i| i.alpha), Some(0.5));
+        // Only the opacity changes: where it sits and what it says.
+        assert_eq!((half.x, half.y, &half.text), (label.x, label.y, &label.text));
+        // A fade of a fade multiplies; junk opacity never panics.
+        assert_eq!(fade(half, 0.5).icon.as_ref().map(|i| i.alpha), Some(0.25));
+        assert_eq!(fade(label.clone(), -3.0).color.0[3], 0);
+        assert_eq!(fade(label.clone(), f32::NAN), label);
+    }
+
+    /// `collect` applies the layer's opacity to what the layer drew (the one place every way of
+    /// drawing a tile layer passes through), not only `fade` on its own.
+    #[test]
+    fn collecting_a_tile_layers_labels_applies_its_opacity() {
+        let label = || rustgis_tiles::Label {
+            text: "Hoek".into(),
+            x: 20.0,
+            y: 20.0,
+            size: 12.0,
+            color: [10, 20, 30, 255],
+            halo: Some([255, 255, 255, 200]),
+            bold: false,
+            italic: false,
+            letter_spacing: 0.0,
+            max_width: 0.0,
+            justify: 0.0,
+            priority: 0.0,
+            anchor: [0.0, 0.0],
+            offset: [0.0, 0.0],
+            angle: None,
+            icon: Some(rustgis_tiles::LabelIcon {
+                image: std::sync::Arc::new(tiny_skia::Pixmap::new(2, 2).unwrap()),
+                width: 8.0,
+                height: 8.0,
+                dx: 0.0,
+                dy: 0.0,
+                angle: None,
+            }),
+            collide: Default::default(),
+        };
+        let collected = |opacity: f32| {
+            let mut t = TileLayer::new("Seamap", TileKind::Style, "https://tiles.test/style.json");
+            t.opacity = opacity;
+            let mut out = super::TileOutput::default();
+            let drawn = rustgis_tiles::Drawn { labels: vec![label()], ..Default::default() };
+            super::collect(drawn, &t, &mut out);
+            assert_eq!(out.labels.len(), 1);
+            out.labels.remove(0).0
+        };
+        let full = collected(1.0);
+        assert_eq!((full.color.0[3], full.halo.map(|h| h.0[3]), full.icon.as_ref().map(|i| i.alpha)), (255, Some(200), Some(1.0)));
+        let faint = collected(0.5);
+        assert_eq!((faint.color.0[3], faint.halo.map(|h| h.0[3]), faint.icon.as_ref().map(|i| i.alpha)), (128, Some(100), Some(0.5)));
+    }
+
     /// The warp interpolating across cells puts every pixel where working it out pixel by pixel
     /// does: on a globe zoomed in, on a whole one with its edge in view, across the antimeridian
     /// (where the mosaic's longitudes jump from one side to the other), and with a pole in sight
@@ -749,6 +869,8 @@ pub(crate) mod tests {
 
     /// What `one.test` was asked for (a test of its own: tests run at once).
     static ASKED_ONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    /// `one.test/down/` fails every request while this is set: a service down for a while.
+    static ONE_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     /// Held by the tests reading `ASKED_ONE`, one at a time.
     static ONE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -757,16 +879,40 @@ pub(crate) mod tests {
     /// Fetches under `stuck.test/`, left unanswered until a test lets them go: another's fetch
     /// still under way.
     static STUCK: std::sync::Mutex<Vec<rustgis_tiles::cache::Done>> = std::sync::Mutex::new(Vec::new());
+    /// Fetches under `tiles.test/held/`, kept in [`HELD`] while `HOLD` is set (a layout page drawn
+    /// short of its frame's tiles), answered at once after.
+    static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static HELD: std::sync::Mutex<Vec<rustgis_tiles::cache::Done>> = std::sync::Mutex::new(Vec::new());
+
+    /// Per-address controlled fetches, shared by render regressions without replacing the fetcher.
+    static WAITING: std::sync::Mutex<std::collections::BTreeMap<String, std::sync::mpsc::Sender<rustgis_tiles::cache::Done>>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    pub(crate) fn hold_fetch(url: &str) -> std::sync::mpsc::Receiver<rustgis_tiles::cache::Done> {
+        serve();
+        let (tx, rx) = std::sync::mpsc::channel();
+        WAITING.lock().unwrap().insert(url.to_string(), tx);
+        rx
+    }
+
+    pub(crate) static PRIVATE_SPRITE_REQUESTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// Serves tiles and documents for `https://tiles.test/…` without a network. Under `split/`,
     /// zoom 11 is red, zoom 13 blue, and zoom 12 never arrives.
     pub(crate) fn serve() {
         rustgis_tiles::cache::set_fetcher(|url, done| {
+            if url.starts_with("http://127.0.0.1/mesh-private-only") {
+                PRIVATE_SPRITE_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let color = |r, g, b| {
                 let mut pm = tiny_skia::Pixmap::new(256, 256).unwrap();
                 pm.fill(tiny_skia::Color::from_rgba8(r, g, b, 255));
                 pm.encode_png().unwrap()
             };
+            if let Some(tx) = WAITING.lock().unwrap().remove(&url) {
+                let _ = tx.send(done);
+                return;
+            }
             if url.starts_with("https://tiles.test/red/") || url.starts_with("https://tiles.test/split/11/") {
                 done(Ok(color(220, 20, 20)));
             } else if url.starts_with("https://tiles.test/split/13/") {
@@ -775,21 +921,78 @@ pub(crate) mod tests {
                 PARKED.lock().unwrap().push(done);
             } else if url.starts_with("https://stuck.test/") {
                 STUCK.lock().unwrap().push(done);
+            } else if url.starts_with("https://tiles.test/held/") {
+                if HOLD.load(std::sync::atomic::Ordering::SeqCst) {
+                    HELD.lock().unwrap().push(done);
+                } else {
+                    done(Ok(color(220, 20, 20)));
+                }
             } else if url.starts_with("https://wms.test/") || url.starts_with("https://wmts.test/") {
                 // A service drawing in a system of its own (#769): green, and what it was asked.
                 ASKED.lock().unwrap().push(url.clone());
                 done(Ok(color(20, 200, 20)));
             } else if url.starts_with("https://one.test/") {
                 ASKED_ONE.lock().unwrap().push(url.clone());
-                // Under `tiles-only/`, a service drawing no picture larger than a tile.
-                if url.starts_with("https://one.test/tiles-only/") && !url.contains("&WIDTH=256&HEIGHT=256") {
-                    done(Err("400 Bad Request".into()));
+                // Under `tiles-only/`, a service drawing no picture larger than a tile; under
+                // `no-dpi/`, one refusing a resolution it doesn't know.
+                if (url.starts_with("https://one.test/tiles-only/") && !url.contains("&WIDTH=256&HEIGHT=256"))
+                    || (url.starts_with("https://one.test/no-dpi/") && url.contains("DPI="))
+                    || (url.starts_with("https://one.test/down/") && ONE_DOWN.load(std::sync::atomic::Ordering::Relaxed))
+                    || (url.starts_with("https://one.test/max1024/")
+                        && url.split("&WIDTH=").nth(1).and_then(|w| w.split('&').next()?.parse::<u32>().ok()).is_some_and(|w| w > 1024))
+                    || (url.starts_with("https://one.test/max2048/")
+                        && url.split("&WIDTH=").nth(1).and_then(|w| w.split('&').next()?.parse::<u32>().ok()).is_some_and(|w| w > 2048))
+                {
+                    done(Err("http status: 400".into()));
+                } else if url.starts_with("https://one.test/busy-big/")
+                    && url.split("&WIDTH=").nth(1).and_then(|w| w.split('&').next()?.parse::<u32>().ok()).is_some_and(|w| w > 1024)
+                {
+                    // A passing failure of every picture over 1024 pixels.
+                    done(Err("http status: 503".into()));
+                } else if url.starts_with("https://one.test/xml-dpi/") && url.contains("DPI=") {
+                    // A WMS exception, sent as a document, for a parameter it doesn't know.
+                    done(Ok(
+                        b"<?xml version=\"1.0\"?><ServiceExceptionReport><ServiceException>DPI</ServiceException></ServiceExceptionReport>"
+                            .to_vec(),
+                    ));
+                } else if url.starts_with("https://one.test/empty-big/")
+                    && url.split("&WIDTH=").nth(1).and_then(|w| w.split('&').next()?.parse::<u32>().ok()).is_some_and(|w| w > 1024)
+                {
+                    // An empty answer for every picture over 1024 pixels.
+                    done(Ok(Vec::new()));
+                } else if url.starts_with("https://one.test/empty2048/")
+                    && url.split("&WIDTH=").nth(1).and_then(|w| w.split('&').next()?.parse::<u32>().ok()).is_some_and(|w| w > 2048)
+                {
+                    // An empty answer for every picture over 2048 pixels.
+                    done(Ok(Vec::new()));
+                } else if url.starts_with("https://one.test/empty-all/") {
+                    // Nothing here: an empty answer to every request.
+                    done(Ok(Vec::new()));
+                } else if url.starts_with("https://one.test/empty-dpi/") && url.contains("DPI=") {
+                    // An empty answer to the picture with its resolution.
+                    done(Ok(Vec::new()));
+                } else if url.starts_with("https://one.test/busy-dpi/") && url.contains("DPI=") {
+                    // A passing failure of the picture with its resolution.
+                    done(Err("http status: 503".into()));
                 } else {
                     done(Ok(color(20, 200, 20)));
                 }
             } else if url == "https://tiles.test/style.json" {
                 let style = r##"{"version": 8, "sources": {}, "layers": [{"id": "bg", "type": "background", "paint": {"background-color": "#2050e0"}}]}"##;
                 done(Ok(style.as_bytes().to_vec()));
+            } else if url == "https://tiles.test/missing-source-style.json" {
+                let style = serde_json::json!({"version": 8,
+                "sources": {
+                    "s": {"type": "raster", "tiles": ["https://tiles.test/red/{z}/{x}/{y}.png"]},
+                    "unsupported": {"type": "geojson", "data": {"type": "FeatureCollection", "features": []}}
+                },
+                "layers": [
+                    {"id": "valid", "type": "raster", "source": "s"},
+                    {"id": "no-source", "type": "raster"},
+                    {"id": "no-definition", "type": "raster", "source": "absent"},
+                    {"id": "no-reader", "type": "raster", "source": "unsupported"}
+                ]});
+                done(Ok(serde_json::to_vec(&style).unwrap()));
             } else {
                 done(Err("404".into()));
             }
@@ -839,12 +1042,13 @@ pub(crate) mod tests {
             let mut m = Map::new("Map");
             m.graticule = false;
             m.tiles.push(TileLayer::new(name, TileKind::Raster, url));
-            let at = |m: &mut Map, res: f64| {
-                let center = m.to_map(bern).unwrap();
+            let at_ppp = |m: &mut Map, res: f64, ppp: f64, dx: f64| {
+                let c = m.to_map(bern).unwrap();
+                let center = Coord::new(c.x + dx, c.y);
                 let view = View {
                     width: 200.0,
                     height: 100.0,
-                    pixels_per_point: 1.0,
+                    pixels_per_point: ppp,
                     camera: Camera { center, res, bearing: 0.0, pitch: 0.0 },
                     sky: false,
                 };
@@ -854,6 +1058,7 @@ pub(crate) mod tests {
                 let p = pm.pixel(100, 50).unwrap();
                 ([p.red(), p.green(), p.blue(), p.alpha()], std::mem::take(&mut *ASKED.lock().unwrap()))
             };
+            let at = |m: &mut Map, res: f64| at_ppp(m, res, 1.0, 0.0);
             // On Web Mercator: in LV95, warped.
             let (p, asked) = at(&mut m, 8.0);
             assert_eq!(p, [20, 200, 20, 255], "{name} on Web Mercator");
@@ -879,6 +1084,14 @@ pub(crate) mod tests {
             } else {
                 // The 5 m matrix's.
                 assert!(!asked.is_empty() && asked.iter().all(|u| u.starts_with("https://wmts.test/lv95/m2/")), "{asked:?}");
+                // At 10 m a point on a 2x display, the 5 m matrix's too (#2390); on a 3x one no
+                // finer (the 2.5 m matrix), as sharp tiles go to twice a point's detail at most.
+                // Each somewhere new, so its tiles are asked for.
+                for (ppp, dx) in [(2.0, 20_000.0), (3.0, 40_000.0)] {
+                    let (p, asked) = at_ppp(&mut m, 10.0, ppp, dx);
+                    assert_eq!(p, [20, 200, 20, 255]);
+                    assert!(!asked.is_empty() && asked.iter().all(|u| u.starts_with("https://wmts.test/lv95/m2/")), "{ppp}: {asked:?}");
+                }
             }
         }
     }
@@ -909,6 +1122,17 @@ pub(crate) mod tests {
             ([px(5, 5), px(200, 100), px(394, 194)], std::mem::take(&mut *ASKED_ONE.lock().unwrap()))
         };
         let green = [20, 200, 20, 255];
+        // The resolution a picture says it is for (#2390): 96 a logical pixel's worth of its own
+        // pixels, which are up to a quarter of a level finer than asked for.
+        // An address with the resolution it says taken out again.
+        let without_dpi = |u: &str| -> String {
+            u.split('&').filter(|p| !p.starts_with("DPI=") && !p.starts_with("FORMAT_OPTIONS=dpi:")).collect::<Vec<_>>().join("&")
+        };
+        let dpi = |u: &str| -> Option<f64> {
+            let d: f64 = u.split("&DPI=").nth(1)?.split('&').next()?.parse().ok()?;
+            let ogc: f64 = u.split("FORMAT_OPTIONS=dpi:").nth(1)?.split('&').next()?.parse().ok()?;
+            ((d * 25.4 / 0.28 / 96.0 - ogc).abs() <= 1.0).then_some(d)
+        };
         // In Web Mercator.
         let mut m = Map::new("Map");
         m.graticule = false;
@@ -916,21 +1140,343 @@ pub(crate) mod tests {
         m.tiles.push(TileLayer::new("WMS", TileKind::Raster, url));
         let (_, tiled) = at(&mut m, 30.0, 0.0);
         assert!(tiled.len() > 1 && tiled.iter().all(|u| u.contains("&WIDTH=256&HEIGHT=256&")), "{tiled:?}");
+        // Tiles for the display's own pixels (#2390): 30 m a point is 15 a pixel at 2 a point,
+        // zoom 13 (4.9 km tiles) rather than 12.
+        let bbox_width = |u: &str| -> Option<f64> {
+            let b: Vec<f64> = u.split("BBOX=").nth(1)?.split('&').next()?.split(',').filter_map(|v| v.parse().ok()).collect();
+            Some(b.get(2)? - b.first()?)
+        };
+        let z13 = 2.0 * rustgis_tiles::template::HALF_WORLD / 8192.0;
+        assert!(tiled.iter().all(|u| bbox_width(u).is_some_and(|w| (w - z13).abs() < 1.0)), "{tiled:?}");
         m.tiles[0].single_image = true;
         let (p, asked) = at(&mut m, 30.0, 0.0);
         assert_eq!(p, [green; 3], "the whole view drawn");
-        // One picture, past the view (200 × 100 logical pixels: 512 × 256 with the margin).
+        // One picture, past the view, for the display's own pixels (200 × 100 logical pixels at
+        // 2 a point: 768 × 512 with the margin), at their resolution (#2390).
         assert_eq!(asked.len(), 1, "{asked:?}");
-        assert!(asked[0].contains("&CRS=EPSG:3857&BBOX=") && asked[0].contains("&WIDTH=512&HEIGHT=256&"), "{}", asked[0]);
+        assert!(asked[0].contains("&CRS=EPSG:3857&BBOX=") && asked[0].contains("&WIDTH=768&HEIGHT=512&"), "{}", asked[0]);
+        assert!(dpi(&asked[0]).is_some_and(|d| (192.0..229.0).contains(&d)), "{}", asked[0]);
         // A small pan: the same picture, from the cache.
         let (p, asked) = at(&mut m, 30.0, 300.0);
         assert_eq!((p, asked.len()), ([green; 3], 0));
+        // A view whose picture would pass the most a service draws (1500 points at 2 a point:
+        // 5632 pixels with the margin) is asked coarser, and says the resolution it came out at,
+        // not the screen's.
+        {
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 1500.0,
+                height: 100.0,
+                pixels_per_point: 2.0,
+                camera: Camera { center, res: 30.0, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            let said: Vec<f64> = asked.iter().filter_map(|u| dpi(u)).collect();
+            assert!(said.len() == 1 && (135.0..162.0).contains(&said[0]), "{asked:?}");
+        }
+        // At one pixel a point the picture is asked for as before: its logical size, and no
+        // resolution, though its pixel is rounded a little finer than asked.
+        {
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 200.0,
+                height: 100.0,
+                pixels_per_point: 1.0,
+                camera: Camera { center, res: 31.0, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            assert!(asked.len() == 1 && asked[0].contains("&WIDTH=512&HEIGHT=256&") && !asked[0].contains("DPI"), "{asked:?}");
+        }
+        // A service refusing a picture too large: asked again smaller, and not taken to refuse
+        // the resolution (the size was refused).
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/max2048/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 1500.0,
+                height: 100.0,
+                pixels_per_point: 2.0,
+                camera: Camera { center, res: 30.0, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            let width = |u: &String| u.split("&WIDTH=").nth(1).and_then(|w| w.split('&').next()?.parse::<u32>().ok());
+            // With its resolution, without, then at most 2048 pixels a side.
+            assert_eq!(asked.len(), 3, "{asked:?}");
+            assert!(dpi(&asked[0]).is_some() && asked[1] == without_dpi(&asked[0]), "{asked:?}");
+            assert!(width(&asked[2]).is_some_and(|w| (1..=2048).contains(&w)), "{asked:?}");
+            // Its resolution wasn't what was refused: a view whose picture fits still says it.
+            let narrow = View { width: 200.0, ..view };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &narrow).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            assert!(asked.len() == 1 && dpi(&asked[0]).is_some(), "{asked:?}");
+        }
+        // A view whose HiDPI picture is over 2048 pixels but whose standard one isn't (700 points
+        // at 2 a point): asked at most 2048 pixels a side, still sharper than a standard screen's
+        // and saying its resolution, not at a standard screen's detail.
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            // An address of its own: the layer before is kept to 2048 pixels for a while.
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/max2048/b/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 700.0,
+                height: 100.0,
+                pixels_per_point: 2.0,
+                camera: Camera { center, res: 30.0, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            let width = |u: &String| u.split("&WIDTH=").nth(1).and_then(|w| w.split('&').next()?.parse::<u32>().ok());
+            assert!(asked.len() == 3 && width(&asked[0]) > Some(2048), "{asked:?}");
+            assert!(width(&asked[2]).is_some_and(|w| w > 1280 && w <= 2048) && dpi(&asked[2]).is_some(), "{asked:?}");
+        }
+        // A service down for a while fails the picture with its resolution and without: once it
+        // is back, the next picture says its resolution again (it wasn't what was refused).
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/down/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            ONE_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+            let (_, asked) = at(&mut m, 30.0, 0.0);
+            ONE_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+            // Its picture with the resolution and without, then its tiles.
+            assert!(asked.len() > 2 && dpi(&asked[0]).is_some() && asked[1] == without_dpi(&asked[0]), "{asked:?}");
+            let (p, asked) = at(&mut m, 30.0, 50_000.0);
+            assert!(p == [green; 3] && asked.len() == 1 && dpi(&asked[0]).is_some(), "{asked:?}");
+        }
+        // A service drawing no picture over 1024 pixels a side: the sharp picture fails with its
+        // resolution and without, and the picture at a standard screen's detail draws, as on main.
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/max1024/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 400.0,
+                height: 100.0,
+                pixels_per_point: 2.0,
+                camera: Camera { center, res: 30.0, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            let png = crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
+            let p = pm.pixel(400, 100).map(|p| [p.red(), p.green(), p.blue(), p.alpha()]).unwrap();
+            assert!(p == green && asked.len() == 3, "{p:?} {asked:?}");
+            assert!(dpi(&asked[0]).is_some() && asked[1] == without_dpi(&asked[0]), "{asked:?}");
+            assert!(asked[2].contains("&WIDTH=768&") && !asked[2].contains("DPI="), "{asked:?}");
+            // And for a while: a panned view asks for the standard screen's picture at once.
+            let view = View { camera: Camera { center: Coord::new(center.x + 50_000.0, center.y), ..view.camera }, ..view };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            assert!(asked.len() == 1 && asked[0].contains("&WIDTH=768&"), "{asked:?}");
+            // A narrower view's HiDPI picture (768 pixels) is smaller than the one refused: asked
+            // sharp again, with its resolution, and drawn.
+            let view = View { width: 200.0, camera: Camera { center: Coord::new(center.x + 100_000.0, center.y), ..view.camera }, ..view };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            assert!(asked.len() == 1 && asked[0].contains("&WIDTH=768&") && dpi(&asked[0]).is_some(), "{asked:?}");
+            // A tall view's HiDPI picture (512 × 1536), narrower than the refused one (1536 × 512)
+            // though as long: asked sharp again.
+            let view = View {
+                width: 100.0,
+                height: 400.0,
+                camera: Camera { center: Coord::new(center.x + 150_000.0, center.y), ..view.camera },
+                ..view
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            assert!(asked.len() == 1 && asked[0].contains("&WIDTH=512&HEIGHT=1536&") && dpi(&asked[0]).is_some(), "{asked:?}");
+        }
+        // A passing failure (a 503) of the HiDPI picture with its resolution and without: the
+        // standard screen's picture draws for that frame, but nothing is kept, so the next view's
+        // HiDPI picture is asked again.
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/busy-big/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 400.0,
+                height: 100.0,
+                pixels_per_point: 2.0,
+                camera: Camera { center, res: 30.0, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            let png = crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
+            let p = pm.pixel(400, 100).map(|p| [p.red(), p.green(), p.blue(), p.alpha()]).unwrap();
+            assert!(p == green && asked.len() == 3, "{p:?} {asked:?}");
+            assert!(asked[1] == without_dpi(&asked[0]) && asked[2].contains("&WIDTH=768&"), "{asked:?}");
+            let view = View { camera: Camera { center: Coord::new(center.x + 50_000.0, center.y), ..view.camera }, ..view };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            assert!(asked.first().is_some_and(|u| dpi(u).is_some() && u.contains("&WIDTH=1536&")), "{asked:?}");
+        }
+        // A WMS exception sent as a document for the resolution: a refusal, so the picture without
+        // it draws and the layer is asked without it for a while.
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/xml-dpi/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let (p, asked) = at(&mut m, 30.0, 0.0);
+            assert!(p == [green; 3] && asked.len() == 2 && asked[1] == without_dpi(&asked[0]), "{asked:?}");
+            let (p, asked) = at(&mut m, 30.0, 50_000.0);
+            assert!(p == [green; 3] && asked.len() == 1 && !asked[0].contains("DPI="), "{asked:?}");
+        }
+        // Empty answers to the HiDPI picture with its resolution and without: the standard
+        // screen's picture draws.
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/empty-big/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 400.0,
+                height: 100.0,
+                pixels_per_point: 2.0,
+                camera: Camera { center, res: 30.0, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            let png = crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
+            let p = pm.pixel(400, 100).map(|p| [p.red(), p.green(), p.blue(), p.alpha()]).unwrap();
+            assert!(p == green && asked.len() == 3 && asked[2].contains("&WIDTH=768&"), "{p:?} {asked:?}");
+        }
+        // Empty answers over 2048 pixels: the picture of at most 2048 pixels is asked this frame
+        // and draws, and nothing is kept (the next view asks its full size first again).
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/empty2048/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 1500.0,
+                height: 100.0,
+                pixels_per_point: 2.0,
+                camera: Camera { center, res: 30.0, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            let width = |u: &String| u.split("&WIDTH=").nth(1).and_then(|w| w.split('&').next()?.parse::<u32>().ok());
+            ASKED_ONE.lock().unwrap().clear();
+            let png = crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
+            let p = pm.pixel(1500, 100).map(|p| [p.red(), p.green(), p.blue(), p.alpha()]).unwrap();
+            assert!(p == green && asked.len() == 3, "{p:?} {asked:?}");
+            assert!(width(&asked[2]).is_some_and(|w| (1..=2048).contains(&w)), "{asked:?}");
+            let view = View { camera: Camera { center: Coord::new(center.x + 200_000.0, center.y), ..view.camera }, ..view };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            assert!(asked.first().and_then(width).is_some_and(|w| w > 2048), "{asked:?}");
+        }
+        // An empty answer to a standard screen's picture is "nothing here", as before: one
+        // request, no tiles asked.
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/empty-all/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 200.0,
+                height: 100.0,
+                pixels_per_point: 1.0,
+                camera: Camera { center, res: 30.0, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            crate::render_png(&mut m, &view).unwrap();
+            let asked = std::mem::take(&mut *ASKED_ONE.lock().unwrap());
+            assert_eq!(asked.len(), 1, "{asked:?}");
+        }
+        // An empty answer to the picture with its resolution: asked again without it, and drawn.
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/empty-dpi/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let (p, asked) = at(&mut m, 30.0, 0.0);
+            assert!(p == [green; 3] && asked.len() == 2 && asked[1] == without_dpi(&asked[0]), "{asked:?}");
+        }
+        // A passing failure (a 503) of the picture with its resolution, the one without drawing:
+        // the resolution wasn't refused, so the next picture says it again.
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/busy-dpi/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let (p, asked) = at(&mut m, 30.0, 0.0);
+            assert!(p == [green; 3] && asked.len() == 2 && asked[1] == without_dpi(&asked[0]), "{asked:?}");
+            let (_, asked) = at(&mut m, 30.0, 50_000.0);
+            assert!(asked.first().is_some_and(|u| dpi(u).is_some()), "{asked:?}");
+        }
+        // A service refusing the resolution: asked again without it, and drawn so.
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/no-dpi/"));
+            t.single_image = true;
+            m.tiles.push(t);
+            let (p, asked) = at(&mut m, 30.0, 0.0);
+            assert_eq!(p, [green; 3], "{asked:?}");
+            assert!(asked.len() == 2 && asked[0].contains("DPI=") && !asked[1].contains("DPI="), "{asked:?}");
+            assert!(asked[1].contains("&WIDTH=768&HEIGHT=512&"), "at the same size: {asked:?}");
+            // And so for a while after: not asked with it again.
+            let (p, asked) = at(&mut m, 30.0, 5000.0);
+            assert!(p == [green; 3] && asked.iter().all(|u| !u.contains("DPI=")), "{asked:?}");
+        }
         // Closer in than its finest zoom (10: 153 m a pixel), its picture there stretched, as its
         // finest tiles are: fewer pixels for the same view.
         m.tiles[0].max_zoom = 10;
         let (p, asked) = at(&mut m, 30.0, 0.0);
         assert_eq!((p, asked.len()), ([green; 3], 1));
         assert!(asked[0].contains("&WIDTH=256&HEIGHT=256&"), "{}", asked[0]);
+        assert!(!asked[0].contains("DPI"), "a stretched picture is asked at its own resolution: {}", asked[0]);
         // Zoomed out past its coarsest zoom: nothing asked, nothing drawn.
         m.tiles[0].max_zoom = 19;
         m.tiles[0].min_zoom = 15;
@@ -952,7 +1498,7 @@ pub(crate) mod tests {
         }
         assert_eq!(p, [green; 3], "drawn in tiles");
         assert!(took < std::time::Duration::from_secs(10), "waited {took:?} for another's fetch");
-        assert!(asked.iter().any(|u| u.contains("&WIDTH=512&HEIGHT=256&")), "its picture asked first: {asked:?}");
+        assert!(asked.iter().any(|u| u.contains("&WIDTH=768&HEIGHT=512&")), "its picture asked first: {asked:?}");
         // In a system of its own, on a map in it.
         let lv95 = System { epsg: 2056, name: "EPSG:2056".into(), lat_first: false };
         let wms = Warp { epsg: 2056, grid: Grid::Map { lat_first: false }, area: Some([5.9, 45.8, 10.5, 47.8]), systems: vec![lv95] }.address(
@@ -967,7 +1513,8 @@ pub(crate) mod tests {
         let (p, asked) = at(&mut m, 5.0, 0.0);
         assert_eq!(p, [green; 3]);
         assert_eq!(asked.len(), 1, "{asked:?}");
-        assert!(asked[0].contains("&CRS=EPSG:2056&BBOX=2") && asked[0].ends_with("&WIDTH=512&HEIGHT=256"), "{}", asked[0]);
+        assert!(asked[0].contains("&CRS=EPSG:2056&BBOX=2") && asked[0].contains("&WIDTH=768&HEIGHT=512&DPI="), "{}", asked[0]);
+        assert!(dpi(&asked[0]).is_some_and(|d| (192.0..229.0).contains(&d)), "{}", asked[0]);
     }
 
     /// Turning the map round asks a single picture layer for a picture or two, not one every few
@@ -1084,6 +1631,25 @@ pub(crate) mod tests {
         let r = crate::render_complete(&mut m, &view).unwrap();
         assert!(!r.tiles_pending);
         assert_eq!(r.tile_errors.len(), 1, "{:?}", r.tile_errors);
+    }
+
+    /// Both full drawings and per-frame placement retain the counted missing-source notice.
+    #[test]
+    fn missing_source_diagnostics_reach_full_and_live_drawings() {
+        serve();
+        let mut map = Map::new("Map");
+        map.tiles.push(TileLayer::new("Broken style", TileKind::Style, "https://tiles.test/missing-source-style.json"));
+        let camera = Camera { center: lonlat_to_merc(Coord::new(10.0, 50.0)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 200.0, height: 100.0, pixels_per_point: 1.0, camera, sky: false };
+        let full = crate::render_complete(&mut map, &view).unwrap();
+        let live = super::live(&super::spec(&map.tiles[0]), 1.0, &view).unwrap();
+        let note = live.error.unwrap();
+        assert!(note.contains("3 style layer(s) skipped"), "{note}");
+        for id in ["no-source", "no-definition", "no-reader"] {
+            assert!(note.contains(id), "{note}");
+        }
+        assert_eq!(full.tile_errors, [format!("Broken style: {note}")]);
+        assert!(!live.quads.is_empty(), "the valid raster layer still draws");
     }
 
     /// A view across the antimeridian on the globe draws the tiles on both sides of it: the
@@ -1283,5 +1849,63 @@ pub(crate) mod tests {
         m.projection = Projection::Globe;
         let p = pixel(&mut m);
         assert!(p[0] < 60 && p[1] < 40 && p[2] < 60, "{p:?}");
+    }
+
+    /// A layout page drawn while a map frame's tiles are still on their way says so, for the
+    /// browser's layout view to draw it again as they land (#1534); drawn once they have, it
+    /// doesn't. The browser doesn't wait for tiles: here the wait is cancelled, which skips it too.
+    #[test]
+    fn a_layout_page_drawn_short_of_its_frames_tiles_says_so() {
+        use rustgis_map::layout::{ElementKind, FrameShape, INDICATOR_COLOR, INDICATOR_WIDTH, Layout};
+        use std::sync::atomic::Ordering;
+        struct Cancelled;
+        impl rustgis_data::progress::Probe for Cancelled {
+            fn cancelled(&self) -> bool {
+                true
+            }
+            fn begin(&self, _: u64) {}
+            fn advance(&self, _: u64) {}
+        }
+        serve();
+        let mut m = Map::new("Map");
+        m.graticule = false;
+        m.basemap = rustgis_map::Basemap::Blank;
+        m.tiles.push(TileLayer::new("Held", TileKind::Raster, "https://tiles.test/held/{z}/{x}/{y}.png"));
+        let mut page = Layout::new("page", 100.0, 80.0);
+        page.add(
+            "map",
+            (5.0, 5.0, 90.0, 70.0),
+            ElementKind::MapFrame {
+                map: "Map".into(),
+                center: Coord::new(4.6, 4.7),
+                scale: 500_000.0,
+                shape: FrameShape::Rectangle,
+                grid: None,
+                extent_of: None,
+                extent_color: INDICATOR_COLOR,
+                extent_width: INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+            },
+        );
+        let info = crate::layout::PageInfo::default();
+        let mut maps = [m];
+        HOLD.store(true, Ordering::SeqCst);
+        let short = {
+            let _wait = rustgis_data::progress::install(Some(std::sync::Arc::new(Cancelled)));
+            crate::layout::render_pending(&page, &mut maps, 72.0, &info).map(|(_, pending)| pending.frames)
+        };
+        // Answered now, and those asked for later at once: the next drawing waits for them.
+        HOLD.store(false, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        while HELD.lock().unwrap().is_empty() && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10)); // test-wait: legacy polling for the held tile request
+        }
+        for done in std::mem::take(&mut *HELD.lock().unwrap()) {
+            done(Ok(tiny_skia::Pixmap::new(256, 256).unwrap().encode_png().unwrap()));
+        }
+        assert_eq!(short, Ok(true), "drawn before its tiles landed");
+        let whole = crate::layout::render_pending(&page, &mut maps, 72.0, &info).map(|(_, pending)| pending.frames);
+        assert_eq!(whole, Ok(false), "drawn once they have");
     }
 }

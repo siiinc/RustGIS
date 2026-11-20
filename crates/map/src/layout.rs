@@ -4,10 +4,14 @@
 //! Element positions are in millimetres from the page's top-left corner. A map frame shows a map
 //! of the project at its own centre and scale, independent of the map view.
 
+use std::collections::BTreeMap;
+
 use rustgis_geom::Coord;
 use serde::{Deserialize, Serialize};
 
 use crate::raster::{Colorizer, Normalizer, RasterLayer, RasterMask, RasterRenderer, RasterStyle};
+use crate::report::StatKind;
+use crate::symbology::Dash;
 use crate::{Camera, Layer, Map, Rgba};
 
 /// Logical points per millimetre (96 points per inch).
@@ -117,6 +121,11 @@ pub struct Grid {
     /// digits (`43` for 543,000 m); off, the whole value.
     #[serde(default, skip_serializing_if = "is_false")]
     pub short: bool,
+    /// A measured grid labelled as MGRS: each 100 km square named with its grid zone designation
+    /// (`32T MT`), and the lines by their kilometres' last two digits (`05`). Its system is a WGS 84 UTM
+    /// zone: the one named, else the map's own when it is one, else the zone at the frame's centre.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mgrs: bool,
 }
 
 /// What a grid's lines are.
@@ -173,6 +182,26 @@ pub fn utm_epsg(lon: f64, lat: f64) -> u32 {
     if lat < 0.0 { 32_700 + zone } else { 32_600 + zone }
 }
 
+/// The WGS 84 UTM zone a coordinate system names by its EPSG code (`EPSG:32632`, `32632`, any
+/// case, also `epsg 32632`): its zone and whether it is the northern hemisphere's. `None` for any
+/// other system, and for a UTM zone given as WKT or a PROJ string, which MGRS labels don't read.
+pub fn utm_zone_of(crs: &str) -> Option<(u8, bool)> {
+    let t = crs.trim();
+    let digits = match t.get(..5) {
+        Some(p) if p.eq_ignore_ascii_case("EPSG:") || p.eq_ignore_ascii_case("EPSG ") => t.get(5..)?.trim(),
+        _ => t,
+    };
+    if !(digits.len() == 5 && digits.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let code: u32 = digits.parse().ok()?;
+    let zone = u8::try_from(code % 100).ok()?;
+    match code / 100 {
+        326 | 327 if (1..=60).contains(&zone) => Some((zone, code / 100 == 326)),
+        _ => None,
+    }
+}
+
 impl Default for Grid {
     fn default() -> Grid {
         Grid {
@@ -189,6 +218,7 @@ impl Default for Grid {
             kind: GridKind::Graticule,
             crs: None,
             short: false,
+            mgrs: false,
         }
     }
 }
@@ -246,11 +276,13 @@ impl Grid {
         // Off by rounding error from the stepped loop: put back on the step.
         let v = if step > 0.0 { (v / step).round() * step } else { v };
         // (Short labels of a step of 100 km or more would all read 0: whole ones.)
-        if self.short && step < 100_000.0 {
+        if (self.short || self.mgrs) && step < 100_000.0 {
             let km = (v / 1000.0).rem_euclid(100.0);
             // (99.9999… after rounding error is 0 again.)
             let km = if (km - 100.0).abs() < 1e-6 { 0.0 } else { km };
-            return decimal(km, step / 1000.0);
+            let s = decimal(km, step / 1000.0);
+            // MGRS prints its two digits always: `05`, `00`.
+            return if self.mgrs && km < 10.0 { format!("0{s}") } else { s };
         }
         let s = decimal(v.abs(), step);
         if v < 0.0 && s.chars().any(|c| c.is_ascii_digit() && c != '0') { format!("-{s}") } else { s }
@@ -461,6 +493,12 @@ fn is_left(a: &TextAlign) -> bool {
 
 /// The most layers a legend leaves out.
 pub const MAX_LEGEND_EXCLUDED: usize = 1000;
+
+/// The most layers a legend labels.
+pub const MAX_LEGEND_LABELS: usize = 1000;
+
+/// The most characters of a legend's label for a layer.
+pub const MAX_LEGEND_LABEL_CHARS: usize = 200;
 
 /// Which way a line element runs across its box.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -793,8 +831,27 @@ fn divisions() -> usize {
     4
 }
 
+/// The most columns a legend lays its rows in.
+pub const MAX_LEGEND_COLUMNS: usize = 3;
+
+fn one_column() -> usize {
+    1
+}
+
+fn is_one_column(columns: &usize) -> bool {
+    *columns == 1
+}
+
+/// The dark grey a scale bar draws in by default, and a legend, colorbar, table or chart without
+/// an ink of its own ([`ElementKind::ink`]).
+pub const INK: Rgba = Rgba::rgb(0x22, 0x22, 0x22);
+
 fn ink() -> Rgba {
-    Rgba::rgb(0x22, 0x22, 0x22)
+    INK
+}
+
+fn white() -> Rgba {
+    Rgba::rgb(0xFF, 0xFF, 0xFF)
 }
 
 fn yes() -> bool {
@@ -885,6 +942,12 @@ pub enum ElementKind {
         divisions: usize,
         #[serde(default)]
         style: ScaleBarStyle,
+        /// The lines, the alternating bar's dark divisions and the labels.
+        #[serde(default = "ink")]
+        color: Rgba,
+        /// The alternating bar's light divisions.
+        #[serde(default = "white")]
+        fill: Rgba,
     },
     Legend {
         frame: u32,
@@ -898,16 +961,34 @@ pub enum ElementKind {
         /// the features it stands for are drawn as before.
         #[serde(default)]
         hide_other: bool,
+        /// Include the grey fallback for Graduated Colors' missing numeric values. Absent in
+        /// older layouts, whose appearance is preserved; this changes only the legend.
+        #[serde(default, skip_serializing_if = "is_false")]
+        show_no_data: bool,
         /// Layers (by name, any case) the legend leaves out though the map draws them: a mask, a
         /// highlight, a basemap-like layer. Empty, it lists every layer it would otherwise.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude: Vec<String>,
+        /// The columns its rows are laid in, 1 to [`MAX_LEGEND_COLUMNS`], under its title: as even
+        /// as they can be, a layer's name staying with the row under it.
+        #[serde(default = "one_column", skip_serializing_if = "is_one_column")]
+        columns: usize,
+        /// The label it shows for a layer instead of the layer's name, by the layer's name (any
+        /// case, as the map spells it): its row, or the name over its classes (#1654). The layer
+        /// keeps its name everywhere else. A layer not in it shows its name.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        labels: BTreeMap<String, String>,
+        /// The colour of its text and lines (#2257); none, the dark grey of [`INK`]. Left out
+        /// when none, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Rgba>,
     },
     /// The colour scale of a raster layer in a frame's map: a gradient bar for a stretch, steps
     /// for classes, a block per value for unique values and colour tables (#326).
     Colorbar {
         frame: u32,
-        /// The raster layer (by name); `None` is the top visible raster of the frame's map.
+        /// The raster layer (by name); `None` is the frame map's top shown raster with a colour scale
+        /// that isn't drawn by classes ([`colorbar_layer`]).
         #[serde(default)]
         layer: Option<String>,
         /// Drawn beside the bar, e.g. the units: `Elevation (m)`.
@@ -925,6 +1006,10 @@ pub enum ElementKind {
         /// the top of a vertical one (the bottom by default).
         #[serde(default)]
         reverse: bool,
+        /// The colour of its text and lines (#2257); none, the dark grey of [`INK`]. Left out
+        /// when none, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Rgba>,
     },
     /// Text; dynamic tokens (`{page}`, `{date}`, `{scale}`…) expand when drawn.
     Text {
@@ -951,6 +1036,16 @@ pub enum ElementKind {
         /// (trimmed, bounded, none when not a name).
         #[serde(default, deserialize_with = "crate::symbology::de_font", skip_serializing_if = "Option::is_none")]
         font_name: Option<String>,
+        /// Turned about the centre of its box, in degrees clockwise as a frame's `bearing` is
+        /// (90 reads top to bottom, -90 bottom to top), -180 to 180 ([`rotation()`]); the element's
+        /// box stays the unturned one. Left out when 0, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        rotation: f64,
+        /// Broken into lines at spaces to fit the width of its (unturned) box when drawn, after
+        /// its dynamic text is filled in (#2346); off, its lines break only where the text has a
+        /// line break. Left out when off, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "is_false")]
+        wrap: bool,
     },
     Picture {
         /// Base64 PNG or JPEG.
@@ -962,15 +1057,42 @@ pub enum ElementKind {
         layer: String,
         #[serde(default = "rows")]
         rows: usize,
+        /// The colour of its text and lines (#2257); none, the dark grey of [`INK`]. Left out
+        /// when none, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Rgba>,
     },
-    /// A bar chart of a numeric field of a layer in a frame's map, one bar per feature.
+    /// A bar chart of a numeric field of a layer in a frame's map: one bar per feature, or one
+    /// per value of a `group` field ([`ElementKind::chart_data`], #2487).
     Chart {
         frame: u32,
         layer: String,
         field: String,
-        /// Bars are labelled with this field, if set.
+        /// Bars are labelled with this field, if set (not read when grouped: a bar is labelled
+        /// with its value of `group`).
         #[serde(default)]
         label: Option<String>,
+        /// The colour of its labels and title (#2257); none, the dark grey of [`INK`]. Its bars
+        /// keep their own colour. Left out when none, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<Rgba>,
+        /// One bar per value of this field, its height `statistic` of `field` over the features
+        /// with that value; none, one bar per feature. The fields below are left out at their
+        /// defaults, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+        /// What a grouped bar measures (sum by default); a bar per feature is its own value.
+        #[serde(default, skip_serializing_if = "is_default")]
+        statistic: StatKind,
+        #[serde(default, skip_serializing_if = "is_default")]
+        order: ChartOrder,
+        /// The most bars drawn, 1 to [`MAX_CHART_BARS`] (read clamped).
+        #[serde(default = "chart_bars", skip_serializing_if = "is_chart_bars")]
+        bars: usize,
+        /// The bars past `bars` gathered in a last "Other" bar (so `bars` - 1 of their own),
+        /// rather than left out.
+        #[serde(default, skip_serializing_if = "is_false")]
+        other: bool,
     },
     /// A rectangle drawn on the page (a neatline or a backdrop). `width` is the outline's, in
     /// points (0: none).
@@ -981,9 +1103,21 @@ pub enum ElementKind {
         /// Its corners rounded by this much, in millimetres (0: square corners).
         #[serde(default, skip_serializing_if = "is_zero")]
         radius: f64,
+        /// Dashed: the pattern along the outline, in points, as a line layer's stroke takes it
+        /// ([`Dash`]); `None` is solid. Left out when solid, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::symbology::de_dash")]
+        dash: Option<Dash>,
     },
     /// An ellipse filling the element's box: a circle in a square one.
-    Ellipse { fill: Rgba, outline: Rgba, width: f64 },
+    Ellipse {
+        fill: Rgba,
+        outline: Rgba,
+        width: f64,
+        /// Dashed: the pattern along the outline, in points, as a line layer's stroke takes it
+        /// ([`Dash`]); `None` is solid. Left out when solid, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::symbology::de_dash")]
+        dash: Option<Dash>,
+    },
     /// A straight line across the element's box, `width` points wide.
     Line {
         color: Rgba,
@@ -993,11 +1127,94 @@ pub enum ElementKind {
         /// Arrowheads: none makes it a plain line.
         #[serde(default)]
         head: LineHead,
+        /// Dashed: the pattern along the line, in points, as a line layer's stroke takes it
+        /// ([`Dash`]); `None` is solid. Only the shaft is dashed: arrowheads stay solid. Left out
+        /// when solid, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::symbology::de_dash")]
+        dash: Option<Dash>,
     },
 }
 
 fn rows() -> usize {
     12
+}
+
+/// The bars a chart draws unless told otherwise, and the most it takes.
+pub const CHART_BARS: usize = 20;
+pub const MAX_CHART_BARS: usize = 100;
+
+fn chart_bars() -> usize {
+    CHART_BARS
+}
+
+fn is_chart_bars(n: &usize) -> bool {
+    *n == CHART_BARS
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+/// How a chart orders its bars.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChartOrder {
+    /// The largest value first.
+    #[default]
+    Descending,
+    /// The smallest value first.
+    Ascending,
+    /// By label, A to Z (case aside).
+    Category,
+    /// As the features come in the layer (grouped, as each value first comes).
+    Layer,
+}
+
+impl ChartOrder {
+    pub const ALL: [ChartOrder; 4] = [ChartOrder::Descending, ChartOrder::Ascending, ChartOrder::Category, ChartOrder::Layer];
+    pub fn code(self) -> &'static str {
+        match self {
+            ChartOrder::Descending => "descending",
+            ChartOrder::Ascending => "ascending",
+            ChartOrder::Category => "category",
+            ChartOrder::Layer => "layer",
+        }
+    }
+    pub fn from_code(s: &str) -> Option<ChartOrder> {
+        ChartOrder::ALL.into_iter().find(|o| o.code().eq_ignore_ascii_case(s))
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            ChartOrder::Descending => "Largest first",
+            ChartOrder::Ascending => "Smallest first",
+            ChartOrder::Category => "By label",
+            ChartOrder::Layer => "Layer order",
+        }
+    }
+}
+
+/// What a bar with no value of a chart's `group` field is labelled, as a report's chart does.
+pub const CHART_BLANK: &str = "(blank)";
+/// The label of the bar gathering a chart's bars past its limit.
+pub const CHART_OTHER: &str = "Other";
+
+/// The bars a chart draws from its layer, and what it leaves out of them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChartData {
+    /// Each bar's value and label, in the order drawn.
+    pub bars: Vec<(f64, String)>,
+    /// Whether its bars have labels: when grouped, or labelled by a field.
+    pub labelled: bool,
+    /// Bars past its limit, left out (none when gathered in an "Other" bar).
+    pub left_out: usize,
+    /// Bars whose statistic is past a number's range (a sum or mean overflowing), left out; an
+    /// Other bar's counts the bars it would gather.
+    pub out_of_range: usize,
+    /// Features with no number in its field (not a number, or not finite), left out; a count
+    /// counts them.
+    pub no_number: usize,
+    /// Its title: the field, or the statistic of the field by the group.
+    pub title: String,
 }
 
 impl ElementKind {
@@ -1013,6 +1230,8 @@ impl ElementKind {
             letter_spacing: 0.0,
             font: FontFamily::Sans,
             font_name: None,
+            rotation: 0.0,
+            wrap: false,
         }
     }
 
@@ -1023,7 +1242,14 @@ impl ElementKind {
 
     /// A scale bar for `frame`, in the default style.
     pub fn scale_bar(frame: u32) -> ElementKind {
-        ElementKind::ScaleBar { frame, units: ScaleUnits::default(), divisions: divisions(), style: ScaleBarStyle::default() }
+        ElementKind::ScaleBar {
+            frame,
+            units: ScaleUnits::default(),
+            divisions: divisions(),
+            style: ScaleBarStyle::default(),
+            color: ink(),
+            fill: white(),
+        }
     }
 
     pub fn code(&self) -> &'static str {
@@ -1058,6 +1284,40 @@ impl ElementKind {
             ElementKind::Line { .. } => "Line",
         }
     }
+    /// Whether an element of this kind takes a background (#2257): all but a map frame, which
+    /// draws its map and the paper behind it itself.
+    pub fn takes_background(&self) -> bool {
+        !matches!(self, ElementKind::MapFrame { .. })
+    }
+
+    /// Whether an element of this kind takes an ink (#2257): a legend, colorbar, table or chart,
+    /// whose text and lines are otherwise dark grey. The other kinds' colours are their own options.
+    pub fn takes_ink(&self) -> bool {
+        matches!(self, ElementKind::Legend { .. } | ElementKind::Colorbar { .. } | ElementKind::Table { .. } | ElementKind::Chart { .. })
+    }
+
+    /// Its ink, when it [takes one](ElementKind::takes_ink) and has one; `None` draws in [`INK`].
+    pub fn ink(&self) -> Option<Rgba> {
+        match self {
+            ElementKind::Legend { color, .. }
+            | ElementKind::Colorbar { color, .. }
+            | ElementKind::Table { color, .. }
+            | ElementKind::Chart { color, .. } => *color,
+            _ => None,
+        }
+    }
+
+    /// Its ink to change, when it [takes one](ElementKind::takes_ink).
+    pub fn ink_mut(&mut self) -> Option<&mut Option<Rgba>> {
+        match self {
+            ElementKind::Legend { color, .. }
+            | ElementKind::Colorbar { color, .. }
+            | ElementKind::Table { color, .. }
+            | ElementKind::Chart { color, .. } => Some(color),
+            _ => None,
+        }
+    }
+
     /// The map frame this element belongs to.
     pub fn frame(&self) -> Option<u32> {
         match self {
@@ -1069,6 +1329,206 @@ impl ElementKind {
             | ElementKind::Chart { frame, .. } => Some(*frame),
             _ => None,
         }
+    }
+
+    /// Whether a chart uses what a chart had none of before (grouping, its statistic, its order,
+    /// its limit, an "Other" bar): an older reader would draw it as one bar per feature, the 20
+    /// largest, and save it again without them; a statistic kept while ungrouped is lost so too.
+    pub fn chart_uses_data_options(&self) -> bool {
+        matches!(self, ElementKind::Chart { group, statistic, order, bars, other, .. }
+            if group.is_some() || *statistic != StatKind::default() || *order != ChartOrder::default() || *bars != CHART_BARS || *other)
+    }
+
+    /// The bars a chart draws from `ds`, its layer's features (#2487); `None` for another kind, or
+    /// when its field or group field isn't in `ds`. Ungrouped, a bar per feature with a number in
+    /// its field; grouped, a bar per value of the group field ([`CHART_BLANK`] for none), its
+    /// statistic of the field over that value's features. Ordered, then cut to its limit, the
+    /// bars past it left out or gathered in a last [`CHART_OTHER`] bar, the statistic over their
+    /// features (their sum, ungrouped), whatever the order.
+    ///
+    /// It holds a value and an index per feature with a number (16 bytes) ungrouped. Grouped, it
+    /// holds a 40-byte tally and an index per value, with the value's name once: at most the
+    /// group field's own text again when every feature has a value of its own. Labels are read
+    /// only for the bars drawn, or, sorted by label, a label and its lowercase copy per bar for
+    /// the sort.
+    pub fn chart_data(&self, ds: &rustgis_data::Dataset) -> Option<ChartData> {
+        let ElementKind::Chart { field, label, group, statistic, order, bars, other, .. } = self else { return None };
+        let fi = ds.field_index(field)?;
+        let gi = match group {
+            Some(g) => Some(ds.field_index(g)?),
+            None => None,
+        };
+        let number = |row: usize| ds.value(row, fi).as_f64().filter(|v| v.is_finite());
+        let (mut no_number, mut out_of_range) = (0, 0);
+        // Grouped, a tally per value of the group field, in the order the values first come, and
+        // each one's name (none: blank, apart from a value that reads "(blank)").
+        let mut groups: Vec<Tally> = Vec::new();
+        let mut names: Vec<Option<String>> = Vec::new();
+        // Each bar's value and its group, or ungrouped its feature's row.
+        let mut drawn: Vec<(f64, usize)> = Vec::new();
+        let stat = match gi {
+            Some(gi) => {
+                // Each name is held once, in `index`; a text is looked up as it is, and only a new
+                // value's name is copied.
+                let mut index = std::collections::HashMap::<String, usize>::new();
+                let mut blank = None;
+                for row in 0..ds.features.len() {
+                    let owned;
+                    let text = match ds.value(row, gi) {
+                        rustgis_data::Value::Null => None,
+                        rustgis_data::Value::Text(t) => Some(t.as_str()),
+                        v => {
+                            owned = v.to_string();
+                            Some(owned.as_str())
+                        }
+                    }
+                    .filter(|t| !t.trim().is_empty());
+                    let at = match text {
+                        None => *blank.get_or_insert_with(|| {
+                            groups.push(Tally::default());
+                            groups.len() - 1
+                        }),
+                        Some(t) => match index.get(t) {
+                            Some(at) => *at,
+                            None => {
+                                groups.push(Tally::default());
+                                index.insert(t.to_string(), groups.len() - 1);
+                                groups.len() - 1
+                            }
+                        },
+                    };
+                    let Some(t) = groups.get_mut(at) else { continue };
+                    t.records += 1;
+                    match number(row) {
+                        Some(n) => t.add(n),
+                        None if *statistic != StatKind::Count => no_number += 1,
+                        None => {}
+                    }
+                }
+                // A value whose features have no number has no bar: they are counted in `no_number`;
+                // one whose statistic is past a number's range, in `out_of_range`.
+                names = vec![None; groups.len()];
+                for (name, i) in index {
+                    if let Some(slot) = names.get_mut(i) {
+                        *slot = Some(name);
+                    }
+                }
+                for (i, t) in groups.iter().enumerate() {
+                    match t.value(*statistic) {
+                        Some(v) => drawn.push((v, i)),
+                        None if t.numbers > 0 => out_of_range += 1,
+                        None => {}
+                    }
+                }
+                *statistic
+            }
+            None => {
+                for row in 0..ds.features.len() {
+                    match number(row) {
+                        Some(n) => drawn.push((n, row)),
+                        None => no_number += 1,
+                    }
+                }
+                StatKind::Sum
+            }
+        };
+        let li = label.as_deref().and_then(|l| ds.field_index(l));
+        let name = |i: usize| match gi {
+            Some(_) => names.get(i).and_then(|n| n.as_deref()).unwrap_or(CHART_BLANK).to_string(),
+            None => li.map(|l| ds.value(i, l).to_string()).unwrap_or_default(),
+        };
+        // Stable sorts: equal values keep the layer's order.
+        match order {
+            ChartOrder::Descending => drawn.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)),
+            ChartOrder::Ascending => drawn.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)),
+            ChartOrder::Category => drawn.sort_by_cached_key(|(_, i)| name(*i).to_lowercase()),
+            ChartOrder::Layer => {}
+        }
+        let limit = (*bars).clamp(1, MAX_CHART_BARS);
+        let mut left_out = 0;
+        let mut gathered = None;
+        if drawn.len() > limit {
+            if *other {
+                let rest = drawn.split_off(limit - 1);
+                let mut t = Tally::default();
+                for (v, i) in &rest {
+                    match gi {
+                        Some(_) => t.merge(groups.get(*i)),
+                        None => {
+                            t.records += 1;
+                            t.add(*v);
+                        }
+                    }
+                }
+                gathered = t.value(stat);
+                // A gathered statistic past a number's range has no bar: its bars are said.
+                if gathered.is_none() {
+                    out_of_range += rest.len();
+                }
+            } else {
+                left_out = drawn.len() - limit;
+                drawn.truncate(limit);
+            }
+        }
+        let mut out: Vec<(f64, String)> = drawn.into_iter().map(|(v, i)| (v, name(i))).collect();
+        out.extend(gathered.map(|v| (v, CHART_OTHER.to_string())));
+        let title = match (group, stat) {
+            (Some(g), StatKind::Count) => format!("Count by {g}"),
+            (Some(g), s) => format!("{} of {field} by {g}", s.label()),
+            (None, _) => field.clone(),
+        };
+        // An Other bar is named, so it isn't taken for one feature's.
+        let labelled = gi.is_some() || li.is_some() || gathered.is_some();
+        Some(ChartData { bars: out, labelled, left_out, out_of_range, no_number, title })
+    }
+}
+
+/// A chart bar's features as its statistic reads them: how many, and their numbers' sum, least
+/// and greatest.
+#[derive(Clone, Copy, Debug)]
+struct Tally {
+    records: usize,
+    numbers: usize,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Default for Tally {
+    fn default() -> Self {
+        Tally { records: 0, numbers: 0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY }
+    }
+}
+
+impl Tally {
+    fn add(&mut self, n: f64) {
+        self.numbers += 1;
+        self.sum += n;
+        self.min = self.min.min(n);
+        self.max = self.max.max(n);
+    }
+
+    fn merge(&mut self, other: Option<&Tally>) {
+        let Some(o) = other else { return };
+        self.records += o.records;
+        self.numbers += o.numbers;
+        self.sum += o.sum;
+        self.min = self.min.min(o.min);
+        self.max = self.max.max(o.max);
+    }
+
+    /// Its statistic, read from the tally as [`StatKind::apply`] reads it from the numbers; none
+    /// without a number (a count but one), or past a number's range.
+    fn value(&self, stat: StatKind) -> Option<f64> {
+        let v = match stat {
+            StatKind::Count => self.records as f64,
+            _ if self.numbers == 0 => return None,
+            StatKind::Sum => self.sum,
+            StatKind::Mean => self.sum / self.numbers as f64,
+            StatKind::Min => self.min,
+            StatKind::Max => self.max,
+        };
+        Some(v).filter(|v| v.is_finite())
     }
 }
 
@@ -1087,13 +1547,112 @@ pub struct Element {
     /// Locked, it can be selected but not moved, resized, deleted or edited until unlocked.
     #[serde(default, skip_serializing_if = "is_false")]
     pub locked: bool,
+    /// The box drawn behind its content (#2257); none on a map frame, and none by default, so a
+    /// layout saved before it draws as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<Background>,
     pub kind: ElementKind,
 }
 
-impl Element {
-    pub fn contains(&self, x: f64, y: f64) -> bool {
-        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+/// The box drawn behind an element's content (#2257): its fill, an outline when it has a width,
+/// rounded corners, and how far it reaches past the element's box on every side. The content is
+/// drawn as without it, in the element's box.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Background {
+    /// White unless given, as `layout.update`'s `{"background": {}}` makes it.
+    #[serde(default = "white")]
+    pub fill: Rgba,
+    #[serde(default = "ink")]
+    pub outline: Rgba,
+    /// The outline's width in points; 0 (the default) draws none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub width: f64,
+    /// The corners' radius, in millimetres.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub radius: f64,
+    /// How far it reaches past the element's box on every side, in millimetres.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub padding: f64,
+}
+
+/// The widest a background's outline may be (points), as a rectangle's.
+pub const MAX_BACKGROUND_WIDTH: f64 = 50.0;
+/// The largest corner radius a background takes (mm), as a rectangle's.
+pub const MAX_BACKGROUND_RADIUS: f64 = 50.0;
+/// The farthest a background reaches past its element's box on each side (mm).
+pub const MAX_BACKGROUND_PADDING: f64 = 50.0;
+
+impl Background {
+    /// Filled with `fill`: no outline, square corners, no padding.
+    pub fn filled(fill: Rgba) -> Background {
+        Background { fill, outline: ink(), width: 0.0, radius: 0.0, padding: 0.0 }
     }
+
+    /// Its numbers brought into range: finite, 0 or more, at most their limits.
+    pub fn clamped(self) -> Background {
+        let keep = |v: f64, max: f64| finite_or(v, 0.0).clamp(0.0, max);
+        Background {
+            width: keep(self.width, MAX_BACKGROUND_WIDTH),
+            radius: keep(self.radius, MAX_BACKGROUND_RADIUS),
+            padding: keep(self.padding, MAX_BACKGROUND_PADDING),
+            ..self
+        }
+    }
+}
+
+impl Element {
+    /// Whether the point (mm) is on the element, its box turned as it is drawn; with a background,
+    /// on the background, padding included.
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        let (x, y) = self.unturned(x, y);
+        let (bx, by, bw, bh) = self.background_box();
+        x >= bx && x <= bx + bw && y >= by && y <= by + bh
+    }
+
+    /// The box its background fills (x, y, w, h in mm, unturned): its own box grown by the
+    /// background's padding, or its own box when it has none.
+    pub fn background_box(&self) -> (f64, f64, f64, f64) {
+        let pad = self.background.map_or(0.0, |b| b.padding);
+        (self.x - pad, self.y - pad, self.w + 2.0 * pad, self.h + 2.0 * pad)
+    }
+
+    /// How far it is turned about its centre, in degrees clockwise: a text's `rotation`, else 0.
+    pub fn rotation(&self) -> f64 {
+        match self.kind {
+            ElementKind::Text { rotation, .. } => rotation,
+            _ => 0.0,
+        }
+    }
+
+    /// The point (mm) seen in the element's unturned box: turned back about its centre.
+    pub fn unturned(&self, x: f64, y: f64) -> (f64, f64) {
+        if self.rotation() == 0.0 {
+            return (x, y);
+        }
+        let (cx, cy) = (self.x + self.w / 2.0, self.y + self.h / 2.0);
+        let (sin, cos) = (-self.rotation()).to_radians().sin_cos();
+        let (dx, dy) = (x - cx, y - cy);
+        (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+    }
+
+    /// The rectangle (x, y, w, h in mm) its turned box takes up on the page: its box when it isn't
+    /// turned.
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        let (sin, cos) = self.rotation().to_radians().sin_cos();
+        let (w, h) = (self.w * cos.abs() + self.h * sin.abs(), self.w * sin.abs() + self.h * cos.abs());
+        (self.x + (self.w - w) / 2.0, self.y + (self.h - h) / 2.0, w, h)
+    }
+}
+
+/// An angle in degrees as a text's `rotation` keeps it: within -180..=180 (450 is 90, 270 is -90),
+/// 0 when it isn't a number.
+pub fn rotation(degrees: f64) -> f64 {
+    if !degrees.is_finite() {
+        return 0.0;
+    }
+    let a = degrees.rem_euclid(360.0);
+    // `rem_euclid` of a tiny negative angle can round to 360 itself.
+    if a > 180.0 { a - 360.0 } else { a }
 }
 
 /// A map series: one page per feature of an index layer, the main frame zoomed to each.
@@ -1112,6 +1671,15 @@ pub struct MapSeries {
     /// The page shown (0-based row of the index layer).
     #[serde(default)]
     pub page: usize,
+}
+
+/// A series row's name, or its one-based row number when the field is missing, null or blank.
+pub fn series_page_name(layer: &Layer, fi: Option<usize>, row: usize) -> String {
+    fi.map(|i| layer.dataset.value(row, i))
+        .filter(|v| !v.is_null())
+        .map(ToString::to_string)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| (row + 1).to_string())
 }
 
 fn margin() -> f64 {
@@ -1158,6 +1726,14 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Resolves a series' index layer from its frame and the optional page-name column.
+    pub fn series_index<'a>(&self, maps: &'a [Map]) -> Option<(&'a Layer, Option<usize>)> {
+        let series = self.series.as_ref()?;
+        let ElementKind::MapFrame { map, .. } = &self.element(series.frame)?.kind else { return None };
+        let layer = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?.layer_by_name(&series.layer)?;
+        Some((layer, layer.dataset.field_index(&series.name_field)))
+    }
+
     pub fn new(name: impl Into<String>, width: f64, height: f64) -> Self {
         Layout {
             name: name.into(),
@@ -1177,7 +1753,7 @@ impl Layout {
         self.next_id = id.saturating_add(1);
         // Templates on tiny pages can compute sizes near zero.
         let (w, h) = (finite_or(w, 1.0).clamp(MIN_ELEMENT_MM, 5000.0), finite_or(h, 1.0).clamp(MIN_ELEMENT_MM, 5000.0));
-        self.elements.push(Element { id, name: name.into(), x, y, w, h, visible: true, locked: false, kind });
+        self.elements.push(Element { id, name: name.into(), x, y, w, h, visible: true, locked: false, background: None, kind });
         id
     }
 
@@ -1244,8 +1820,11 @@ impl Layout {
     }
 
     /// Keeps the page and elements sane after loading or editing (layout files are untrusted):
-    /// sizes in range, unique element ids, and no references to missing frames.
-    pub fn clamp(&mut self) {
+    /// sizes in range, unique element ids, and no references to missing frames. Returns what it
+    /// changed, so a project reader can say so.
+    pub fn clamp(&mut self) -> LayoutRepairs {
+        let page = (self.width, self.height, self.guides.clone(), self.series.clone());
+        let count = self.elements.len();
         self.width = finite_or(self.width, 210.0).clamp(20.0, 5000.0);
         self.height = finite_or(self.height, 297.0).clamp(20.0, 5000.0);
         // The same limits `layout.guides` sets: the view walks these lists every frame.
@@ -1256,7 +1835,28 @@ impl Layout {
         self.elements.truncate(500);
         let mut seen = std::collections::HashSet::new();
         let mut next = self.elements.iter().map(|e| e.id).filter(|id| *id <= MAX_ID).max().unwrap_or(0).saturating_add(1);
+        let mut changed = Vec::with_capacity(self.elements.len());
+        let mut mgrs_off = 0usize;
         for e in &mut self.elements {
+            // A picture's image (often large) is never changed here, so it isn't copied.
+            let mut before = Element {
+                name: e.name.clone(),
+                kind: match &e.kind {
+                    ElementKind::Picture { .. } => ElementKind::Picture { image: String::new() },
+                    kind => kind.clone(),
+                },
+                ..*e
+            };
+            // A bearing past half a turn names the same direction once normalized, and a pitch
+            // too small to tilt is drawn flat: neither is a change.
+            if let ElementKind::MapFrame { bearing, pitch, .. } = &mut before.kind {
+                if bearing.is_finite() {
+                    *bearing = crate::camera::normalize_bearing(*bearing);
+                }
+                if (0.0..1e-6).contains(pitch) {
+                    *pitch = 0.0;
+                }
+            }
             // Ids stay well below u32::MAX so new elements never run out of numbers. A repeated id
             // (only a hand-edited file has one) is renumbered; references to it keep meaning the
             // first element with that id, as they did when the file was written.
@@ -1269,6 +1869,7 @@ impl Layout {
             e.h = finite_or(e.h, 20.0).clamp(MIN_ELEMENT_MM, 5000.0);
             e.x = finite_or(e.x, 0.0).clamp(-5000.0, 5000.0);
             e.y = finite_or(e.y, 0.0).clamp(-5000.0, 5000.0);
+            let mut cut = e.name.chars().nth(200).is_some();
             e.name = e.name.chars().take(200).collect();
             match &mut e.kind {
                 ElementKind::MapFrame { center, scale, shape, grid, bearing, pitch, extent_width, .. } => {
@@ -1282,8 +1883,10 @@ impl Layout {
                     center.x = center.x.clamp(-540.0, 540.0);
                     center.y = center.y.clamp(-85.0, 85.0);
                     if let FrameShape::Polygon(p) = shape {
+                        let points = p.len();
                         p.retain(|(u, v)| u.is_finite() && v.is_finite());
                         p.truncate(10_000);
+                        cut |= p.len() < points;
                         p.iter_mut().for_each(|(u, v)| (*u, *v) = (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0)));
                         if p.len() < 3 {
                             *shape = FrameShape::Rectangle;
@@ -1298,18 +1901,53 @@ impl Layout {
                             GridKind::Measured => step.clamp(MIN_MEASURED_STEP, MAX_MEASURED_STEP),
                         };
                         g.tick_length = finite_or(g.tick_length, tick_length()).clamp(0.0, MAX_TICK_MM);
+                        // MGRS labels name a WGS 84 UTM zone's squares, on a measured grid: on a
+                        // graticule, or with another system named (only a hand-edited file has
+                        // either), they are left off, and counted on their own.
+                        let named_other = g.crs.as_deref().is_some_and(|c| !c.trim().is_empty() && utm_zone_of(c).is_none());
+                        if g.mgrs && (g.kind != GridKind::Measured || named_other) {
+                            g.mgrs = false;
+                            mgrs_off = mgrs_off.saturating_add(1);
+                            // (Counted by `mgrs_off` and said in its own notice, so `before` matches:
+                            // not an adjusted element too.)
+                            if let ElementKind::MapFrame { grid: Some(b), .. } = &mut before.kind {
+                                b.mgrs = false;
+                            }
+                        }
                         g.width = finite_or(g.width, grid_width()).clamp(0.0, MAX_GRID_WIDTH);
                     }
                 }
-                ElementKind::Legend { exclude, .. } => {
+                ElementKind::Legend { exclude, columns, labels, .. } => {
                     // Names stay whole: a layer's own name isn't cut, and a cut one would no
                     // longer match it.
+                    cut |= exclude.len() > MAX_LEGEND_EXCLUDED;
                     exclude.truncate(MAX_LEGEND_EXCLUDED);
+                    *columns = (*columns).clamp(1, MAX_LEGEND_COLUMNS);
+                    // The same for the names labelled; a label is cut to its length, and a blank
+                    // one shows the name, as it would without.
+                    labels.retain(|_, label| !label.trim().is_empty());
+                    let labelled = labels.len();
+                    // One label per layer, as a command keeps: of two spellings of a name (any
+                    // case), the first in order stays and the other is cut.
+                    let mut seen = std::collections::HashSet::new();
+                    labels.retain(|name, _| seen.insert(name.to_ascii_lowercase()));
+                    while labels.len() > MAX_LEGEND_LABELS {
+                        labels.pop_last();
+                    }
+                    cut |= labels.len() < labelled;
+                    for label in labels.values_mut() {
+                        let end = label.char_indices().nth(MAX_LEGEND_LABEL_CHARS).map_or(label.len(), |(i, _)| i);
+                        cut |= end < label.len();
+                        label.truncate(end);
+                    }
                 }
-                ElementKind::Text { text, size, letter_spacing, .. } => {
+                ElementKind::Text { text, size, letter_spacing, rotation: turn, .. } => {
+                    *turn = rotation(*turn);
                     *size = finite_or(*size, 12.0).clamp(*crate::graphics::FONT_SIZE.start(), *crate::graphics::FONT_SIZE.end());
                     *letter_spacing = finite_or(*letter_spacing, 0.0).clamp(MIN_LETTER_SPACING, MAX_LETTER_SPACING);
-                    text.truncate(text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i));
+                    let end = text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i);
+                    cut |= end < text.len();
+                    text.truncate(end);
                 }
                 ElementKind::Table { rows, .. } => *rows = (*rows).clamp(1, 500),
                 ElementKind::ScaleBar { divisions, .. } => *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS),
@@ -1319,26 +1957,83 @@ impl Layout {
                 ElementKind::Line { width, .. } => *width = finite_or(*width, 1.0).clamp(0.1, 50.0),
                 _ => {}
             }
+            // A map frame draws its map and its paper itself: a background on one (a hand-edited
+            // file) is dropped.
+            e.background = e.background.filter(|_| e.kind.takes_background()).map(Background::clamped);
+            let kind_changed = !matches!(e.kind, ElementKind::Picture { .. }) && e.kind != before.kind;
+            changed.push((
+                kind_changed
+                    || e.background != before.background
+                    || (e.id, &e.name, e.x, e.y, e.w, e.h, e.visible, e.locked)
+                        != (before.id, &before.name, before.x, before.y, before.w, before.h, before.visible, before.locked),
+                cut,
+            ));
         }
         self.next_id = next;
         // References must point at map frames that exist.
         let frames: std::collections::HashSet<u32> =
             self.elements.iter().filter(|e| matches!(e.kind, ElementKind::MapFrame { .. })).map(|e| e.id).collect();
-        self.elements.retain(|e| e.kind.frame().is_none_or(|f| frames.contains(&f)));
-        for e in &mut self.elements {
+        let (mut adjusted, mut cut_count) = (0usize, 0usize);
+        let elements = std::mem::take(&mut self.elements);
+        for (mut e, (mut changed, cut)) in elements.into_iter().zip(changed) {
+            if e.kind.frame().is_some_and(|f| !frames.contains(&f)) {
+                continue;
+            }
             if let ElementKind::MapFrame { extent_of, .. } = &mut e.kind
                 && extent_of.is_some_and(|o| !frames.contains(&o) || o == e.id)
             {
                 *extent_of = None;
+                changed = true;
             }
+            adjusted = adjusted.saturating_add(usize::from(changed));
+            cut_count = cut_count.saturating_add(usize::from(cut));
+            self.elements.push(e);
         }
+        let mut series_removed = false;
         if let Some(s) = &mut self.series {
             if !frames.contains(&s.frame) {
                 self.series = None;
+                series_removed = true;
             } else {
                 s.margin = finite_or(s.margin, 0.1).clamp(0.0, 5.0);
             }
         }
+        let series_adjusted = !series_removed && self.series != page.3;
+        let page_adjusted = series_adjusted || (self.width, self.height, &self.guides) != (page.0, page.1, &page.2);
+        LayoutRepairs {
+            elements_adjusted: adjusted,
+            elements_cut: cut_count,
+            elements_removed: count.saturating_sub(self.elements.len()),
+            page_adjusted: usize::from(page_adjusted),
+            series_removed: usize::from(series_removed),
+            mgrs_off,
+        }
+    }
+}
+
+/// What [`Layout::clamp`] changed in a layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutRepairs {
+    /// Elements kept with a value brought into range, a new id, or a reference cleared.
+    pub elements_adjusted: usize,
+    /// Elements with a name, text, polygon points, legend exclusions or legend labels cut to their
+    /// limits (the same element may count as adjusted too).
+    pub elements_cut: usize,
+    /// Elements removed: beyond the 500 a layout holds, or tied to a map frame it doesn't have.
+    pub elements_removed: usize,
+    /// Whether the page size, guides or map series margin changed (0 or 1).
+    pub page_adjusted: usize,
+    /// Whether the map series was removed, its map frame missing (0 or 1).
+    pub series_removed: usize,
+    /// Map frames whose grid had MGRS labels on a graticule or over a system other than a WGS 84
+    /// UTM zone, turned off.
+    pub mgrs_off: usize,
+}
+
+impl LayoutRepairs {
+    /// Whether nothing was changed.
+    pub fn is_empty(&self) -> bool {
+        *self == LayoutRepairs::default()
     }
 }
 
@@ -1433,11 +2128,21 @@ pub const MAX_COLORBAR_VALUES: usize = 64;
 /// Colours sampled along a continuous colorbar.
 const RAMP_SAMPLES: usize = 256;
 
-/// The raster layer a colorbar shows: `layer` by name, or the top visible raster of the map.
+/// The raster layer a colorbar shows: `layer` by name, or the topmost raster the map shows (its
+/// groups visible too) with a colour scale ([`color_scale`]) that isn't drawn by classes: a legend lists those (#1679), and a colorbar
+/// of their codes would be the only key a land cover had. An RGB composite or a land cover over a
+/// DEM leaves it to the DEM. A raster on a ramp (Stretch, a tinted hillshade) whose pixels aren't
+/// read yet keeps its place: it is returned with no colour scale to show, rather than the one of
+/// a raster under it.
 pub fn colorbar_layer<'a>(map: &'a Map, layer: Option<&str>) -> Option<&'a Layer> {
     match layer {
         Some(n) => map.layer_by_name(n).filter(|l| l.is_raster()),
-        None => map.layers.iter().find(|l| l.visible && l.is_raster()),
+        None => map.layers.iter().filter(|l| map.shows(l)).find(|l| {
+            l.raster.as_ref().is_some_and(|r| match r.data {
+                None => matches!(r.style.renderer, RasterRenderer::Stretch { .. } | RasterRenderer::ShadedRelief { ramp: Some(_), .. }),
+                Some(_) => !r.style.renderer.draws_classes() && color_scale(r).is_some(),
+            })
+        }),
     }
 }
 
@@ -1453,7 +2158,15 @@ pub fn color_scale(rl: &RasterLayer) -> Option<ColorScale> {
     let band = style.renderer.bands().first().copied().unwrap_or(0);
     let stats = view_stats.and_then(|s| s.first()).or_else(|| r.bands.get(band).map(|b| &b.stats))?;
     let colorizer = Colorizer::new(&style, r, view_stats);
-    let shade = matches!(style.renderer, RasterRenderer::ShadedRelief { .. }).then_some(255);
+    // A relief's bar is the colour of its flat ground: under the balanced light (#1977), flat
+    // ground's own hillshade, which keeps the ramp's colour; under the plain light, full light.
+    let shade = match style.renderer {
+        RasterRenderer::ShadedRelief { altitude, balanced: true, .. } => {
+            Some(crate::raster::hillshade(&[0.0; 9], 1.0, 1.0, 0.0, altitude, 1.0))
+        }
+        RasterRenderer::ShadedRelief { .. } => Some(255),
+        _ => None,
+    };
     let at = |v: f64| colorizer.color(&[v as f32], shade).map(Rgba);
     match &style.renderer {
         RasterRenderer::Stretch { .. } | RasterRenderer::ShadedRelief { ramp: Some(_), .. } => {
@@ -1505,11 +2218,233 @@ pub fn color_scale(rl: &RasterLayer) -> Option<ColorScale> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symbology::MAX_DASH_STEP;
+
+    /// A chart of layer "t" with `extra` keys (its field among them).
+    fn chart(extra: serde_json::Value) -> ElementKind {
+        let mut c = serde_json::json!({"frame": 1, "layer": "t"});
+        if let (Some(c), Some(e)) = (c.as_object_mut(), extra.as_object()) {
+            c.extend(e.clone());
+        }
+        serde_json::from_value(serde_json::json!({ "Chart": c })).unwrap()
+    }
+
+    /// Places: name, region, people; a missing number for region "S", a blank region.
+    fn places() -> rustgis_data::Dataset {
+        use rustgis_data::{Dataset, Field, FieldType, Value};
+        let mut ds = Dataset::new(
+            "t",
+            rustgis_data::GeometryType::Point,
+            vec![Field::new("name", FieldType::Text), Field::new("region", FieldType::Text), Field::new("people", FieldType::Double)],
+        );
+        let text = |t: &str| Value::Text(t.into());
+        for (name, region, people) in [
+            ("a", text("N"), Value::Float(10.0)),
+            ("b", text("S"), Value::Float(4.0)),
+            ("c", text("N"), Value::Float(2.0)),
+            ("d", text("E"), Value::Float(7.0)),
+            ("e", text("S"), Value::Null),
+            ("f", Value::Null, Value::Float(1.0)),
+            ("g", text("W"), Value::Float(-3.0)),
+        ] {
+            ds.push(None, vec![text(name), region, people]);
+        }
+        ds
+    }
+
+    fn bars(d: &ChartData) -> Vec<(f64, &str)> {
+        d.bars.iter().map(|(v, n)| (*v, n.as_str())).collect()
+    }
+
+    /// Ungrouped, a bar per feature with a number, largest first, labelled by its field; the
+    /// rest are counted, not drawn.
+    #[test]
+    fn an_ungrouped_chart_draws_a_bar_per_feature() {
+        let d = chart(serde_json::json!({"field": "people", "label": "name"})).chart_data(&places()).unwrap();
+        assert_eq!(bars(&d), [(10.0, "a"), (7.0, "d"), (4.0, "b"), (2.0, "c"), (1.0, "f"), (-3.0, "g")]);
+        assert_eq!((d.labelled, d.left_out, d.no_number, d.title.as_str()), (true, 0, 1, "people"));
+        // A label field the layer hasn't leaves the bars unlabelled; a field it hasn't, no chart.
+        assert!(!chart(serde_json::json!({"field": "people", "label": "gone"})).chart_data(&places()).unwrap().labelled);
+        assert!(chart(serde_json::json!({"field": "gone"})).chart_data(&places()).is_none());
+        assert!(chart(serde_json::json!({"field": "people", "group": "gone"})).chart_data(&places()).is_none());
+    }
+
+    /// Grouped, a bar per value (blank ones together), the statistic over its features; a count
+    /// counts features with no number, the others leave them out and say how many.
+    #[test]
+    fn a_grouped_chart_draws_the_statistic_per_value() {
+        let ds = places();
+        let grouped =
+            |stat: &str| chart(serde_json::json!({"field": "people", "group": "region", "statistic": stat})).chart_data(&ds).unwrap();
+        let sum = grouped("sum");
+        assert_eq!(bars(&sum), [(12.0, "N"), (7.0, "E"), (4.0, "S"), (1.0, CHART_BLANK), (-3.0, "W")]);
+        assert_eq!((sum.labelled, sum.no_number, sum.title.as_str()), (true, 1, "Sum of people by region"));
+        let count = grouped("count");
+        assert_eq!(bars(&count), [(2.0, "N"), (2.0, "S"), (1.0, "E"), (1.0, CHART_BLANK), (1.0, "W")]);
+        assert_eq!((count.no_number, count.title.as_str()), (0, "Count by region"));
+        assert_eq!(bars(&grouped("mean")), [(7.0, "E"), (6.0, "N"), (4.0, "S"), (1.0, CHART_BLANK), (-3.0, "W")]);
+        assert_eq!(bars(&grouped("min"))[0], (7.0, "E"));
+        assert_eq!(bars(&grouped("max"))[0], (10.0, "N"));
+        // A value whose features have no number has no bar.
+        let mut only_null = places();
+        only_null.features.truncate(1);
+        let i = only_null.field_index("people").unwrap();
+        only_null.features[0].attrs[i] = rustgis_data::Value::Null;
+        let d = chart(serde_json::json!({"field": "people", "group": "region"})).chart_data(&only_null).unwrap();
+        assert_eq!((d.bars.len(), d.no_number), (0, 1));
+        // A value that reads "(blank)" is a bar of its own; a blank one joins the features with none.
+        let mut blanks = places();
+        let i = blanks.field_index("region").unwrap();
+        blanks.features[0].attrs[i] = rustgis_data::Value::Text(CHART_BLANK.into());
+        blanks.features[1].attrs[i] = rustgis_data::Value::Text("  ".into());
+        let d = chart(serde_json::json!({"field": "people", "group": "region", "statistic": "count", "order": "layer"}))
+            .chart_data(&blanks)
+            .unwrap();
+        assert_eq!(bars(&d), [(1.0, CHART_BLANK), (2.0, CHART_BLANK), (1.0, "N"), (1.0, "E"), (1.0, "S"), (1.0, "W")]);
+    }
+
+    /// The four orders; ties keep the layer's order.
+    #[test]
+    fn a_chart_orders_its_bars() {
+        let ds = places();
+        let ordered = |order: &str| {
+            let d = chart(serde_json::json!({"field": "people", "group": "region", "statistic": "count", "order": order}))
+                .chart_data(&ds)
+                .unwrap();
+            d.bars.into_iter().map(|(_, n)| n).collect::<Vec<_>>()
+        };
+        assert_eq!(ordered("descending"), ["N", "S", "E", CHART_BLANK, "W"]);
+        assert_eq!(ordered("ascending"), ["E", CHART_BLANK, "W", "N", "S"]);
+        assert_eq!(ordered("category"), [CHART_BLANK, "E", "N", "S", "W"]);
+        assert_eq!(ordered("layer"), ["N", "S", "E", CHART_BLANK, "W"]);
+    }
+
+    /// Past its limit, bars are left out and counted, or gathered in a last Other bar measured
+    /// over their features, whatever the order; a limit of 1 gathers them all.
+    #[test]
+    fn a_chart_past_its_limit_leaves_bars_out_or_gathers_them() {
+        let ds = places();
+        let cut = |extra: serde_json::Value| {
+            let mut keys = serde_json::json!({"field": "people", "group": "region"});
+            if let (Some(k), Some(e)) = (keys.as_object_mut(), extra.as_object()) {
+                k.extend(e.clone());
+            }
+            chart(keys).chart_data(&ds).unwrap()
+        };
+        let left = cut(serde_json::json!({"bars": 2}));
+        assert_eq!((bars(&left), left.left_out), (vec![(12.0, "N"), (7.0, "E")], 3));
+        let other = cut(serde_json::json!({"bars": 3, "other": true}));
+        assert_eq!((bars(&other), other.left_out), (vec![(12.0, "N"), (7.0, "E"), (2.0, CHART_OTHER)], 0));
+        // Ascending, Other still comes last; its mean is over the features of the bars it gathers.
+        let mean = cut(serde_json::json!({"bars": 2, "other": true, "order": "ascending", "statistic": "mean"}));
+        assert_eq!(bars(&mean), [(-3.0, "W"), (4.8, CHART_OTHER)]);
+        let all = cut(serde_json::json!({"bars": 1, "other": true, "statistic": "count"}));
+        assert_eq!(bars(&all), [(7.0, CHART_OTHER)]);
+        // Fewer bars than the limit: no Other bar.
+        assert_eq!(cut(serde_json::json!({"bars": 9, "other": true})).bars.len(), 5);
+        // Ungrouped, Other sums the features past the limit; a limit out of range is read clamped.
+        // Unlabelled, the bars are labelled then, so the Other bar is named.
+        let ungrouped = chart(serde_json::json!({"field": "people", "bars": 3, "other": true})).chart_data(&ds).unwrap();
+        assert_eq!((bars(&ungrouped), ungrouped.labelled), (vec![(10.0, ""), (7.0, ""), (4.0, CHART_OTHER)], true));
+        assert!(!chart(serde_json::json!({"field": "people", "bars": 3})).chart_data(&ds).unwrap().labelled);
+        assert_eq!(cut(serde_json::json!({"bars": 0})).bars.len(), 1);
+        let mut many = rustgis_data::Dataset::new(
+            "t",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("people", rustgis_data::FieldType::Double)],
+        );
+        for i in 0..150 {
+            many.push(None, vec![rustgis_data::Value::Float(i as f64)]);
+        }
+        let d = chart(serde_json::json!({"field": "people", "bars": 5000})).chart_data(&many).unwrap();
+        assert_eq!((d.bars.len(), d.left_out), (MAX_CHART_BARS, 50));
+        // An Other bar past a number's range isn't drawn: the bars it would gather are left out.
+        let mut huge = places();
+        let i = huge.field_index("people").unwrap();
+        for f in &mut huge.features {
+            f.attrs[i] = rustgis_data::Value::Float(f64::MAX);
+        }
+        let d = chart(serde_json::json!({"field": "people", "bars": 2, "other": true})).chart_data(&huge).unwrap();
+        assert_eq!((d.bars.len(), d.left_out, d.out_of_range), (1, 0, 6));
+        // So is a grouped bar's: N sums two of them; a count of the same features is drawn.
+        let grouped =
+            |stat: &str| chart(serde_json::json!({"field": "people", "group": "region", "statistic": stat})).chart_data(&huge).unwrap();
+        let sum = grouped("sum");
+        assert_eq!((sum.bars.len(), sum.out_of_range), (3, 2));
+        assert!(sum.bars.iter().all(|(v, n)| v.is_finite() && n != "N" && n != "S"));
+        assert_eq!((grouped("count").bars.len(), grouped("count").out_of_range), (5, 0));
+    }
+
+    /// The options are left out at their defaults, so a chart saved before keeps its bytes, and
+    /// read back as written otherwise.
+    #[test]
+    fn a_charts_options_are_saved_only_when_set() {
+        let plain = chart(serde_json::json!({"field": "people"}));
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"Chart": {"frame": 1, "layer": "t", "field": "people", "label": null}})
+        );
+        assert!(!plain.chart_uses_data_options());
+        let set = chart(
+            serde_json::json!({"field": "people", "group": "region", "statistic": "mean", "order": "category", "bars": 5, "other": true}),
+        );
+        let back: ElementKind = serde_json::from_value(serde_json::to_value(&set).unwrap()).unwrap();
+        assert_eq!(back, set);
+        assert!(set.chart_uses_data_options());
+        for one in [
+            serde_json::json!({"group": "region"}),
+            // Kept while ungrouped, which an older reader would save without.
+            serde_json::json!({"statistic": "count"}),
+            serde_json::json!({"order": "layer"}),
+            serde_json::json!({"bars": 21}),
+            serde_json::json!({"other": true}),
+        ] {
+            let mut keys = one.clone();
+            keys["field"] = serde_json::json!("people");
+            assert!(chart(keys).chart_uses_data_options(), "{one}");
+        }
+    }
+
+    /// Under the balanced light (#1977) flat ground is drawn in the ramp's own colour, so a relief's
+    /// colour bar is that colour, whatever the sun's height; under the plain light, the ramp.
+    #[test]
+    fn a_balanced_reliefs_colour_bar_is_its_flat_ground() {
+        use crate::Ramp;
+        use crate::raster::{Colorizer, RasterLayer, hillshade};
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r =
+            Raster::new("dem", 10, 10, vec![(0..100).map(|v| v as f32).collect()], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32")
+                .unwrap();
+        for (altitude, balanced) in [(45.0, true), (20.0, true), (45.0, false)] {
+            let mut rl = RasterLayer::from_path(r.clone(), "dem.tif");
+            rl.style.renderer = RasterRenderer::ShadedRelief {
+                band: 0,
+                ramp: Some(Ramp::Terrain),
+                azimuth: 315.0,
+                altitude,
+                z_factor: 1.0,
+                shadow: 0.0,
+                sky: 0.0,
+                fill: 0.0,
+                rock: None,
+                ambient: None,
+                balanced,
+            };
+            let Some(ColorScale::Ramp { lo, hi, colors }) = color_scale(&rl) else { panic!("a ramp") };
+            let colorizer = Colorizer::new(&rl.style, &r, None);
+            let flat = if balanced { hillshade(&[0.0; 9], 1.0, 1.0, 315.0, altitude, 1.0) } else { 255 };
+            for (i, c) in colors.iter().enumerate() {
+                let v = lo + (hi - lo) * i as f64 / (colors.len() - 1) as f64;
+                assert_eq!(Some(c.0), colorizer.color(&[v as f32], Some(flat)), "{altitude}° balanced {balanced}: sample {i}");
+            }
+        }
+    }
 
     #[test]
     fn elements_are_arranged_in_the_drawing_order() {
         let mut l = Layout::new("L", 100.0, 100.0);
-        let rect = || ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 };
+        let rect = || ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0, dash: None };
         let ids: Vec<u32> = (0..4).map(|i| l.add(format!("E{i}"), (10.0, 10.0, 50.0, 50.0), rect())).collect();
         let order = |l: &Layout| l.elements.iter().map(|e| e.id).collect::<Vec<_>>();
         // All four overlap: the one drawn last is the one a click picks.
@@ -1595,7 +2530,21 @@ mod tests {
             {"id":9,"name":"c","x":0,"y":0,"w":10,"h":10,"kind":{"Legend":{"frame":42,"title":"L"}}}],
             "series":{"frame":77,"layer":"x"}}"#;
         let mut l: Layout = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}"));
-        l.clamp();
+        let repairs = l.clamp();
+        assert_eq!(
+            repairs,
+            LayoutRepairs { elements_adjusted: 2, elements_cut: 0, elements_removed: 1, page_adjusted: 1, series_removed: 1, mgrs_off: 0 },
+            "what changed is counted"
+        );
+        assert!(l.clamp().is_empty(), "a repaired layout needs nothing more");
+        if let ElementKind::MapFrame { bearing, .. } = &mut l.elements[0].kind {
+            *bearing = 270.0;
+        }
+        assert!(l.clamp().is_empty(), "a bearing of 270 is -90 by another name, not a repair");
+        if let ElementKind::MapFrame { pitch, .. } = &mut l.elements[0].kind {
+            *pitch = 1e-7;
+        }
+        assert!(l.clamp().is_empty(), "a pitch too small to tilt is flat, not a repair");
         let ids: Vec<u32> = l.elements.iter().map(|e| e.id).collect();
         assert_eq!(ids.len(), 2, "the legend of a missing frame goes");
         assert_ne!(ids[0], ids[1], "duplicate ids are renumbered");
@@ -1619,7 +2568,7 @@ mod tests {
         let a = big.add(
             "a",
             (0.0, 0.0, 1.0, 1.0),
-            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0, radius: 0.0 },
+            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 1.0, radius: 0.0, dash: None },
         );
         assert!(a != big.elements[0].id && a <= MAX_ID + 1);
     }
@@ -1627,7 +2576,7 @@ mod tests {
     #[test]
     fn hairline_rectangles_keep_their_height() {
         let mut l = Layout::new("Layout", 210.0, 297.0);
-        let rule = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 };
+        let rule = ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0, dash: None };
         let id = l.add("Rule", (14.0, 33.0, 182.0, 0.15), rule.clone());
         assert_eq!(l.element(id).map(|e| e.h), Some(0.15));
         // A zero height becomes the thinnest element, not a 1 mm box.
@@ -1747,6 +2696,69 @@ mod tests {
         assert_eq!(GridKind::from_name("utm"), None);
     }
 
+    /// MGRS labels: the kilometres' last two digits on the lines, saved only when on; a WGS 84 UTM
+    /// zone is read from its EPSG code alone; a file with them on a graticule or naming another
+    /// system has them left off, counted on their own.
+    #[test]
+    fn mgrs_labels_need_a_wgs84_utm_zone() {
+        let g = Grid { kind: GridKind::Measured, mgrs: true, ..Grid::default() };
+        assert_eq!(g.measured_label(543_000.0, 1000.0), "43");
+        assert_eq!(g.measured_label(5_262_500.0, 500.0), "62.5");
+        assert_eq!(g.measured_label(500_000.0, 1000.0), "00", "two digits, as MGRS prints them");
+        assert_eq!(g.measured_label(505_500.0, 500.0), "05.5");
+        assert_eq!(Grid { mgrs: false, short: true, ..g.clone() }.measured_label(505_000.0, 1000.0), "5");
+        assert_eq!(g.measured_label(500_000.0, 100_000.0), "500000");
+        assert!(serde_json::to_value(Grid::default()).unwrap().get("mgrs").is_none());
+        let v = serde_json::to_value(&g).unwrap();
+        assert_eq!(v["mgrs"].as_bool(), Some(true));
+        assert_eq!(serde_json::from_value::<Grid>(v).unwrap(), g);
+        for (crs, zone) in [
+            ("EPSG:32632", Some((32, true))),
+            (" epsg:32760 ", Some((60, false))),
+            ("32601", Some((1, true))),
+            ("EPSG: 32733", Some((33, false))),
+            ("epsg 32632", Some((32, true))),
+            (" EPSG 32733 ", Some((33, false))),
+            ("EPSG:32600", None),
+            ("EPSG:32661", None),
+            ("EPSG:32761", None),
+            ("EPSG:25832", None),
+            ("EPSG:2056", None),
+            ("EPSG:326320", None),
+            ("+proj=utm +zone=32 +datum=WGS84", None),
+            ("", None),
+        ] {
+            assert_eq!(utm_zone_of(crs), zone, "{crs}");
+        }
+        let frame = |crs: Option<&str>, kind: GridKind| {
+            let mut l = Layout::new("Layout", 297.0, 210.0);
+            l.add(
+                "Map Frame",
+                (10.0, 10.0, 200.0, 150.0),
+                ElementKind::MapFrame {
+                    map: "Map".into(),
+                    center: Coord::new(8.7, 47.5),
+                    scale: 25_000.0,
+                    shape: FrameShape::Rectangle,
+                    grid: Some(Grid { crs: crs.map(Into::into), kind, ..g.clone() }),
+                    extent_of: None,
+                    extent_color: INDICATOR_COLOR,
+                    extent_width: INDICATOR_WIDTH,
+                    bearing: 0.0,
+                    pitch: 0.0,
+                },
+            );
+            let r = l.clamp();
+            let ElementKind::MapFrame { grid: Some(g), .. } = &l.elements[0].kind else { panic!() };
+            (g.mgrs, r.mgrs_off, r.elements_adjusted)
+        };
+        assert_eq!(frame(None, GridKind::Measured), (true, 0, 0));
+        assert_eq!(frame(Some("EPSG:32632"), GridKind::Measured), (true, 0, 0));
+        assert_eq!(frame(Some(" "), GridKind::Measured), (true, 0, 0));
+        assert_eq!(frame(Some("EPSG:2056"), GridKind::Measured), (false, 1, 0), "said on its own, not as a value out of range");
+        assert_eq!(frame(None, GridKind::Graticule), (false, 1, 0));
+    }
+
     #[test]
     fn grid_labels_follow_the_format() {
         let g = Grid::default();
@@ -1798,10 +2810,112 @@ mod tests {
         let bar: ElementKind = serde_json::from_str(r#"{"ScaleBar":{"frame":3}}"#).unwrap();
         assert_eq!(bar, ElementKind::scale_bar(3));
         assert!(matches!(bar, ElementKind::ScaleBar { units: ScaleUnits::Auto, divisions: 4, style: ScaleBarStyle::Alternating, .. }));
+        assert!(matches!(bar, ElementKind::ScaleBar { color, fill, .. } if color == ink() && fill == white()));
         let grid: Grid = serde_json::from_str(r#"{"step":10,"color":[64,72,85,150],"labels":true}"#).unwrap();
         assert_eq!(grid, Grid { step: 10.0, ..Grid::default() });
         assert_eq!(grid.edges, GridEdges { top: false, bottom: true, left: true, right: false });
         assert_eq!(grid.style, GridStyle::Lines);
+    }
+
+    /// Lines and the outlines of rectangles and ellipses keep a dash pattern through a save
+    /// (#1763); solid, nothing is written, so a layout saved before is written back byte for
+    /// byte; a pattern read from a file is brought into range as a line layer's is.
+    #[test]
+    fn dashes_round_trip_and_old_layouts_keep_their_bytes() {
+        let black = Rgba::rgb(0, 0, 0);
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let line = l.add(
+            "Line",
+            (10.0, 10.0, 60.0, 6.0),
+            ElementKind::Line { color: black, width: 1.0, dir: LineDir::Horizontal, head: LineHead::End, dash: None },
+        );
+        let rect = l.add(
+            "Box",
+            (10.0, 30.0, 60.0, 30.0),
+            ElementKind::Rectangle { fill: black, outline: black, width: 1.0, radius: 0.0, dash: None },
+        );
+        let oval = l.add("Oval", (10.0, 70.0, 30.0, 20.0), ElementKind::Ellipse { fill: black, outline: black, width: 1.0, dash: None });
+        let old = serde_json::to_string(&l).unwrap();
+        assert!(!old.contains("dash"), "solid writes no pattern");
+        assert_eq!(serde_json::to_string(&serde_json::from_str::<Layout>(&old).unwrap()).unwrap(), old, "written back byte for byte");
+        let dash_of = |l: &Layout, id: u32| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Line { dash, .. } | ElementKind::Rectangle { dash, .. } | ElementKind::Ellipse { dash, .. }) => {
+                dash.map(|d| d.steps().to_vec())
+            }
+            _ => panic!("a line or a shape"),
+        };
+        let pattern = Dash::new(&[4.0, 2.0, 1.0, 2.0]);
+        for id in [line, rect, oval] {
+            if let Some(ElementKind::Line { dash, .. } | ElementKind::Rectangle { dash, .. } | ElementKind::Ellipse { dash, .. }) =
+                l.element_mut(id).map(|e| &mut e.kind)
+            {
+                *dash = pattern;
+            }
+        }
+        let saved = serde_json::to_string(&l).unwrap();
+        assert!(saved.contains(r#""dash":[4.0,2.0,1.0,2.0]"#), "{saved}");
+        let back: Layout = serde_json::from_str(&saved).unwrap();
+        for id in [line, rect, oval] {
+            assert_eq!(dash_of(&back, id), Some(vec![4.0, 2.0, 1.0, 2.0]));
+        }
+        // From a file, as a line layer's pattern: steps clamped, all-zero read as solid.
+        let file = saved.replacen("[4.0,2.0,1.0,2.0]", "[4,1e9,-2]", 1).replacen("[4.0,2.0,1.0,2.0]", "[0,0]", 1);
+        let read: Layout = serde_json::from_str(&file).unwrap();
+        assert_eq!(dash_of(&read, line), Some(vec![4.0, MAX_DASH_STEP, 0.0]));
+        assert_eq!(dash_of(&read, rect), None);
+        assert_eq!(dash_of(&read, oval), Some(vec![4.0, 2.0, 1.0, 2.0]));
+    }
+
+    /// A text turned 90° or -90° (#1763) keeps its turn through a save; one saved before reads
+    /// upright and is written back byte for byte; a turn read from a file is kept within -180 to
+    /// 180.
+    #[test]
+    fn text_rotation_round_trips_and_old_layouts_keep_their_bytes() {
+        let turn_of = |l: &Layout, id: u32| l.element(id).map(Element::rotation);
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let upright = l.add("Title", (10.0, 10.0, 60.0, 10.0), ElementKind::text("Brasil", 12.0, Rgba::rgb(0, 0, 0), false));
+        let old = serde_json::to_string(&l).unwrap();
+        assert!(!old.contains("rotation"), "an upright text writes no turn");
+        let back: Layout = serde_json::from_str(&old).unwrap();
+        assert_eq!(turn_of(&back, upright), Some(0.0));
+        assert_eq!(serde_json::to_string(&back).unwrap(), old, "written back byte for byte");
+        for turn in [90.0, -90.0] {
+            let mut l = l.clone();
+            if let Some(ElementKind::Text { rotation, .. }) = l.element_mut(upright).map(|e| &mut e.kind) {
+                *rotation = turn;
+            }
+            let back: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+            assert_eq!(turn_of(&back, upright), Some(turn));
+        }
+        // Read from a file, a turn is kept within -180..=180.
+        let file = old.replace(r#""bold":false"#, r#""bold":false,"rotation":450"#);
+        let mut read: Layout = serde_json::from_str(&file).unwrap();
+        read.clamp();
+        assert_eq!(turn_of(&read, upright), Some(90.0));
+        assert_eq!(
+            [rotation(270.0), rotation(-270.0), rotation(180.0), rotation(-180.0), rotation(f64::NAN)],
+            [-90.0, 90.0, 180.0, 180.0, 0.0]
+        );
+    }
+
+    /// A turned text is hit, and takes up the page, where it is drawn: its box turned about its
+    /// centre (#1763).
+    #[test]
+    fn a_turned_text_is_hit_on_its_turned_box() {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let id = l.add("Source", (20.0, 45.0, 60.0, 10.0), ElementKind::text("Fonte: IBGE", 8.0, Rgba::rgb(0, 0, 0), false));
+        // Upright: 60 wide, 10 high, centred on (50, 50).
+        assert_eq!((l.hit(25.0, 50.0), l.hit(50.0, 25.0)), (Some(id), None));
+        if let Some(ElementKind::Text { rotation, .. }) = l.element_mut(id).map(|e| &mut e.kind) {
+            *rotation = 90.0;
+        }
+        // Turned: 10 wide, 60 high, about the same centre.
+        assert_eq!((l.hit(25.0, 50.0), l.hit(50.0, 25.0)), (None, Some(id)));
+        let (x, y, w, h) = l.element(id).unwrap().bounds();
+        assert!((x - 45.0).abs() < 1e-9 && (y - 20.0).abs() < 1e-9 && (w - 10.0).abs() < 1e-9 && (h - 60.0).abs() < 1e-9);
+        // The element keeps its unturned box.
+        let e = l.element(id).unwrap();
+        assert_eq!((e.x, e.y, e.w, e.h), (20.0, 45.0, 60.0, 10.0));
     }
 
     #[test]
@@ -1830,5 +2944,77 @@ mod tests {
             (1000.0, MAX_MEASURED_STEP, MIN_MEASURED_STEP)
         );
         assert_eq!(step("measured", 0.0), 0.0, "Auto");
+    }
+
+    /// A background (#2257) is left out of a saved element that has none, so older layouts read and
+    /// write as before; read back, it keeps its fill, outline, corners and padding, and a hand-edited
+    /// one is brought into range, a map frame's dropped.
+    #[test]
+    fn element_backgrounds_are_saved_read_back_and_repaired() {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let t = l.add("T", (40.0, 40.0, 20.0, 10.0), ElementKind::text("t", 12.0, Rgba::rgb(0, 0, 0), false));
+        let saved = serde_json::to_value(&l).unwrap();
+        assert!(saved["elements"][0].get("background").is_none(), "none, not written: {saved}");
+        let b = Background { fill: Rgba::new(255, 255, 255, 204), outline: Rgba::rgb(0, 0, 0), width: 0.5, radius: 1.0, padding: 1.5 };
+        l.element_mut(t).unwrap().background = Some(b);
+        let back: Layout = serde_json::from_value(serde_json::to_value(&l).unwrap()).unwrap();
+        assert_eq!(back.element(t).unwrap().background, Some(b));
+        // Only a fill given: no outline, square corners, no padding.
+        let fill: Background = serde_json::from_str(r#"{"fill":[1,2,3,255]}"#).unwrap();
+        assert_eq!(fill, Background::filled(Rgba::rgb(1, 2, 3)));
+        // An empty one is white, as `layout.update` makes `{"background": {}}`, not a file that fails to open.
+        let empty: Background = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, Background::filled(Rgba::rgb(255, 255, 255)));
+
+        let text = r#"{"name":"x","width":100,"height":100,"elements":[
+            {"id":1,"name":"f","x":0,"y":0,"w":50,"h":50,"background":{"fill":[255,0,0,255]},"kind":{"MapFrame":{"map":"M","center":{"x":0,"y":0},"scale":1000000}}},
+            {"id":2,"name":"t","x":0,"y":0,"w":10,"h":10,"background":{"fill":[255,0,0,255],"width":1e9,"radius":-3,"padding":1e300},"kind":{"Text":{"text":"t","size":12,"color":[0,0,0,255]}}},
+            {"id":3,"name":"u","x":0,"y":0,"w":10,"h":10,"background":{"fill":[255,0,0,255],"padding":2},"kind":{"Text":{"text":"u","size":12,"color":[0,0,0,255]}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}"));
+        let repairs = l.clamp();
+        assert_eq!(repairs.elements_adjusted, 2, "the frame's background and the text's numbers: {repairs:?}");
+        assert_eq!(l.element(1).unwrap().background, None, "a map frame has none");
+        let b = l.element(2).unwrap().background.unwrap();
+        assert_eq!((b.width, b.radius, b.padding), (MAX_BACKGROUND_WIDTH, 0.0, MAX_BACKGROUND_PADDING));
+        assert_eq!(l.element(3).unwrap().background.unwrap().padding, 2.0, "in range, kept");
+        assert!(l.clamp().is_empty(), "a repaired layout needs nothing more");
+    }
+
+    /// A click on an element's background picks it, padding included; without one, its box only.
+    #[test]
+    fn a_background_is_part_of_what_a_click_picks() {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let t = l.add("T", (40.0, 40.0, 20.0, 10.0), ElementKind::text("t", 12.0, Rgba::rgb(0, 0, 0), false));
+        assert_eq!(l.hit(38.0, 45.0), None);
+        l.element_mut(t).unwrap().background = Some(Background { padding: 3.0, ..Background::filled(Rgba::rgb(255, 255, 255)) });
+        assert_eq!(l.hit(38.0, 45.0), Some(t));
+        assert_eq!(l.hit(36.0, 45.0), None, "past the padding");
+        assert_eq!(l.element(t).unwrap().background_box(), (37.0, 37.0, 26.0, 16.0));
+    }
+
+    /// A legend's, colorbar's, table's or chart's ink (#2257): none in a layout saved before it,
+    /// not written when none, and read back when set. Other kinds have none to set.
+    #[test]
+    fn inks_are_saved_and_read_back() {
+        let text = r#"{"name":"x","width":100,"height":100,"elements":[
+            {"id":1,"name":"f","x":0,"y":0,"w":50,"h":50,"kind":{"MapFrame":{"map":"M","center":{"x":0,"y":0},"scale":1000000}}},
+            {"id":2,"name":"l","x":0,"y":0,"w":10,"h":10,"kind":{"Legend":{"frame":1,"title":"L"}}},
+            {"id":3,"name":"c","x":0,"y":0,"w":10,"h":10,"kind":{"Colorbar":{"frame":1}}},
+            {"id":4,"name":"t","x":0,"y":0,"w":10,"h":10,"kind":{"Table":{"frame":1,"layer":"A"}}},
+            {"id":5,"name":"g","x":0,"y":0,"w":10,"h":10,"kind":{"Chart":{"frame":1,"layer":"A","field":"n"}}}]}"#;
+        let mut l: Layout = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}"));
+        assert!(l.elements[1..].iter().all(|e| e.kind.takes_ink() && e.kind.ink().is_none()), "the default ink in an older layout");
+        assert!(!l.elements[0].kind.takes_ink(), "a map frame has no ink");
+        let saved = serde_json::to_string(&l).unwrap();
+        assert!(!saved.contains("\"color\""), "none is not written: {saved}");
+        let white = Rgba::new(255, 255, 255, 230);
+        for e in &mut l.elements[1..] {
+            *e.kind.ink_mut().unwrap() = Some(white);
+        }
+        let back: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert!(back.elements[1..].iter().all(|e| e.kind.ink() == Some(white)), "{back:?}");
+        assert_eq!(back, l);
+        let mut text = ElementKind::text("t", 12.0, Rgba::rgb(0, 0, 0), false);
+        assert!(!text.takes_ink() && text.ink_mut().is_none(), "a text's colour is its own option");
     }
 }

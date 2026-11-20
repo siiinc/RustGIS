@@ -11,6 +11,13 @@ use crate::{RustGisApp, icons};
 pub const CONTENT_H: f32 = 72.0;
 pub const LABEL_H: f32 = 18.0;
 
+/// The least width of a ribbon button's menu.
+pub const MENU_MIN_W: f32 = 200.0;
+
+/// The least width of a submenu, so one of short rows (a page size's styles) doesn't open as a
+/// strip; narrower than a menu, whose rows have room for an icon and a shortcut (#2398).
+pub const SUBMENU_MIN_W: f32 = 100.0;
+
 /// A number its caller lends saved each frame and saves only once it is settled, kept across a
 /// drag (#597, #607). egui's `DragValue` keeps the value dragged so far in its own memory and
 /// forgets it when the pointer is released, a frame on which `dragged()` is false: lent the saved
@@ -36,6 +43,10 @@ impl<T: Copy + Default + PartialEq + Send + Sync + 'static> Dragged<T> {
     /// Whether the number is settled: let go after a drag (`value` is then the dragged one), typed
     /// in, or set by assistive technology. The caller still compares it with the saved one.
     pub(crate) fn settled(self, ui: &Ui, r: &Response, value: &mut T) -> bool {
+        if escaped(r) {
+            *value = self.saved;
+            return false;
+        }
         if r.dragged() {
             ui.data_mut(|d| d.insert_temp(self.key, (self.saved, *value)));
             return false;
@@ -51,16 +62,167 @@ impl<T: Copy + Default + PartialEq + Send + Sync + 'static> Dragged<T> {
 
 /// Makes the command the caller runs next, for a change of `r`, part of the undo step of the
 /// pointer press making it: a number dragged, or a colour picked in its picker, is one step to
-/// undo however many changes it makes (#1194). A change from the keyboard is a step of its own.
+/// undo however many changes it makes (#1194). A number typed into `r` is a step of its own, even
+/// while a button is held elsewhere; a key pressed during a drag elsewhere doesn't split the drag.
 /// Called just before the command runs, so the merge can't reach another command.
 pub(crate) fn one_step_per_press(app: &mut RustGisApp, r: &Response) {
-    if let Some(t) = r.ctx.input(|i| i.pointer.press_start_time()) {
+    let typed = r.has_focus() || r.lost_focus();
+    let press = r.ctx.input(|i| i.pointer.press_start_time()).filter(|_| !typed);
+    if let Some(t) = press {
         app.session.merge_undo(format!("press {:?} {t}", r.id));
     }
 }
 
+/// Makes a field being typed into let go of its focus, and so set what was typed, when the pointer
+/// is pressed on a panel outside it, not when it is let go: the Layers pane is drawn before the
+/// panes, so a click there would pick another layer before the field set a number typed for the
+/// one it was typed for (#1194). A press on a popup, a menu or a list over the map (the search
+/// box's) is left to egui, which lets go on the release, after the list took the click. Called
+/// each frame before the panes are drawn.
+pub(crate) fn let_go_on_panel_press(ctx: &egui::Context) {
+    let Some(at) = ctx.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten()) else { return };
+    let Some(id) = ctx.memory(|m| m.focused()) else { return };
+    // A field that keeps its focus on a press elsewhere (`fieldmenu`) keeps it.
+    let kept = ctx.options(|o| o.input_options.surrender_focus_on == egui::SurrenderFocusOn::Never);
+    let on_field = ctx.read_response(id).is_some_and(|r| r.rect.contains(at));
+    let on_panel = ctx.layer_id_at(at).is_some_and(|l| l.order == egui::Order::Background);
+    if ctx.text_edit_focused() && !kept && !on_field && on_panel {
+        ctx.memory_mut(|m| m.surrender_focus(id));
+    }
+}
+
+/// What [`note_escape`] keeps: the widget that had the focus, and the field Escape took it from
+/// with the pass it did.
+type EscapeNote = (Option<egui::Id>, Option<(egui::Id, u64)>);
+
+/// Where [`note_escape`] keeps its [`EscapeNote`].
+fn escape_key() -> egui::Id {
+    egui::Id::unique("escaped_field")
+}
+
+/// Notes the field Escape takes the focus from, for [`escaped`]. Called each frame before the
+/// panes are drawn.
+pub(crate) fn note_escape(ctx: &egui::Context) {
+    let now = ctx.memory(|m| m.focused());
+    let pass = ctx.cumulative_pass_nr();
+    let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    ctx.data_mut(|d| {
+        let (before, escaped) = d.get_temp::<EscapeNote>(escape_key()).unwrap_or_default();
+        let escaped = match before {
+            Some(id) if escape && now != Some(id) => Some((id, pass)),
+            // The field taken back: what it sets from here on is not what Escape dropped.
+            _ => escaped.filter(|(id, _)| now != Some(*id)),
+        };
+        d.insert_temp(escape_key(), (now, escaped));
+    });
+}
+
+/// The widget that had the focus when the pass began, as [`note_escape`] noted it: egui may have
+/// taken the focus from a field drawn earlier in the pass, which sets its number only in the next.
+pub(crate) fn focused_at_pass_start(ctx: &egui::Context) -> Option<egui::Id> {
+    ctx.data(|d| d.get_temp::<EscapeNote>(escape_key())).and_then(|(now, _)| now)
+}
+
+/// Whether a change of `r` is egui setting the text typed into it before Escape. egui sets it on a
+/// lost focus unless it sees the Escape: a shortcut drawn before the field can take the key on the
+/// Escape's own frame, and egui 0.37 tells a field it lost the focus for two frames, the second
+/// without the Escape. The caller drops the change, so Escape brings back the value from before
+/// (#1194).
+pub(crate) fn escaped(r: &Response) -> bool {
+    let escaped = r.ctx.data(|d| d.get_temp::<EscapeNote>(escape_key())).and_then(|(_, e)| e);
+    // The Escape's pass or one of the two after it.
+    escaped.is_some_and(|(id, pass)| id == r.id && (pass..=pass + 2).contains(&r.ctx.cumulative_pass_nr()))
+}
+
+/// Whether `r` changed to a value to keep: not one Escape dropped ([`escaped`]).
+pub(crate) fn changed(r: &Response) -> bool {
+    r.changed() && !escaped(r)
+}
+
 pub fn text_w(ui: &Ui, s: &str, font: egui::FontId) -> f32 {
     ui.ctx().fonts_mut(|f| f.layout_no_wrap(s.to_string(), font, egui::Color32::WHITE).size().x)
+}
+
+/// One tab in [`tabs`]: its label and hover text as interface keys ([`tl!`](crate::tl) translates
+/// them), its icon's name (empty for none), and the value choosing it sets.
+pub(crate) struct Tab<T> {
+    pub(crate) label: &'static str,
+    pub(crate) icon: &'static str,
+    pub(crate) hover: Option<&'static str>,
+    pub(crate) value: T,
+}
+
+/// A row of tabs drawn as the ribbon's: the chosen one open onto the pane below with its accent
+/// bar, a base line and a hover fill; as the pane narrows, each tab drops its icon, then its name
+/// (the icon alone, its hover text — or its name — on hover). `current` becomes the chosen tab's
+/// value; returns whether it changed.
+pub(crate) fn tabs<T: Copy + PartialEq>(ui: &mut Ui, t: &Tokens, id: egui::Id, current: &mut T, tabs: &[Tab<T>]) -> bool {
+    let font = |on: bool| if on { semibold(12.5) } else { regular(12.5) };
+    let (pad, icon, gap, h) = (8.0, 16.0, 5.0, 30.0);
+    // Measured in the chosen tab's font, so the tabs don't move as another is chosen.
+    let text: Vec<f32> = tabs.iter().map(|tab| text_w(ui, tl!(tab.label), semibold(12.5))).collect();
+    let room = ui.available_width() - 2.0 * (tabs.len() as f32 - 1.0);
+    // A tab's room besides its name, with or without its icon.
+    let extra = |icons: bool| 2.0 * pad + if icons { icon + gap } else { 0.0 };
+    let fits = |icons: bool| text.iter().map(|w| w + extra(icons)).sum::<f32>() <= room;
+    let (icons, names) = if fits(true) {
+        (true, true)
+    } else if fits(false) {
+        (false, true)
+    } else {
+        (true, false)
+    };
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    let base = row.max.y - 0.5;
+    ui.painter().hline(row.x_range(), base, Stroke::new(1.0, t.border));
+    let mut x = row.min.x;
+    let mut changed = false;
+    for (tab, w) in tabs.iter().zip(text) {
+        let shown = tl!(tab.label);
+        let on = tab.value == *current;
+        let w = if names { extra(icons) + w } else { 36.0 };
+        let r = Rect::from_min_size(pos2(x, row.min.y), vec2(w, h));
+        x = r.max.x + 2.0;
+        let mut resp = ui.interact(r, id.with(tab.label), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, shown));
+        let p = ui.painter();
+        let body = Rect::from_min_max(pos2(r.min.x, r.min.y + 3.0), r.max);
+        let round = CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+        if on {
+            p.rect_filled(body, round, t.pane);
+            p.rect_stroke(body, round, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+            // Open onto the pane: the line under the tabs stops at the chosen one.
+            p.rect_filled(Rect::from_min_max(pos2(r.min.x + 1.0, base - 1.0), pos2(r.max.x - 1.0, row.max.y + 1.0)), 0.0, t.pane);
+            p.rect_filled(
+                Rect::from_min_max(pos2(r.min.x + 8.0, r.max.y - 3.0), pos2(r.max.x - 8.0, r.max.y - 1.0)),
+                CornerRadius::same(1),
+                t.accent,
+            );
+        } else if resp.hovered() {
+            p.rect_filled(body.shrink2(vec2(1.0, 2.0)), CornerRadius::same(5), t.hover);
+        }
+        let cy = body.center().y - 1.0;
+        if !names {
+            icons::paint(p, Rect::from_center_size(pos2(r.center().x, cy), vec2(icon, icon)), tab.icon, t.icon, t.accent);
+            resp = resp.on_hover_text(tab.hover.map_or(shown, |h| tl!(h)));
+        } else {
+            let mut tx = r.min.x + pad;
+            if icons {
+                icons::paint(p, Rect::from_min_size(pos2(tx, cy - icon / 2.0), vec2(icon, icon)), tab.icon, t.icon, t.accent);
+                tx += icon + gap;
+            }
+            let ink = if on { t.text } else { t.text_dim };
+            p.text(pos2(tx, cy), Align2::LEFT_CENTER, shown, font(on), ink);
+            if let Some(hover) = tab.hover {
+                resp = resp.on_hover_text(tl!(hover));
+            }
+        }
+        if resp.clicked() && *current != tab.value {
+            *current = tab.value;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The shortcut of a command run without parameters (`⌘S` on a Mac, as egui reads the keys,
@@ -71,6 +233,9 @@ pub fn shortcut_text(ctx: &egui::Context, app: &RustGisApp, id: &str) -> String 
 
 /// Whether a command exists and is enabled now.
 pub fn enabled(app: &RustGisApp, id: &str) -> bool {
+    if matches!(id, "ui.reloadData" | "layer.reloadData") {
+        return why_disabled(app, id).is_none();
+    }
     match app.session.registry.get(id) {
         Some(s) => (s.enabled)(&app.session).is_none(),
         None => id.starts_with("ui.") || rustgis_engine::plugins::command(id).is_some(),
@@ -78,14 +243,29 @@ pub fn enabled(app: &RustGisApp, id: &str) -> bool {
 }
 
 pub fn why_disabled(app: &RustGisApp, id: &str) -> Option<&'static str> {
+    if matches!(id, "ui.reloadData" | "layer.reloadData") {
+        #[cfg(not(target_arch = "wasm32"))]
+        return app
+            .session
+            .active_layer
+            .and_then(|layer| app.session.map().layer(layer))
+            .is_none_or(|layer| !crate::reloaddata::supported(layer))
+            .then_some(tl_raw!("Select a layer linked to a local file or folder, or an editable GeoPackage layer."));
+        #[cfg(target_arch = "wasm32")]
+        return Some(tl_raw!("Reload Data from local files requires the desktop app."));
+    }
     app.session.registry.get(id).and_then(|s| (s.enabled)(&app.session))
 }
 
 /// A rich tooltip: title (with the shortcut of `id` with `params`), description and why it's
 /// disabled.
 pub fn tooltip(app: &RustGisApp, resp: Response, title: &str, desc: &str, id: &str, params: &Value) -> Response {
+    tooltip_for(app, resp, title, desc, id, params, why_disabled(app, id))
+}
+
+/// [`tooltip`], saying `why` the command is unavailable (as [`small_for`] judged it).
+fn tooltip_for(app: &RustGisApp, resp: Response, title: &str, desc: &str, id: &str, params: &Value, why: Option<&str>) -> Response {
     let sc = crate::keymap::shortcut_text(&resp.ctx, app, id, params);
-    let why = why_disabled(app, id);
     let contents = |ui: &mut Ui| {
         ui.set_max_width(280.0);
         // Callers pass text that is already translated.
@@ -102,18 +282,23 @@ pub fn tooltip(app: &RustGisApp, resp: Response, title: &str, desc: &str, id: &s
 }
 
 fn bg(ui: &Ui, r: Rect, resp: &Response, checked: bool, t: &Tokens) {
-    let fill = if resp.is_pointer_button_down_on() {
-        t.pressed
-    } else if checked {
-        t.checked
-    } else if resp.hovered() {
-        t.hover
-    } else {
-        return;
-    };
+    let Some(fill) = bg_fill(resp, checked, t) else { return };
     ui.painter().rect_filled(r, CornerRadius::same(6), fill);
     if checked {
         ui.painter().rect_stroke(r, CornerRadius::same(6), Stroke::new(1.0, t.accent.gamma_multiply(0.55)), egui::StrokeKind::Inside);
+    }
+}
+
+/// The fill a ribbon button paints behind its icon in `resp`'s state, if any (none at rest).
+pub fn bg_fill(resp: &Response, checked: bool, t: &Tokens) -> Option<egui::Color32> {
+    if resp.is_pointer_button_down_on() {
+        Some(t.pressed)
+    } else if checked {
+        Some(t.checked)
+    } else if resp.hovered() {
+        Some(t.hover)
+    } else {
+        None
     }
 }
 
@@ -154,9 +339,8 @@ pub fn big(
 /// The shared icon and label layout of large ribbon controls. A split button gives this only
 /// its primary region, keeping even a long translated label clear of the adjacent arrow.
 fn paint_big(ui: &Ui, r: Rect, icon: &str, label: &str, on: bool, menu: bool, t: &Tokens) {
-    let ic = Rect::from_center_size(pos2(r.center().x, r.min.y + 21.0), vec2(32.0, 32.0));
     let (c, a) = if on { (t.icon, t.accent) } else { (t.text_disabled, t.text_disabled) };
-    icons::paint(ui.painter(), ic, icon, c, a);
+    icons::paint(ui.painter(), big_icon_rect(r), icon, c, a);
     let mut lines = label.split('\n').peekable();
     let mut y = r.min.y + 42.0;
     while let Some(l) = lines.next() {
@@ -198,6 +382,45 @@ pub fn big_split_menu(
     menu_enabled: bool,
     menu: impl FnOnce(&mut Ui, &mut RustGisApp),
 ) -> (Response, Response) {
+    let close = egui::PopupCloseBehavior::CloseOnClick;
+    big_split_menu_with(ui, app, icon, label, desc, id, params, checked, menu_label, menu_desc, menu_enabled, close, menu)
+}
+
+/// A [`big_split_menu`] whose menu holds editable controls (a text box): clicks inside keep it
+/// open, as in [`big_form_menu`]; its action buttons close it themselves (`ui.close()`).
+pub fn big_split_form_menu(
+    ui: &mut Ui,
+    app: &mut RustGisApp,
+    icon: &str,
+    label: &str,
+    desc: &str,
+    id: &str,
+    params: Value,
+    checked: bool,
+    menu_label: &str,
+    menu_desc: &str,
+    menu_enabled: bool,
+    menu: impl FnOnce(&mut Ui, &mut RustGisApp),
+) -> (Response, Response) {
+    let close = egui::PopupCloseBehavior::CloseOnClickOutside;
+    big_split_menu_with(ui, app, icon, label, desc, id, params, checked, menu_label, menu_desc, menu_enabled, close, menu)
+}
+
+fn big_split_menu_with(
+    ui: &mut Ui,
+    app: &mut RustGisApp,
+    icon: &str,
+    label: &str,
+    desc: &str,
+    id: &str,
+    params: Value,
+    checked: bool,
+    menu_label: &str,
+    menu_desc: &str,
+    menu_enabled: bool,
+    close: egui::PopupCloseBehavior,
+    menu: impl FnOnce(&mut Ui, &mut RustGisApp),
+) -> (Response, Response) {
     let (label, desc, menu_label, menu_desc) = (tl!(label), tl!(desc), tl!(menu_label), tl!(menu_desc));
     let t = Tokens::get(ui.ctx());
     let w = (label.split('\n').map(|l| text_w(ui, l, regular(11.5))).fold(0.0, f32::max) + 14.0).max(50.0);
@@ -237,23 +460,58 @@ pub fn big_split_menu(
     if primary.clicked() {
         let _ = app.run_by_user(id, params);
     }
-    egui::Popup::menu(&arrow).show(|ui| {
-        ui.set_min_width(200.0);
+    egui::Popup::menu(&arrow).close_behavior(close).show(|ui| {
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
     (primary, arrow)
 }
 
+pub(crate) const SMALL_ICON_BUTTON_WIDTH: f32 = 26.0;
+
 /// A small button: 18 px icon with an optional label.
 pub fn small(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, id: &str, params: Value, checked: bool) -> Response {
+    let on = enabled(app, id);
+    let why = if on { None } else { why_disabled(app, id) };
+    small_button(ui, app, icon, label, desc, id, params, checked, on, why)
+}
+
+/// [`small`] for a command whose parameters name what it acts on (a standalone table), unavailable
+/// for the reason `why`, as [`rustgis_engine::Session::why_blocked`] judged it with them.
+pub fn small_for(
+    ui: &mut Ui,
+    app: &mut RustGisApp,
+    icon: &str,
+    label: &str,
+    desc: &str,
+    id: &str,
+    params: Value,
+    why: Option<&'static str>,
+) -> Response {
+    small_button(ui, app, icon, label, desc, id, params, false, why.is_none(), why)
+}
+
+/// The small button [`small`] and [`small_for`] draw: `on` says whether it runs `id` when
+/// clicked, `why` why it doesn't, in its tooltip.
+fn small_button(
+    ui: &mut Ui,
+    app: &mut RustGisApp,
+    icon: &str,
+    label: &str,
+    desc: &str,
+    id: &str,
+    params: Value,
+    checked: bool,
+    on: bool,
+    why: Option<&str>,
+) -> Response {
     let (label, desc) = (tl!(label), tl!(desc));
     let t = Tokens::get(ui.ctx());
     let tw = if label.is_empty() { 0.0 } else { text_w(ui, label, regular(11.5)) + 8.0 };
-    let (r, resp) = ui.allocate_exact_size(vec2(26.0 + tw, 22.0), Sense::click());
-    let on = enabled(app, id);
+    let (r, resp) = ui.allocate_exact_size(vec2(SMALL_ICON_BUTTON_WIDTH + tw, 22.0), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, on, if label.is_empty() { desc } else { label }));
     bg(ui, r, &resp, checked, &t);
-    let ic = Rect::from_center_size(pos2(r.min.x + 13.0, r.center().y), vec2(18.0, 18.0));
+    let ic = small_icon_rect(r);
     let (c, a) = if on { (t.icon, t.accent) } else { (t.text_disabled, t.text_disabled) };
     icons::paint(ui.painter(), ic, icon, c, a);
     if !label.is_empty() {
@@ -266,7 +524,7 @@ pub fn small(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &
         );
     }
     let title = if label.is_empty() { desc } else { label };
-    let resp = tooltip(app, resp, title, if label.is_empty() { "" } else { desc }, id, &params);
+    let resp = tooltip_for(app, resp, title, if label.is_empty() { "" } else { desc }, id, &params, why);
     crate::showme::ring(ui, app, r, id, &params);
     if resp.clicked() && on {
         let _ = app.run_by_user(id, params);
@@ -278,7 +536,7 @@ pub fn small(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &
 pub fn big_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, menu: impl FnOnce(&mut Ui, &mut RustGisApp)) {
     let resp = big(ui, app, icon, label, desc, "ui.menu", Value::Null, false, true);
     egui::Popup::menu(&resp).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -288,7 +546,7 @@ pub fn big_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc
 pub fn big_form_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, menu: impl FnOnce(&mut Ui, &mut RustGisApp)) {
     let resp = big(ui, app, icon, label, desc, "ui.menu", Value::Null, false, true);
     egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -331,7 +589,7 @@ fn small_menu_with(
     caret(ui.painter(), pos2(r.max.x - 9.0, r.center().y), t.text);
     let resp = tooltip(app, resp, label, desc, "ui.menu", &Value::Null);
     egui::Popup::menu(&resp).close_behavior(close).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -341,12 +599,23 @@ fn small_menu_with(
 pub fn row_button(ui: &mut Ui, on: bool, button: egui::Button<'_>, expand: f32) -> Response {
     let under = ui.painter().add(egui::Shape::Noop);
     let resp = ui.add_enabled(on, button);
-    if on && (resp.hovered() || resp.is_pointer_button_down_on()) {
-        let t = Tokens::get(ui.ctx());
-        let fill = if resp.is_pointer_button_down_on() { t.pressed } else { t.hover };
+    if let Some(fill) = row_fill(on, &resp, &Tokens::get(ui.ctx())) {
         ui.painter().set(under, egui::Shape::rect_filled(resp.rect.expand2(vec2(expand, 0.0)), CornerRadius::same(5), fill));
     }
     resp
+}
+
+/// The highlight a menu row paints under itself in `resp`'s state, if any (none at rest or disabled).
+pub fn row_fill(on: bool, resp: &Response, t: &Tokens) -> Option<egui::Color32> {
+    if !on {
+        None
+    } else if resp.is_pointer_button_down_on() {
+        Some(t.pressed)
+    } else if resp.hovered() {
+        Some(t.hover)
+    } else {
+        None
+    }
 }
 
 /// Room for a menu row's icon before its label.
@@ -354,12 +623,34 @@ const MENU_ICON_W: f32 = 22.0;
 
 /// A menu row that runs a command (disabled when the command is).
 pub fn menu_item(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, id: &str, params: Value) {
+    menu_item_response(ui, app, icon, label, id, params);
+}
+
+/// [`menu_item`], returning the row's response.
+pub fn menu_item_response(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, id: &str, params: Value) -> Response {
     let on = enabled(app, id);
     let shortcut = crate::keymap::shortcut_text(ui.ctx(), app, id, &params);
-    if menu_row(ui, icon, tl!(label), &shortcut, on).clicked() {
+    let resp = menu_row(ui, icon, tl!(label), &shortcut, on);
+    if resp.clicked() {
         let _ = app.run_by_user(id, params);
         ui.close();
     }
+    resp
+}
+
+/// Where a menu row draws its icon.
+pub fn menu_icon_rect(ui: &Ui, resp: &Response) -> Rect {
+    Rect::from_center_size(resp.rect.left_center() + vec2(ui.spacing().button_padding.x + MENU_ICON_W / 2.0 - 2.0, 0.0), vec2(16.0, 16.0))
+}
+
+/// Where a large button draws its icon.
+pub fn big_icon_rect(r: Rect) -> Rect {
+    Rect::from_center_size(pos2(r.center().x, r.min.y + 21.0), vec2(32.0, 32.0))
+}
+
+/// Where a small button draws its icon.
+pub fn small_icon_rect(r: Rect) -> Rect {
+    Rect::from_center_size(pos2(r.min.x + 13.0, r.center().y), vec2(18.0, 18.0))
 }
 
 /// A menu row with an icon (empty for none) before an already translated label, and a shortcut
@@ -375,13 +666,35 @@ pub fn menu_row(ui: &mut Ui, icon: &str, label: &str, shortcut: &str, on: bool) 
     resp
 }
 
-/// A menu row with an icon that opens a submenu of `add`'s rows.
+/// A menu row with an icon and a highlight when it represents the current choice.
+pub(crate) fn selectable_menu_row(ui: &mut Ui, icon: &str, label: &str, selected: bool) -> Response {
+    let button = egui::Button::selectable(selected, menu_text(ui, icon, label)).min_size(vec2(ui.available_width(), 0.0));
+    let response = ui.add(button);
+    menu_icon(ui, &response, icon);
+    response
+}
+
+/// A menu row with an icon that opens a submenu of `add`'s rows, at least [`SUBMENU_MIN_W`]
+/// wide: in a menu of [`menu_item`] rows, as tall as they are.
 pub fn submenu_row(ui: &mut Ui, icon: &str, label: &str, add: impl FnOnce(&mut Ui)) {
     let button = egui::Button::new(menu_text(ui, icon, label))
         .min_size(vec2(0.0, 24.0))
         .right_text(egui::containers::menu::SubMenuButton::arrow_atom(None));
-    let (resp, _) = egui::containers::menu::SubMenuButton::from_button(button).ui(ui, add);
+    let (resp, _) = egui::containers::menu::SubMenuButton::from_button(button).ui(ui, |ui| {
+        ui.set_min_width(SUBMENU_MIN_W);
+        add(ui);
+    });
     menu_icon(ui, &resp, icon);
+}
+
+/// A row that opens a submenu of `add`'s rows, at least [`SUBMENU_MIN_W`] wide: in a menu of
+/// plain buttons, as tall as they are (a menu of [`menu_item`] rows uses [`submenu_row`]).
+pub fn submenu(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) -> Response {
+    ui.menu_button(label, |ui| {
+        ui.set_min_width(SUBMENU_MIN_W);
+        add(ui);
+    })
+    .response
 }
 
 /// A menu row's label: with an icon, it starts after it, so the icon is drawn inside the row (and the menu).
@@ -401,16 +714,7 @@ fn menu_icon(ui: &Ui, resp: &Response, icon: &str) {
         return;
     }
     let t = Tokens::get(ui.ctx());
-    icons::paint(
-        ui.painter(),
-        Rect::from_center_size(
-            resp.rect.left_center() + vec2(ui.spacing().button_padding.x + MENU_ICON_W / 2.0 - 2.0, 0.0),
-            vec2(16.0, 16.0),
-        ),
-        icon,
-        t.icon,
-        t.accent,
-    );
+    icons::paint(ui.painter(), menu_icon_rect(ui, resp), icon, t.icon, t.accent);
 }
 
 /// A ribbon group: controls laid out left to right over a centred label, with a separator.
@@ -595,8 +899,76 @@ pub fn color_button(ui: &mut Ui, color: &mut egui::Color32) -> Response {
     egui::color_picker::color_edit_button_srgba(ui, color, egui::color_picker::Alpha::OnlyBlend)
 }
 
+/// A colour button for a symbol's fill, which may be transparent: its hue survives an opacity of
+/// 0, where `Color32` (and [`color_button`]) loses it. The colour picked, if one was.
+pub fn rgba_button(ui: &mut Ui, color: rustgis_engine::map::Rgba) -> (Response, Option<rustgis_engine::map::Rgba>) {
+    // The picker's own state while it shows this colour, as egui keeps it for its buttons: the hue
+    // stays where it was on black or grey, which have none of their own.
+    let id = ui.next_auto_id().with("rgba_button");
+    let kept = ui.data(|d| d.get_temp::<([u8; 4], egui::ecolor::Hsva)>(id)).filter(|(c, _)| *c == color.0);
+    let mut hsva = kept.map_or_else(
+        || {
+            // Construct hue independently of alpha: Color32 discards hidden RGB at zero.
+            let mut hsva = egui::ecolor::Hsva::from_srgb([color.r(), color.g(), color.b()]);
+            hsva.a = f32::from(color.a()) / 255.0;
+            hsva
+        },
+        |(_, hsva)| hsva,
+    );
+    let before = hsva;
+    // egui creates the popup from the context, not this Ui's scoped style.
+    // Borrow linear numeric editing only while a transparent picker is open. The units chosen
+    // when an edit begins hold until it ends (the pointer let go, no number being typed), so they
+    // don't change in the middle of a drag or of typing that moves the opacity to or from 0.
+    // This button's own popup, as egui names it, not any popup.
+    let open = egui::Popup::is_id_open(ui.ctx(), ui.auto_id_with("popup"));
+    let linear_id = id.with("linear");
+    // An edit is a press held down, or typing into one number: the same one, as focus can pass
+    // straight to another; the button itself keeping focus isn't one.
+    let button = ui.next_auto_id();
+    let typing = ui.ctx().memory(|m| m.focused()).filter(|f| *f != button);
+    let pressed = ui.input(|i| i.pointer.any_down());
+    let held = ui
+        .data(|d| d.get_temp::<(Option<egui::Id>, bool)>(linear_id))
+        .filter(|(was, _)| pressed || (typing.is_some() && *was == typing))
+        .map(|(_, linear)| linear);
+    let linear = open && held.unwrap_or(color.a() == 0);
+    if open {
+        ui.data_mut(|d| d.insert_temp(linear_id, (typing, linear)));
+    } else {
+        ui.data_mut(|d| d.remove::<(Option<egui::Id>, bool)>(linear_id));
+    }
+    let styles = linear.then(|| [egui::Theme::Light, egui::Theme::Dark].map(|theme| (theme, ui.ctx().style_of(theme))));
+    if styles.is_some() {
+        ui.ctx().global_style_mut(|style| style.visuals.numeric_color_space = egui::style::NumericColorSpace::Linear);
+    }
+    let response = egui::color_picker::color_edit_button_hsva(ui, &mut hsva, egui::color_picker::Alpha::OnlyBlend);
+    if let Some(styles) = styles {
+        // The popup's numeric-mode button can change both themes; restore both
+        // immediately so no other picker or later frame inherits the override.
+        for (theme, style) in styles {
+            ui.ctx().set_style_of(theme, style);
+        }
+    }
+    let shown = picked_colour(hsva, before, color);
+    // egui's round trip through its own colour model can report a change that isn't one, every
+    // frame the popup is open: only a colour that differs is picked.
+    let picked = (response.changed() && shown != color).then_some(shown);
+    // Kept for the colour the caller holds next frame: the one picked, else this one.
+    ui.data_mut(|d| d.insert_temp(id, (picked.unwrap_or(color).0, hsva)));
+    (response, picked)
+}
+
+/// The colour a picker left at `hsva` for `old`, which it showed as `before`: the picker's colour
+/// when its red, green or blue changed, else `old`'s own channels at the picker's opacity, as an
+/// opacity-only edit leaves channels the picker may not hold exactly (at opacity 0, its own
+/// colour model can't). Both may change in one frame (two accessibility requests).
+pub fn picked_colour(hsva: egui::ecolor::Hsva, before: egui::ecolor::Hsva, old: rustgis_engine::map::Rgba) -> rustgis_engine::map::Rgba {
+    let rgb = rustgis_engine::map::Rgba(hsva.to_srgba_unmultiplied());
+    if hsva.to_srgb() != before.to_srgb() { rgb } else { old.with_alpha(rgb.a()) }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use egui_kittest::kittest::Queryable;
 
@@ -618,6 +990,49 @@ mod tests {
         assert!(!offers_additive(|ui, c| {
             super::color_button(ui, c);
         }));
+        assert!(!offers_additive(|ui, c| {
+            let [r, g, b, a] = c.to_srgba_unmultiplied();
+            super::rgba_button(ui, rustgis_engine::map::Rgba([r, g, b, a]));
+        }));
+    }
+
+    /// A field being typed into lets go of its focus on a press on the panel outside it, but keeps
+    /// it through a press on a list over it until the release, as the search box's list needs to
+    /// take the click (#1194).
+    #[test]
+    fn a_press_on_a_panel_lets_go_of_a_field_and_one_on_a_list_waits_for_the_release() {
+        use egui::accesskit::Role;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(600.0, 400.0)).build_ui_state(
+            |ui, text: &mut String| {
+                super::let_go_on_panel_press(ui.ctx());
+                let label = ui.label("Name");
+                ui.add(egui::TextEdit::singleline(text)).labelled_by(label.id);
+                let _ = ui.button("Panel");
+                egui::Area::new(egui::Id::unique("list")).order(egui::Order::Foreground).fixed_pos(egui::pos2(300.0, 200.0)).show(
+                    ui.ctx(),
+                    |ui| {
+                        let _ = ui.button("Listed");
+                    },
+                );
+            },
+            String::new(),
+        );
+        h.run();
+        let focused = |h: &egui_kittest::Harness<'_, String>| h.query_all_by_role(Role::TextInput).any(|n| n.is_focused());
+        for (button, kept) in [("Listed", true), ("Panel", false)] {
+            h.get_by_role(Role::TextInput).focus();
+            h.run();
+            assert!(focused(&h));
+            let at = h.get_by_label(button).rect().center();
+            h.hover_at(at);
+            h.drag_at(at);
+            h.step();
+            h.step();
+            assert_eq!(focused(&h), kept, "{button}: pressed");
+            h.drop_at(at);
+            h.run();
+            assert!(!focused(&h), "{button}: let go");
+        }
     }
 
     /// A number dragged and let go keeps the dragged value (#607), a decimal and a whole one

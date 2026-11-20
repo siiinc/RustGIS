@@ -167,7 +167,6 @@ fn note(ui: &mut Ui, text: &str, why: Option<&str>, t: &Tokens) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use egui_kittest::kittest::Queryable;
     use serde_json::json;
@@ -192,6 +191,7 @@ mod tests {
     /// command.
     #[test]
     fn a_tile_layers_legend_opens_under_it() {
+        let _turn = crate::fetching::turn();
         let mut app = RustGisApp::with_sample();
         for c in ["Cities", "Countries"] {
             app.session.run("layer.expand", &json!({"layer": c, "on": false})).unwrap();

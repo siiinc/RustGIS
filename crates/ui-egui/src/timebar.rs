@@ -62,6 +62,12 @@ fn unit_label(u: Unit) -> String {
     .to_string()
 }
 
+/// A date field as the lists that bind a layer by it show it: its name and the share of its values
+/// that read as dates (the Layers menu here, the Time tab of Layer Properties).
+pub(crate) fn field_share(field: &str, share: f64) -> String {
+    crate::i18n::fmt("{field} ({share}%)", &[("field", field), ("share", &format!("{:.0}", share * 100.0))])
+}
+
 /// Whether the bar shows: the map has a slider and the bar wasn't closed.
 pub fn open(app: &RustGisApp) -> bool {
     app.session.map().time.is_some() && !app.time.hidden
@@ -125,6 +131,14 @@ fn advance(app: &mut RustGisApp, ui: &Ui) {
         return;
     };
     let elapsed = elapsed + f64::from(ui.input(|i| i.stable_dt).min(0.25)) * 1000.0;
+    // A Zarr step still being read holds the next one, and shows for a whole step once it lands:
+    // playing goes at the pace the steps are read, as it does where the read waits, and each
+    // step shows.
+    if app.session.zarr_waiting() {
+        app.time.playing = Some(0.0);
+        ui.ctx().request_repaint_after(web_time::Duration::from_millis(50));
+        return;
+    }
     if elapsed >= f64::from(t.speed_ms) {
         if t.at_end() && !t.looping {
             app.time.playing = None;
@@ -285,13 +299,13 @@ fn header(app: &mut RustGisApp, ui: &mut Ui, t: &TimeSlider, steps: &[f64], tk: 
         // Applied when the drag or the typing ends: one undo step, not one a frame.
         let mut every = app.time.interval.unwrap_or(t.interval);
         let r = ui
-            .add(egui::DragValue::new(&mut every).range(1..=1000).speed(0.1))
+            .add(egui::DragValue::new(&mut every).update_while_editing(false).range(1..=1000).speed(0.1))
             .labelled_by(input_label.id)
             .on_hover_text(tl!("Units per step"));
-        if r.changed() {
+        if crate::widgets::changed(&r) {
             app.time.interval = Some(every);
         }
-        let done = r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus());
+        let done = r.drag_stopped() || r.lost_focus() || (crate::widgets::changed(&r) && !r.dragged() && !r.has_focus());
         if done && let Some(n) = app.time.interval.take() {
             let _ = app.run("time.set", json!({"interval": n}));
         }
@@ -342,9 +356,7 @@ fn layers_menu(app: &mut RustGisApp, ui: &mut Ui) {
                     .selected_text(current.as_str())
                     .show_ui(ui, |ui| {
                         for (f, share) in fields {
-                            let label =
-                                crate::i18n::fmt("{field} ({share}%)", &[("field", f), ("share", &format!("{:.0}", share * 100.0))]);
-                            if ui.selectable_label(*f == current, label).clicked() {
+                            if ui.selectable_label(*f == current, field_share(f, *share)).clicked() {
                                 let _ = app.run("time.bind", json!({"layer": id, "field": f}));
                             }
                         }

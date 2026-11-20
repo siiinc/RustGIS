@@ -7,7 +7,7 @@ use std::sync::Arc;
 use rustgis_data::raster::{self, Raster};
 use rustgis_geom::Extent;
 use rustgis_map::raster::{
-    Normalizer, RasterLayer, RasterMask, RasterRenderer, RasterStyle, Resampling, Stretch, classify_masked, unique_values,
+    Normalizer, RasterLayer, RasterMask, RasterRenderer, RasterStyle, Resampling, Rock, Stretch, classify_masked, unique_values,
 };
 use rustgis_map::{ClassMethod, Ramp, RasterDefaults};
 use serde_json::{Value, json};
@@ -33,12 +33,12 @@ pub(crate) fn need_raster(s: &Session) -> Option<&'static str> {
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes)
-            .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k (JPEG 2000: desktop, through GDAL)", "data": base64, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData)}"#),
-        C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).params(
-            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "grey"?: bool (shadedRelief without its colour ramp)}"#,
+        C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes::<MAX_UPLOAD_BYTES>).roles(&[]).effects(crate::policy::Effects::NONE)
+            .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k|.dxf|.pdf (JPEG 2000: desktop, through GDAL; PDF: desktop, command line and Python)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name, or a PDF's page number (the first when left out or blank)", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData)}"#),
+        C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).roles(&[]).effects(crate::policy::Effects::NONE).params(
+            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "ambient"?: 0..1|null (shadedRelief: the share of the colour a slope turned fully from the sun keeps; left out, kept; null, the default: 0.25, or 0.5 balanced), "balanced"?: bool (shadedRelief: flat ground keeps the ramp's colour and slopes facing the sun brighten, up to 1.3; left out, kept; false, the default, lights as before), "rock"?: {"from"?: 0..90, "to"?: 0..90, "color"?: #RRGGBB} | false (shadedRelief: steep slopes tinted toward a rock colour before the light, from the ground's own slope in degrees, without the Z factor: the ramp below from, the colour above to, blended between; left out, kept; an object's missing keys keep the current rock's, or 25, 40 and #B2ACA4; false or null removes it), "grey"?: bool (shadedRelief without its colour ramp)}"#,
         ),
-        C::new("raster.stretch", "Stretch Type", "Style › Rendering", stretch)
+        C::new("raster.stretch", "Stretch Type", "Style › Rendering", stretch).inputs(stretch_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_raster)
         .params(r#"{"layer"?, "type": "none"|"minMax"|"custom"|"percentClip"|"standardDeviation"|"histogramEqualize", "low"?: %, "high"?: %, "n"?: deviations, "min"?, "max"?: custom bounds in the data's units, a number for every band or [red, green, blue] on an RGB layer, null for a band's own (a missing one is the range now drawn; the layer's own on one band), "like"?: raster layer (instead of type: that layer's stretch as fixed bounds, so tiles match at their joins)}"#),
         C::new("raster.dra", "DRA", "Style › Rendering", |s, p| {
@@ -47,10 +47,10 @@ pub fn commands() -> Vec<C> {
                 rl.style.dra = on.unwrap_or(!rl.style.dra);
                 Ok(())
             })
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_raster)
         .params(r#"{"layer"?, "on"?: bool}"#),
-        C::new("raster.mask", "Mask Values", "Style › Rendering", mask).when(need_raster).params(
+        C::new("raster.mask", "Mask Values", "Style › Rendering", mask).roles(&[]).effects(crate::policy::Effects::NONE).when(need_raster).params(
             r#"{"layer"?, "values"?: [numbers] or "0, 254, 255" (drawn as no data; [] for none), "min"?, "max"?: hide values outside this range (null for no bound), "inside"?: bool (hide those inside it instead), "clear"?: bool}"#,
         ),
         C::new("raster.resampling", "Resampling Type", "Style › Rendering", |s, p| {
@@ -60,10 +60,10 @@ pub fn commands() -> Vec<C> {
                 rl.style.resampling = r;
                 Ok(())
             })
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_raster)
         .params(r#"{"layer"?, "type": "nearest"|"bilinear"}"#),
-        C::new("raster.bands", "Band Combination", "Style › Rendering", bands)
+        C::new("raster.bands", "Band Combination", "Style › Rendering", bands).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_raster)
             .params(r#"{"layer"?, "red"?: 1.., "green"?: 1.., "blue"?: 1.., "preset"?: "natural"|"colorInfrared"}"#),
         C::new("raster.enhance", "Enhancement", "Style › Enhancement", |s, p| {
@@ -80,17 +80,34 @@ pub fn commands() -> Vec<C> {
                 }
                 Ok(())
             })
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_raster)
         .params(r#"{"layer"?, "brightness"?: -100..100, "contrast"?: -100..100, "gamma"?: 0.1..10}"#),
-        C::new("raster.setDefaultStyle", "Save as Default Raster Style", "Style › Rendering", set_default_style).view().params(
+        C::new("raster.setDefaultStyle", "Save as Default Raster Style", "Style › Rendering", set_default_style).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
             r#"{"fromLayer"?: bool (the active or named layer's colour ramp stretch; the settings apply to every raster added later that would be a grey stretch, opened files and analysis results alike), "layer"?, "ramp"?, "invert"?: bool, "stretch"?: "none"|"minMax"|"percentClip"|"standardDeviation"|"histogramEqualize", "low"?, "high"?: %, "n"?: deviations, "resampling"?: "nearest"|"bilinear", "reset"?: bool (back to the black-to-white grey stretch)}"#,
         ),
-        C::new("raster.info", "Raster Information", "Data › Information", info).view().when(need_raster).params(r#"{"layer"?}"#),
-        C::new("share.exportRaster", "Export Raster", "Data › Information", export).view().when(need_raster).params(
-            r#"{"layer"?, "path": "*.tif", "band"?: 1.. (rasters that aren't colour ones; a colour raster writes its colour bands), "cog"?: bool (a cloud-optimised GeoTIFF: 512 px tiles, Deflate, overviews; default false, an untiled GeoTIFF)}"#,
+        C::new("raster.info", "Raster Information", "Data › Information", info).view().when(need_raster).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?}"#),
+        C::new("share.exportRaster", "Export Raster", "Data › Information", |s, p| super::exports::write_here(s, p, "share.exportRaster")).view().when(need_exportable).inputs(export_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
+            r#"{"layer"?, "path": "*.tif", "band"?: 1.. (rasters that aren't colour ones; a colour raster writes its colour bands), "cog"?: bool (a cloud-optimised GeoTIFF: 512 px tiles, Deflate, overviews; default false, an untiled GeoTIFF), "tiles"?: "a tile layer's name, or its index (0 = top): its raster tiles (XYZ, WMTS, WMS, a raster archive) put together as an RGBA GeoTIFF in Web Mercator; by default the tile layer picked in the Layers pane, when no layer is given or active", "bbox"?: "[west, south, east, north] in degrees, for a tile layer (default: the view's)", "zoom"?: "0..30, the tiles' zoom (default: about the zoom the view shows at one pixel a point, as on a standard-density screen); at most 1024 tiles and 8192 pixels a side"}"#,
         ),
     ]
+}
+
+/// Export Raster writes the active (or named) raster layer, or a tile layer: one a script names
+/// (`tiles`) while another layer is active, or the one picked in the Layers pane. Which, and
+/// why none, is said by the export itself once tile layers are there.
+fn need_exportable(s: &Session) -> Option<&'static str> {
+    need_raster(s).filter(|_| s.map().tiles.is_empty())
+}
+
+/// The export reads the tile layer it writes, with its route; else the raster layer.
+fn export_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    match super::tile_export::target(input, p)? {
+        Some(i) if super::tile_export::named(p) => Ok(super::tiles::tile_inputs(input.map(), [i])),
+        // The tile layer picked in the Layers pane is a choice a plan can't see ahead of time.
+        Some(_) => Ok(super::Inputs::unresolved()),
+        None => super::Inputs::single_layer(input, p),
+    }
 }
 
 /// The raster layer named by `p` (default: active layer) and its data.
@@ -179,8 +196,7 @@ fn like_stretch(s: &Session, name: &str) -> Result<Stretch, String> {
 }
 
 fn stretch(s: &mut Session, p: &Value) -> CmdResult {
-    if let Some(like) = p.get("like").filter(|v| !v.is_null()) {
-        let like = like.as_str().ok_or("like is a raster layer's name")?;
+    if let Some(like) = like_name(p)? {
         let st = like_stretch(s, like)?;
         return with(s, p, |rl, _| {
             rl.style.stretch = st;
@@ -265,9 +281,10 @@ fn band(p: &Value, k: &str, r: &Raster) -> Result<Option<usize>, String> {
 }
 
 /// Adds a picture laid over the map (a KML ground overlay), kept in the project as a GeoTIFF.
-pub(crate) fn add_overlay(s: &mut Session, name: &str, r: raster::Raster) -> CmdResult {
+/// `zoom` is the adding command's `"zoom"`, as for the layers beside it.
+pub(crate) fn add_overlay(s: &mut Session, name: &str, r: raster::Raster, zoom: Option<bool>) -> CmdResult {
     let tif = raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
-    add_raster(s, name, RasterLayer::from_bytes(r, format!("{name}.tif"), tif))
+    add_raster_after(s, name, RasterLayer::from_bytes(r, format!("{name}.tif"), tif), zoom)
 }
 
 /// Sets how rasters added from now on are drawn when they hold a single band of continuous values
@@ -325,7 +342,13 @@ pub fn default_style_json(d: &RasterDefaults) -> Value {
 /// Adds a raster as a new layer, selects it and returns its id. A raster drawn the built-in way
 /// for a single band of continuous values takes the session's default raster style instead:
 /// opened files and analysis results (a slope, an NDVI) alike, since every producer adds here.
-pub fn add_raster(s: &mut Session, name: &str, mut layer: RasterLayer) -> CmdResult {
+pub fn add_raster(s: &mut Session, name: &str, layer: RasterLayer) -> CmdResult {
+    add_raster_after(s, name, layer, None)
+}
+
+/// [`add_raster`], with the adding command's `"zoom"`: `Some(true)` frames what was added,
+/// `Some(false)` keeps the view, and `None` frames only the first content on an empty map.
+pub(crate) fn add_raster_after(s: &mut Session, name: &str, mut layer: RasterLayer, zoom: Option<bool>) -> CmdResult {
     // A scan has no coordinates: it is laid over what the view shows, and says so.
     let mut laid = None;
     if let Some(d) = layer.data.as_mut().filter(|d| !d.georeferenced) {
@@ -347,18 +370,13 @@ pub fn add_raster(s: &mut Session, name: &str, mut layer: RasterLayer) -> CmdRes
         unique = format!("{name} ({i})");
     }
     let (w, h, n, overview) = layer.data.as_ref().map(|d| (d.width, d.height, d.band_count(), d.overview)).unwrap_or_default();
-    let rounded = layer.data.as_deref().and_then(rounded_count);
-    let empty_before = s.map().layers.is_empty();
+    read_notices(s, &unique, &mut layer);
+    let empty_before = super::map_is_empty(s);
     let id = s.map_mut().add_raster(unique.clone(), layer);
     s.active_layer = Some(id);
-    if let Some((fw, fh)) = overview {
-        s.notify(format!("{unique}: showing a {w} × {h} overview of the {fw} × {fh} raster"), false);
-    }
-    if let Some(count) = rounded {
-        let held = "pixels are held as 32-bit floats, exact for whole numbers up to 16,777,216 and to about 7 significant digits";
-        s.notify(format!("{unique}: {count} rounded as the file was read: {held}, so an export writes the rounded values"), false);
-    }
-    if empty_before && let Some(e) = s.map().layer(id).map(|l| l.extent()) {
+    if zoom.unwrap_or(empty_before)
+        && let Some(e) = s.map().layer(id).map(|l| l.extent())
+    {
         s.zoom_to(&e);
     }
     let mut v = json!({"layer": id, "width": w, "height": h, "bands": n});
@@ -374,6 +392,29 @@ pub fn add_raster(s: &mut Session, name: &str, mut layer: RasterLayer) -> CmdRes
         o.insert("overviewOf".into(), json!([fw, fh]));
     }
     Ok(v)
+}
+
+/// Discloses a newly read layer's losses once, whether added, reloaded or repaired.
+pub(super) fn read_notices(s: &mut Session, name: &str, layer: &mut RasterLayer) {
+    let lost = layer.lost_unsaid();
+    let pixels = layer.pixels_unsaid();
+    if let Some(r) = pixels.as_deref()
+        && let Some((fw, fh)) = r.overview.filter(|_| !layer.in_place)
+    {
+        s.notify(format!("{name}: showing a {} × {} overview of the {fw} × {fh} raster", r.width, r.height), false);
+    }
+    for loss in lost {
+        s.notify(format!("{name}: {loss}"), false);
+    }
+    if let Some(r) = pixels.as_deref() {
+        if let Some(held) = layer.in_place.then(|| crate::in_place_overview(r)).flatten() {
+            s.notify(format!("{name}: {held}"), false);
+        }
+        if let Some(count) = rounded_count(r) {
+            let held = "pixels are held as 32-bit floats, exact for whole numbers up to 16,777,216 and to about 7 significant digits";
+            s.notify(format!("{name}: {count} rounded as the file was read: {held}, so an export writes the rounded values"), false);
+        }
+    }
 }
 
 /// How many of a raster's values changed when read as 32-bit floats, as notices say it: "3 values
@@ -410,16 +451,16 @@ fn scan_box(s: &Session, w: u32, h: u32) -> [f64; 4] {
     [c.x - across / 2.0, c.y - up / 2.0, c.x + across / 2.0, c.y + up / 2.0]
 }
 
-/// Whether `"as": "scan"` was given for a TIFF, PNG or JPEG named `name`.
+/// Whether `"as": "scan"` was given for a TIFF, PNG, JPEG or PDF named `name`.
 pub(crate) fn wants_scan(p: &Value, name: &str) -> Result<bool, String> {
     if !as_scan(p)? {
         return Ok(false);
     }
     let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    if matches!(ext.as_str(), "tif" | "tiff" | "png" | "jpg" | "jpeg") {
+    if matches!(ext.as_str(), "tif" | "tiff" | "png" | "jpg" | "jpeg" | "pdf") {
         Ok(true)
     } else {
-        Err(format!("{name}: \"as\": \"scan\" opens a TIFF, PNG or JPEG"))
+        Err(format!("{name}: \"as\": \"scan\" opens a TIFF, PNG, JPEG or PDF"))
     }
 }
 
@@ -433,9 +474,99 @@ pub(crate) fn as_scan(p: &Value) -> Result<bool, String> {
     }
 }
 
+/// Says what reading several rasters left out, each `(raster, line)`: one notice a kind (the same
+/// line), naming the rasters that share it (three, then a count), as AGENTS.md's Never silent asks.
+///
+/// Lines that differ only in their numbers ("1 scale…", "2 scale…") are one kind. When the
+/// numbers are the same for every raster the kind is said once; when they differ, each raster's
+/// own line is said (three rasters or fewer), or the range they give, for each of them ("4
+/// rasters (a, b, c, …), each: 1–2 scale…"): never summed, since a size limit isn't a count.
+pub(crate) fn say_losses(s: &mut Session, losses: Vec<(String, String)>) {
+    // A line's kind: its text with each number taken out, and those numbers. A number is a run of
+    // digits standing as a word of its own: one inside a name (`scene2024.tif`) stays text.
+    fn kind_of(line: &str) -> (Vec<&str>, Vec<u64>) {
+        let apart = |c: Option<char>| c.is_none_or(|c| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | ':'));
+        let (mut parts, mut numbers, mut from) = (Vec::new(), Vec::new(), 0);
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_digit() {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let before = line[..start].chars().next_back();
+                let after = line[i..].chars().next();
+                if !(apart(before) && apart(after)) {
+                    continue;
+                }
+                match line[start..i].parse::<u64>() {
+                    Ok(n) => {
+                        parts.push(&line[from..start]);
+                        numbers.push(n);
+                        from = i;
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                i += 1;
+            }
+        }
+        parts.push(&line[from..]);
+        (parts, numbers)
+    }
+    // Each kind: its text parts, each number's lowest and highest, and the rasters with their
+    // own lines.
+    type Kind = (Vec<String>, Vec<(u64, u64)>, Vec<(String, String)>);
+    let mut kinds: Vec<Kind> = Vec::new();
+    for (name, line) in losses {
+        let (parts, numbers) = kind_of(&line);
+        let parts_owned: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+        match kinds.iter_mut().find(|(p, n, _)| *p == parts_owned && n.len() == numbers.len()) {
+            Some((_, ranges, named)) => {
+                for (r, n) in ranges.iter_mut().zip(&numbers) {
+                    *r = (r.0.min(*n), r.1.max(*n));
+                }
+                named.push((name, line));
+            }
+            None => kinds.push((parts_owned, numbers.iter().map(|n| (*n, *n)).collect(), vec![(name, line)])),
+        }
+    }
+    for (parts, ranges, named) in kinds {
+        let differ = ranges.iter().any(|(lo, hi)| lo != hi);
+        // A few rasters whose numbers differ: each its own, so none is lost in a range.
+        if differ && named.len() <= 3 {
+            for (name, line) in named {
+                s.notify(format!("{name}: {line}"), false);
+            }
+            continue;
+        }
+        let names: Vec<String> = named.into_iter().map(|(name, _)| name).collect();
+        let mut line = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            line.push_str(part);
+            if let Some((lo, hi)) = ranges.get(i) {
+                line.push_str(&if lo == hi { lo.to_string() } else { format!("{lo}–{hi}") });
+            }
+        }
+        let who = match names.as_slice() {
+            [one] => one.clone(),
+            _ => {
+                let more = if names.len() > 3 { ", …" } else { "" };
+                format!("{} rasters ({}{more})", names.len(), names[..names.len().min(3)].join(", "))
+            }
+        };
+        let each = if differ { ", each" } else { "" };
+        s.notify(format!("{who}{each}: {line}"), false);
+    }
+}
+
 /// Opens a raster file by path.
-pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool) -> CmdResult {
-    let mut r = raster::read_path(Path::new(path)).map_err(|e| format!("{path}: {e}"))?;
+pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, page: Option<&str>, scan: bool) -> CmdResult {
+    let mut r = match super::reads::take(s, &read_key(path, page, scan)) {
+        Some(r) => r,
+        None => read_raster_as(path, page, scan),
+    }?;
     if scan {
         r = r.into_scan().map_err(|e| format!("{path}: {e}"))?;
     }
@@ -443,24 +574,104 @@ pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool) -> 
     // Absolute, so the project finds it again from anywhere (`absolute`, unlike `canonicalize`,
     // gives plain paths on Windows rather than `\\?\` ones).
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
-    add_raster(s, &name, RasterLayer::from_path(r, full))
+    // A scan is laid over the view as it is added, and that placement makes it reopen as one.
+    let mut rl = RasterLayer::from_path(r, full);
+    // A PDF's page, kept so the project opens the same page again.
+    rl.subdataset = page.map(str::to_string);
+    add_raster(s, &name, rl)
+}
+
+/// The page `"layer"` asks for when `path` is a PDF's: its number, given as text or as a whole
+/// number (a JSON number); `None` when not given, or for a raster that has no pages. Any other
+/// value is refused rather than read as the first page.
+pub(crate) fn pdf_page(path: &str, p: &Value) -> Result<Option<String>, String> {
+    if !raster::is_pdf_name(path) {
+        return Ok(None);
+    }
+    match p.get("layer") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(t)) => Ok(Some(t.trim().to_string()).filter(|t| !t.is_empty())),
+        Some(other) => match other.as_u64() {
+            Some(n) => Ok(Some(n.to_string())),
+            None => Err(format!("\"layer\": {other} isn't a page number")),
+        },
+    }
+}
+
+/// Whether a whole file downloaded from `url` is a PDF page to draw off the frame before it is
+/// added (`layer.addDownload` with `p`): its file name, page and whether it is placed by its
+/// coordinates (not `"as": "scan"`). `None` for anything else, or a page that can't be read here,
+/// which `layer.addDownload` reads (or refuses) as it adds it.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn download_page(url: &str, p: &Value, bytes: &[u8]) -> Option<(String, Option<String>, bool)> {
+    let plain = ["service", "coverage", "geolibreProject", "geolibreLayer"]
+        .iter()
+        .all(|k| p.get(k).is_none_or(|v| v.is_null() || v.as_bool() == Some(false)));
+    if !raster::PDF_PAGES || !plain {
+        return None;
+    }
+    let name = super::layer::url_file_name(url, bytes).ok().filter(|n| raster::is_pdf_name(n))?;
+    let page = pdf_page(&name, p).ok()?;
+    let scan = wants_scan(p, &name).ok()?;
+    Some((name, page, !scan))
+}
+
+/// Draws a downloaded PDF's page off the frame ([`download_page`]), for
+/// [`crate::Session::download_landed_page`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_download_page(name: &str, bytes: &[u8], page: Option<&str>, place: bool) -> Result<Raster, String> {
+    raster::read_bytes_page(name, bytes, page, place).map_err(|e| format!("{name}: {e}"))
+}
+
+/// The raster at `path` (a PDF's `page`), read whole; for a `scan`, as the file holds it, without
+/// the world file beside it (#2075).
+pub(crate) fn read_raster_as(path: &str, page: Option<&str>, scan: bool) -> Result<Raster, String> {
+    let p = Path::new(path);
+    let read = if scan { raster::read_path_unplaced(p, page, None) } else { raster::read_path_with(p, page, None) };
+    read.map_err(|e| format!("{path}: {e}"))
+}
+
+/// The key [`add_path`]'s read of `path` (a PDF's `page`) is taken by (see [`super::reads`]): a
+/// scan's read, without the world file, isn't another's, nor is another page's.
+pub(crate) fn read_key(path: &str, page: Option<&str>, scan: bool) -> String {
+    let path = match page {
+        Some(page) => format!("{path}#page={page}"),
+        None => path.to_string(),
+    };
+    if scan { format!("raster-scan:{path}") } else { format!("raster:{path}") }
+}
+
+/// A raster GDAL converts and the conversion it read.
+#[cfg(not(target_arch = "wasm32"))]
+type GdalRead = Result<(rustgis_data::raster::gdal::Converted, Raster), String>;
+
+/// The raster GDAL converts from `path` (`layer` its subdataset, `crs` a coordinate system the
+/// file doesn't say), with the conversion.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_gdal(path: &str, layer: Option<&str>, crs: Option<&str>) -> GdalRead {
+    use rustgis_data::raster::gdal;
+    let c = gdal::convert(Path::new(path), layer, crs).map_err(|e| format!("{path}: {e}"))?;
+    let r = raster::read_converted(Path::new(path), &c).map_err(|e| format!("{path}: {e}"))?;
+    Ok((c, r))
+}
+
+/// The key [`add_gdal_path`]'s read of `path` is taken by (see [`super::reads`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn gdal_key(path: &str) -> String {
+    format!("gdal:{path}")
 }
 
 /// Adds a raster GDAL reads (converted once to a GeoTIFF in the cache): `"layer"` picks a
 /// subdataset (a NetCDF variable) and `"crs"` gives a coordinate system the file doesn't say.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn add_gdal_path(s: &mut Session, p: &Value, path: &str) -> CmdResult {
-    use rustgis_data::raster::gdal;
     let text = |k: &str| ps(p, k).map(str::trim).filter(|v| !v.is_empty());
-    let c = gdal::convert(Path::new(path), text("layer"), text("crs")).map_err(|e| format!("{path}: {e}"))?;
-    let r = raster::read_converted(Path::new(path), &c).map_err(|e| format!("{path}: {e}"))?;
-    if c.assumed_lonlat {
-        s.notify(format!("{path} doesn't say its coordinate system; its coordinates look like longitude/latitude, so it's read as WGS 84 (give \"crs\" if not)"), false);
-    }
-    if !c.others.is_empty() {
-        let shown: Vec<&str> = c.others.iter().take(20).map(String::as_str).collect();
-        s.notify(format!("{path} has more variables ({}): add one with \"layer\"", shown.join(", ")), false);
-    }
+    let (c, r) = match super::reads::take::<GdalRead>(s, &gdal_key(path)) {
+        Some(read) => read,
+        None => read_gdal(path, text("layer"), text("crs")),
+    }?;
+    // What converting found (a system GDAL assumed, variables not added) is in `r.lost`
+    // ([`raster::read_converted`]), said once with the layer's other losses by `read_notices`.
     let name = text("name").map(str::to_string).unwrap_or_else(|| r.name.clone());
     // A project names the file itself, with the subdataset and coordinate system chosen, and
     // converts it again (from the cache, while it is there) when it opens.
@@ -474,7 +685,7 @@ pub(crate) fn add_gdal_path(s: &mut Session, p: &Value, path: &str) -> CmdResult
 /// Adds an uploaded or downloaded JPEG 2000 raster, converted by GDAL to a GeoTIFF that the project
 /// keeps (it opens again without GDAL or the source file, as an uploaded GeoTIFF does).
 #[cfg(not(target_arch = "wasm32"))]
-fn add_jpeg2000_bytes(s: &mut Session, p: &Value, name: &str, bytes: Vec<u8>) -> CmdResult {
+fn add_jpeg2000_bytes(s: &mut Session, p: &Value, name: &str, bytes: Vec<u8>, zoom: Option<bool>) -> CmdResult {
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
     let c = raster::gdal::convert_jpeg2000(bytes, crs, MAX_UPLOAD_BYTES as u64).map_err(|e| format!("{name}: {e}"))?;
     let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
@@ -484,44 +695,83 @@ fn add_jpeg2000_bytes(s: &mut Session, p: &Value, name: &str, bytes: Vec<u8>) ->
         s.notify(format!("{name} doesn't say its coordinate system; its coordinates look like longitude/latitude, so it's read as WGS 84 (give \"crs\" if not)"), false);
     }
     let title = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| r.name.clone());
-    add_raster(s, &title, RasterLayer::from_bytes(r, file_name, c.tif))
+    add_raster_after(s, &title, RasterLayer::from_bytes(r, file_name, c.tif), zoom)
 }
 
-fn add_bytes(s: &mut Session, p: &Value) -> CmdResult {
+/// Strips directory components from an uploaded/text `fileName`, keeping only a plain file name.
+pub(crate) fn bytes_file_name(raw: &str) -> Option<&str> {
+    let leaf = raw.trim().rsplit(['/', '\\']).next()?.trim();
+    let leaf = std::path::Path::new(leaf).file_name().and_then(|n| n.to_str()).unwrap_or(leaf).trim();
+    (!leaf.is_empty() && leaf != "." && leaf != "..").then_some(leaf)
+}
+
+/// Whether `layer.addDataBytes` names a JPEG 2000 upload (which runs `gdal_translate` via temp files).
+pub(crate) fn bytes_is_jpeg2000(p: &Value) -> bool {
+    ps(p, "fileName").is_some_and(|raw| raster::is_jpeg2000_name(raw.trim()) || bytes_file_name(raw).is_some_and(raster::is_jpeg2000_name))
+}
+
+/// Imports base64 file contents, applying the platform's upload cap before decoding.
+fn add_bytes<const LIMIT: usize>(s: &mut Session, p: &Value) -> CmdResult {
     use base64::Engine;
-    let name = ps(p, "fileName").ok_or("fileName is required")?.to_string();
+    let raw_name = ps(p, "fileName").ok_or("fileName is required")?;
+    let name = bytes_file_name(raw_name).ok_or("fileName is required")?.to_string();
     let data = ps(p, "data").ok_or("data is required")?;
     // Base64 is 4 characters per 3 bytes; refuse files past the upload limit before decoding.
-    if data.len() / 4 * 3 > MAX_UPLOAD_BYTES {
-        return Err(format!("{name} is too large to open"));
+    let padding = if data.ends_with("==") { 2 } else { usize::from(data.ends_with('=')) };
+    if (data.len() / 4 * 3).saturating_sub(padding) > LIMIT {
+        return Err(rustgis_data::io::file_size_error(&name, LIMIT as u64));
     }
     let bytes = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).map_err(|e| format!("data: {e}"))?;
-    add_named_bytes(s, p, name, bytes)
+    add_named_bytes(s, p, name, bytes, b(p, "zoom"))
 }
 
-/// Adds a file's contents (an upload, a download) as its name's extension says.
-pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: Vec<u8>) -> CmdResult {
+/// Adds a file's contents (an upload, a download) as its name's extension says. A PDF's page is
+/// drawn here, on the caller's thread, unless it was drawn already ([`add_named_bytes_read`]): the
+/// desktop app's downloads land with theirs drawn off the frame ([`download_page`]) and its file
+/// drops are read by path on the read queue, so a caller here is the command line, Python or a
+/// script, with no window to hold.
+pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: Vec<u8>, zoom: Option<bool>) -> CmdResult {
+    add_named_bytes_read(s, p, name, bytes, zoom, None)
+}
+
+/// [`add_named_bytes`], with a PDF's page drawn already off the frame (a download's,
+/// [`read_download_page`]) instead of here.
+pub(crate) fn add_named_bytes_read(
+    s: &mut Session,
+    p: &Value,
+    name: String,
+    bytes: Vec<u8>,
+    zoom: Option<bool>,
+    drawn: Option<Raster>,
+) -> CmdResult {
     // A geotagged photo (an upload, a drop): a point in the photo layer, so several uploads
     // gather in one.
     let scan = wants_scan(p, &name)?;
     if !scan && rustgis_data::photo::is_photo_name(&name) {
         let layer = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(super::layer::PHOTOS).to_string();
-        return super::layer::add_photos_to(s, &layer, |reader| reader.add(&name, &bytes));
+        return super::layer::add_photos_to(s, &layer, zoom, |reader| reader.add(&name, &bytes));
     }
     // JPEG 2000 (an upload or a download): through GDAL, on the desktop.
     if raster::is_jpeg2000_name(&name) {
         #[cfg(not(target_arch = "wasm32"))]
-        return add_jpeg2000_bytes(s, p, &name, bytes);
+        return add_jpeg2000_bytes(s, p, &name, bytes, zoom);
         #[cfg(target_arch = "wasm32")]
         return Err(JPEG2000_WEB_LIMITATION.into());
     }
     if raster::is_raster_name(&name) {
-        let mut r = raster::read_bytes(&name, &bytes).map_err(|e| format!("{name}: {e}"))?;
+        // A PDF's page, kept so the project reads the same page from its copy again.
+        let page = pdf_page(&name, p)?;
+        let mut r = match drawn {
+            Some(r) => r,
+            None => raster::read_bytes_page(&name, &bytes, page.as_deref(), !scan).map_err(|e| format!("{name}: {e}"))?,
+        };
         if scan {
             r = r.into_scan().map_err(|e| format!("{name}: {e}"))?;
         }
         let title = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| r.name.clone());
-        return add_raster(s, &title, RasterLayer::from_bytes(r, name, bytes));
+        let mut rl = RasterLayer::from_bytes(r, name, bytes);
+        rl.subdataset = page;
+        return add_raster_after(s, &title, rl, zoom);
     }
     // An MBTiles archive: held in memory and drawn as a tile layer.
     if rustgis_data::mbtiles::is_mbtiles_name(&name) {
@@ -534,25 +784,37 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     }
     // A spreadsheet's sheet.
     if rustgis_data::sheets::is_sheet_name(&name) {
-        return super::layer::add_sheet(s, p, &name, &bytes);
+        return super::layer::add_sheet(s, p, &name, &bytes, zoom);
     }
-    // Files of several layers: zipped Shapefiles, KML/KMZ, GPX, GeoRSS, LandXML.
+    // Files of several layers: zipped Shapefiles, KML/KMZ, GPX, GeoRSS, LandXML, CityJSON.
     if rustgis_data::io::is_multi_layer_name(&name) {
-        return super::layer::add_layers(s, p, &name, &bytes);
+        return super::layer::add_layers(s, p, &name, &bytes, zoom, false);
     }
     // GeoParquet and FlatGeobuf uploads (binary vector files).
     if rustgis_data::source::is_source_name(&name) {
-        return super::layer::add_source(s, p, super::layer::Origin::Bytes(&name, std::sync::Arc::new(bytes)));
+        return super::layer::add_source(s, p, super::layer::Origin::Bytes(&name, std::sync::Arc::new(bytes)), zoom);
+    }
+    // A standalone dBASE table is binary too, and uses the usual non-spatial table path.
+    if name.to_ascii_lowercase().ends_with(".dbf") {
+        let read = rustgis_data::io::read_bytes(&name, &bytes).map_err(|e| e.to_string())?;
+        return super::layer::add_read(s, p, read, zoom);
+    }
+    if name.to_ascii_lowercase().ends_with(".gz") && !rustgis_data::io::is_gzip_text_name(&name) {
+        return Err(format!("{name}: decompress it first, then add the supported file inside"));
+    }
+    if rustgis_data::io::is_gzip_text_name(&name) || (name.to_ascii_lowercase().ends_with(".dat") && std::str::from_utf8(&bytes).is_err()) {
+        let read = super::layer::read_delimited_bytes(p, &name, &bytes)?;
+        return super::layer::add_read(s, p, read, zoom);
     }
     let text = String::from_utf8(bytes).map_err(|_| format!("{name} is not a text file"))?;
     // The delimited-text and naming parameters carry over (not the data, already decoded).
     let mut q = json!({"fileName": name, "text": text});
-    for k in ["name", "x", "y", "wkt", "crs", "delimiter"] {
+    for k in ["name", "x", "y", "wkt", "crs", "delimiter", "layer", "paperSpace", "blocks"] {
         if let Some(v) = p.get(k) {
             q[k] = v.clone();
         }
     }
-    super::layer::add_data_text(s, &q)
+    super::layer::add_data_text_after(s, &q, zoom)
 }
 
 fn symbology(s: &mut Session, p: &Value) -> CmdResult {
@@ -615,13 +877,37 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                 }
                 RasterRenderer::Colormap
             }
-            "shadedrelief" | "hillshade" => RasterRenderer::ShadedRelief {
-                band: bi,
-                ramp: ramp.or(Some(Ramp::Terrain)).filter(|_| !b(p, "grey").unwrap_or(false)),
-                azimuth: f(p, "azimuth").unwrap_or(315.0).rem_euclid(360.0),
-                altitude: f(p, "altitude").unwrap_or(45.0).clamp(0.0, 90.0),
-                z_factor: f(p, "zFactor").unwrap_or(1.0).clamp(0.001, 1000.0),
-            },
+            "shadedrelief" | "hillshade" => {
+                // Left out, a Shaded Relief keeps its own shadows, sky, fill light, rock, ambient
+                // and balanced light; a new one has none (and the default ambient).
+                let (cur_shadow, cur_sky, cur_fill, cur_rock, cur_ambient, cur_balanced) = match rl.style.renderer {
+                    RasterRenderer::ShadedRelief { shadow, sky, fill, rock, ambient, balanced, .. } => {
+                        (shadow, sky, fill, rock, ambient, balanced)
+                    }
+                    _ => (0.0, 0.0, 0.0, None, None, false),
+                };
+                RasterRenderer::ShadedRelief {
+                    band: bi,
+                    ramp: ramp.or(Some(Ramp::Terrain)).filter(|_| !b(p, "grey").unwrap_or(false)),
+                    azimuth: f(p, "azimuth").unwrap_or(315.0).rem_euclid(360.0),
+                    altitude: f(p, "altitude").unwrap_or(45.0).clamp(0.0, 90.0),
+                    z_factor: f(p, "zFactor").unwrap_or(1.0).clamp(0.001, 1000.0),
+                    shadow: f(p, "shadow").unwrap_or(cur_shadow).clamp(0.0, 1.0),
+                    sky: f(p, "sky").unwrap_or(cur_sky).clamp(0.0, 1.0),
+                    fill: f(p, "fill").unwrap_or(cur_fill).clamp(0.0, 1.0),
+                    rock: match p.get("rock") {
+                        None => cur_rock,
+                        Some(v) => relief_rock(v, cur_rock)?,
+                    },
+                    // null goes back to the default, which follows `balanced`.
+                    ambient: match p.get("ambient") {
+                        None => cur_ambient,
+                        Some(Value::Null) => None,
+                        Some(_) => Some(f(p, "ambient").ok_or("\"ambient\" must be a number from 0 to 1, or null")?.clamp(0.0, 1.0)),
+                    },
+                    balanced: b(p, "balanced").unwrap_or(cur_balanced),
+                }
+            }
             other => return Err(format!("unknown raster symbology '{other}'")),
         };
         if matches!(rl.style.renderer, RasterRenderer::Colormap | RasterRenderer::UniqueValues { .. } | RasterRenderer::Classify { .. }) {
@@ -631,6 +917,31 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         }
         Ok(())
     })
+}
+
+/// The rock of a Shaded Relief's `"rock"` (see `raster.symbology`): `false` or null for none, or
+/// an object whose missing keys keep `cur`'s, or else [`Rock::DEFAULT`]'s.
+fn relief_rock(v: &Value, cur: Option<Rock>) -> Result<Option<Rock>, String> {
+    if v.is_null() || *v == Value::Bool(false) {
+        return Ok(None);
+    }
+    if !v.is_object() {
+        return Err("rock must be an object with from, to and color, or false".into());
+    }
+    let was = cur.unwrap_or(Rock::DEFAULT);
+    let angle = |k: &str, d: f64| match v.get(k).filter(|x| !x.is_null()) {
+        None => Ok(d),
+        Some(x) => x.as_f64().filter(|a| a.is_finite()).map(|a| a.clamp(0.0, 90.0)).ok_or_else(|| format!("rock's {k} must be degrees")),
+    };
+    let (from, to) = (angle("from", was.from)?, angle("to", was.to)?);
+    if from >= to {
+        return Err(format!("rock's from ({from}°) must be below its to ({to}°)"));
+    }
+    let color = super::layout::color(v, "color", was.color)?;
+    if color.a() != 255 {
+        return Err("rock's color must be #RRGGBB: the rock is opaque".into());
+    }
+    Ok(Some(Rock { from, to, color }))
 }
 
 /// Most values a mask lists.
@@ -768,10 +1079,15 @@ fn bands(s: &mut Session, p: &Value) -> CmdResult {
 fn info(s: &mut Session, p: &Value) -> CmdResult {
     let (id, r) = get(s, p)?;
     let rl = s.map().layer(id).and_then(|l| l.raster.as_ref()).ok_or("no layer")?;
+    let source = match rl.path.as_deref() {
+        Some(path) if !s.policy_user() && rustgis_map::tiles::is_local_archive(path) => rl.file_name.clone(),
+        Some(path) => Some(crate::sources::redact_output(path)),
+        None => rl.file_name.clone(),
+    };
     let (cx, cy) = r.cell_size();
     Ok(json!({
         "name": r.name,
-        "source": rl.path.clone().or(rl.file_name.clone()),
+        "source": source,
         "width": r.width, "height": r.height,
         "overviewOf": r.overview.map(|(w, h)| json!([w, h])),
         "bands": r.bands.iter().map(|b| json!({
@@ -792,43 +1108,57 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
 
 /// GeoTIFF bytes of a raster layer (band is 1-based; RGB rasters keep their colour bands; `cog`
 /// makes it a cloud-optimised one).
-pub fn geotiff_bytes(s: &Session, p: &Value) -> Result<(String, Vec<u8>), String> {
+pub fn geotiff_bytes(s: &mut Session, p: &Value) -> Result<(String, Vec<u8>), String> {
     let (_, r) = get(s, p)?;
     let bi = band(p, "band", &r)?.unwrap_or(0);
-    let bytes = if b(p, "cog") == Some(true) { raster::cogwrite::write(&r, bi) } else { raster::geotiff::write(&r, bi) };
-    Ok((r.name.clone(), bytes.map_err(|e| e.to_string())?))
+    let cog = b(p, "cog") == Some(true);
+    let bytes = if cog { raster::cogwrite::write(&r, bi) } else { raster::geotiff::write(&r, bi) }.map_err(|e| e.to_string())?;
+    let note = geotiff_note(&r, bi, cog, "give \"band\" for another")?;
+    if !note.is_empty() {
+        s.notify(format!("Exported {}.tif{note}", r.name), false);
+    }
+    Ok((r.name.clone(), bytes))
 }
 
-fn export(s: &mut Session, p: &Value) -> CmdResult {
+/// `share.exportRaster`'s inputs, and the work that writes the raster as a GeoTIFF (a
+/// cloud-optimised one with `cog`).
+pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
+    if let Some(i) = super::tile_export::target(s, p)? {
+        return super::tile_export::export_work(s, p, i);
+    }
     let path = ps(p, "path").ok_or("path is required")?.to_string();
+    // A raster layer is written whole: a box or zoom asked for would be dropped.
+    if [p.get("bbox"), p.get("zoom")].into_iter().flatten().any(|v| !v.is_null()) {
+        return Err("bbox and zoom are for a tile layer: name it with \"tiles\", or pick it in the Layers pane".into());
+    }
+    // No layer named or active, nor a tile layer picked: what to pick.
+    if matches!(p.get("layer"), None | Some(Value::Null))
+        && let Some(why) = need_raster(s)
+    {
+        return Err(why.replace("a raster layer", "a raster or tile layer"));
+    }
     let (_, r) = get(s, p)?;
-    let mut cog = None;
-    if b(p, "cog") == Some(true) {
-        // Tiles go to the file as they are made: the whole file is never held in memory.
-        let bi = band(p, "band", &r)?.unwrap_or(0);
-        cog = Some(raster::cogwrite::write_file(&r, bi, Path::new(&path)).map_err(|e| format!("{path}: {e}"))?);
-    } else {
-        let (_, bytes) = geotiff_bytes(s, p)?;
-        rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
-    }
-    let mut note = match r.overview {
-        Some((fw, fh)) => format!(" (the {} × {} overview of the {fw} × {fh} raster)", r.width, r.height),
-        None => String::new(),
-    };
-    // Values changed when the file was read are written as they are held: those of the bands the
-    // writer writes, as it chooses them.
     let bi = band(p, "band", &r)?.unwrap_or(0);
-    let bands = if cog.is_some() {
-        raster::cogwrite::written_bands(&r, bi).map_err(|e| e.to_string())?
+    let cog = b(p, "cog") == Some(true);
+    Ok(Box::new(move || write_geotiff(&r, bi, cog, &path)))
+}
+
+/// Writes raster `r` (band `bi`, or its colour bands) to `path`, and says what the file holds.
+pub(super) fn write_geotiff(r: &Raster, bi: usize, cog: bool, path: &str) -> Result<super::exports::Wrote, String> {
+    write_geotiff_with_guidance(r, bi, cog, path, "give \"band\" for another")
+}
+
+/// Builds the band instruction before combining the note with any caller-supplied path or name.
+fn write_geotiff_with_guidance(r: &Raster, bi: usize, cog: bool, path: &str, band_hint: &str) -> Result<super::exports::Wrote, String> {
+    let cog = if cog {
+        // Tiles go to the file as they are made: the whole file is never held in memory.
+        Some(raster::cogwrite::write_file(r, bi, Path::new(path)).map_err(|e| format!("{path}: {e}"))?)
     } else {
-        raster::geotiff::written_bands(&r, bi)
+        let bytes = raster::geotiff::write(r, bi).map_err(|e| e.to_string())?;
+        rustgis_data::io::write_atomic(Path::new(path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+        None
     };
-    let written: u64 = bands.iter().filter_map(|b| r.rounded.get(*b)).sum();
-    if written > 0 {
-        let (values, verb) = values_were(written);
-        note.push_str(&format!("; {values} in it {verb} rounded to 32-bit floats when {} was read", r.name));
-    }
-    s.notify(format!("Exported {path}{note}"), false);
+    let note = geotiff_note(r, bi, cog.is_some(), band_hint)?;
     let mut v = match r.overview {
         Some((fw, fh)) => json!({"path": path, "width": r.width, "height": r.height, "overviewOf": [fw, fh]}),
         None => json!({"path": path}),
@@ -836,7 +1166,71 @@ fn export(s: &mut Session, p: &Value) -> CmdResult {
     if let (Some(o), Some(c)) = (v.as_object_mut(), cog) {
         o.insert("cog".into(), json!({"overviews": c.levels.len().saturating_sub(1), "bigTiff": c.big, "bytes": c.bytes}));
     }
-    Ok(v)
+    Ok(super::exports::Wrote {
+        answer: v,
+        diagnostics: Vec::new(),
+        refused_notes: Vec::new(),
+        notes: vec![format!("Exported {path}{note}")],
+        written_path: Some(path.to_string()),
+        then: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        owner: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        crs_used: Vec::new(),
+    })
+}
+
+/// Writes a tool's raster file and reports the same export notes as `share.exportRaster`.
+pub(super) fn write_and_report(s: &mut Session, r: &Raster, bi: usize, cog: bool, path: &str) -> Result<Value, String> {
+    let wrote =
+        write_geotiff_with_guidance(r, bi, cog, path, "export the resulting layer with share.exportRaster and give \"band\" for another")?;
+    for note in wrote.notes {
+        s.notify_written(note, false);
+    }
+    Ok(wrote.answer)
+}
+
+/// What the selected GeoTIFF writer keeps, changes or leaves out, shared by files and downloads.
+fn geotiff_note(r: &Raster, bi: usize, cog: bool, band_hint: &str) -> Result<String, String> {
+    let mut note = match r.overview {
+        Some((fw, fh)) => format!(" (the {} × {} overview of the {fw} × {fh} raster)", r.width, r.height),
+        None => String::new(),
+    };
+    // Values changed when the file was read are written as they are held: those of the bands the
+    // writer writes, as it chooses them.
+    let bands =
+        if cog { raster::cogwrite::written_bands(r, bi).map_err(|e| e.to_string())? } else { raster::geotiff::written_bands(r, bi) };
+    let written: u64 = bands.iter().filter_map(|b| r.rounded.get(*b)).sum();
+    if written > 0 {
+        let (values, verb) = values_were(written);
+        note.push_str(&format!("; {values} in it {verb} rounded to 32-bit floats when {} was read", r.name));
+    }
+    if bands.iter().any(|b| r.rounded_some.get(*b).copied().unwrap_or(false)) {
+        // Made from part of a raster with rounded values (a clip, an edit): how many it kept isn't
+        // known, so no count is given.
+        note.push_str("; some values in it may have been rounded to 32-bit floats when the raster it was made from was read");
+    }
+    // The bands the writer leaves out (it writes `band`, or a colour raster's colour bands, which
+    // `band` doesn't change) are said, names and all.
+    if bands.len() < r.bands.len() {
+        let which = if bands == [bi] { band_hint } else { "its colour bands" };
+        note.push_str(&format!("; {} of its {} bands written ({which})", bands.len(), r.bands.len()));
+    }
+    // The file keeps the first written band's class names only (as dataset `CLASS_` items).
+    let unnamed: Vec<String> =
+        bands.iter().skip(1).filter(|b| r.bands.get(**b).is_some_and(|b| !b.classes.is_empty())).map(|b| (b + 1).to_string()).collect();
+    if !unnamed.is_empty() {
+        note.push_str(&format!("; the class names of band(s) {} aren't written: a GeoTIFF keeps the first band's", unnamed.join(", ")));
+    }
+    // Who holds the rights goes into a tag that holds ASCII only: what that changed is said.
+    if let Some(said) = r.copyright.as_deref().and_then(raster::tag_text_note) {
+        note.push_str(&format!("; {said}"));
+    }
+    let spaced = raster::gdal_metadata_changed(r, &bands);
+    if spaced > 0 {
+        note.push_str(&format!("; {spaced} band or class name(s) held control characters, written as spaces"));
+    }
+    Ok(note)
 }
 
 /// Pixel values of the topmost visible raster under a longitude/latitude point.
@@ -857,4 +1251,83 @@ pub fn identify(s: &Session, lon: f64, lat: f64) -> Option<Value> {
         attrs.insert("Pixel".into(), json!(format!("{col}, {row}")));
         Some(json!({"layer": l.name, "layerId": l.id, "raster": true, "attributes": attrs}))
     })
+}
+
+/// Binds the primary raster and optional actual like raster without copying pixel data.
+fn stretch_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let mut inputs = super::Inputs::single_layer(s, p)?;
+    if let Some(name) = like_name(p)? {
+        inputs.extend(super::Inputs::named(s.map(), [name])?);
+    }
+    Ok(inputs)
+}
+
+/// Selects only the literal like raster consumed by stretch.
+fn like_name(p: &Value) -> Result<Option<&str>, String> {
+    p.get("like").filter(|v| !v.is_null()).map(|v| v.as_str().ok_or_else(|| "like is a raster layer's name".to_string())).transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The last padded quartet must count only the bytes it will decode into.
+    #[test]
+    fn add_data_bytes_accepts_padded_files_at_the_exact_limit() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        const CSV: &[u8] = b"X,Y\n1,2\n";
+        fn check<const LIMIT: usize>(bytes: &[u8]) {
+            let mut session = Session::new(crate::Project::default());
+            let params = |bytes: &[u8]| json!({"fileName": "points.csv", "data": STANDARD.encode(bytes)});
+            add_bytes::<LIMIT>(&mut session, &params(bytes)).unwrap();
+            let larger = [bytes, b" "].concat();
+            let error = add_bytes::<LIMIT>(&mut session, &params(&larger)).unwrap_err();
+            assert!(error.contains("is too large to open"), "{error}");
+        }
+        check::<{ CSV.len() }>(CSV);
+        check::<{ CSV.len() - 1 }>(&CSV[..CSV.len() - 1]);
+    }
+
+    /// Exercise upload refusals with a reduced cap across formats with different recovery advice.
+    #[test]
+    fn oversized_add_data_bytes_reports_limit_and_advice() {
+        const LIMIT: usize = 1 << 20;
+        let mut session = Session::new(crate::Project::default());
+        let data = "YWJj".repeat(LIMIT / 3 + 1);
+        let split = "Split the data into smaller files and import each one separately.";
+        for (name, advice) in [
+            ("permits.csv", split),
+            ("imagery.tif", split),
+            ("permits.gpkg", split),
+            (
+                "permits.geojson",
+                "Split it into smaller files, or convert vector data to FlatGeobuf or GeoPackage and open it on the desktop.",
+            ),
+        ] {
+            let error = add_bytes::<LIMIT>(&mut session, &json!({"fileName": name, "data": &data})).unwrap_err();
+            assert_eq!(error, format!("{name} is too large to open (limit 1 MiB). {advice}"));
+        }
+        assert!(session.map().layers.is_empty());
+    }
+
+    /// Rasters that leave out the same thing are said together; when their numbers differ, each
+    /// is said with its own (a few) or the range is said for each of them (many), never a sum.
+    #[test]
+    fn losses_are_said_by_kind_and_per_raster_when_they_differ() {
+        let said = |losses: &[(&str, &str)]| {
+            let mut s = Session::new(crate::Project::default());
+            let mark = s.notice_mark();
+            say_losses(&mut s, losses.iter().map(|(n, l)| (n.to_string(), l.to_string())).collect());
+            s.notices_since(mark).iter().map(|n| n.text.clone()).collect::<Vec<_>>()
+        };
+        let cut = |n: u32| format!("{n} band or class name(s) cut to 256 characters");
+        let (one, two, three) = (cut(1), cut(2), cut(3));
+        assert_eq!(said(&[("a", &two), ("b", &two)]), [format!("2 rasters (a, b): {two}")]);
+        assert_eq!(said(&[("a", &one), ("b", &three)]), [format!("a: {one}"), format!("b: {three}")]);
+        assert_eq!(
+            said(&[("a", &one), ("b", &three), ("c", &two), ("d", &one)]),
+            ["4 rasters (a, b, c, …), each: 1–3 band or class name(s) cut to 256 characters"]
+        );
+    }
 }

@@ -476,7 +476,7 @@ fn auth(app: &mut RustGisApp, ui: &mut egui::Ui, w: f32) {
 
 /// Reads the token remembered on this computer, once, off the frame: the system may ask for its
 /// store to be unlocked.
-fn restore(app: &mut RustGisApp, ctx: &egui::Context) {
+pub(crate) fn restore(app: &mut RustGisApp, ctx: &egui::Context) {
     if app.ui.earthaccess.restoring || app.services.secrets.is_none() {
         return;
     }
@@ -486,6 +486,8 @@ fn restore(app: &mut RustGisApp, ctx: &egui::Context) {
         let ctx = ctx.clone();
         let read = std::thread::Builder::new().name("earthdata-token".into()).spawn(move || {
             earthdata::restore();
+            // The Copernicus Data Space sign-in remembered in the same store signs in too.
+            rustgis_engine::render::rustgis_tiles::copernicus::restore();
             ctx.request_repaint();
         });
         if read.is_err() {
@@ -657,6 +659,32 @@ fn granules(app: &mut RustGisApp, ui: &mut egui::Ui, t: &crate::theme::Tokens, w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first frame reads the remembered token, only where there is a credential store.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn the_first_frame_reads_the_remembered_token() {
+        use rustgis_engine::data::secrets::{MemorySecrets, Secret, SecretStore};
+        // The token and its store are process-wide: this scenario runs alone.
+        if crate::isolate_account_test("earthaccessui::tests::the_first_frame_reads_the_remembered_token") {
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut none = RustGisApp::with_sample();
+        none.logic(&ctx);
+        assert!(!none.ui.earthaccess.restoring && !earthdata::has_token(), "no store, nothing read");
+        let store = std::sync::Arc::new(MemorySecrets::new());
+        store.save(earthdata::ACCOUNT, &Secret::new("synthetic-remembered")).unwrap();
+        let mut app = RustGisApp::with_sample().with_services(crate::Services { secrets: Some(store), ..Default::default() });
+        app.logic(&ctx);
+        assert!(app.ui.earthaccess.restoring, "the first frame starts the read");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !earthdata::has_token() {
+            assert!(std::time::Instant::now() < deadline, "the token was never read");
+            std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: legacy polling for the remembered token read
+        }
+        earthdata::set_secret_store(None);
+    }
 
     #[test]
     fn bounds_and_names() {

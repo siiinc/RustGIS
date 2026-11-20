@@ -185,10 +185,158 @@ pub struct Terrain {
     pub source: TerrainSource,
     #[serde(default = "one")]
     pub exaggeration: f64,
+    /// A block diagram (#1914): the ground cut to a box, its sides walls down to a base. None
+    /// drapes the map as far as the view reaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<TerrainBlock>,
+    /// Water bodies drawn flat at their level (#1915). None: the ground's heights everywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub water: Option<TerrainWater>,
 }
 
 fn one() -> f64 {
     1.0
+}
+
+/// The colour of a block diagram's walls when none is given: a sandy brown.
+pub const BLOCK_WALLS: crate::color::Rgba = crate::color::Rgba::rgb(0xC8, 0xB8, 0x9A);
+
+fn block_walls() -> crate::color::Rgba {
+    BLOCK_WALLS
+}
+
+/// A block diagram cut from a map's terrain (#1914): only the ground inside the box is drawn, and
+/// its sides facing the eye are walls from the ground's profile down to a flat base.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TerrainBlock {
+    /// The box, `[xmin, ymin, xmax, ymax]` in the map's units (Web Mercator metres: terrain
+    /// shows on a Web Mercator map only). None: the terrain layer's extent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent: Option<[f64; 4]>,
+    /// Metres from the lowest ground in the box down to the base, before exaggeration. None:
+    /// half the box's relief, at least [`BLOCK_MIN_DEPTH`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<f64>,
+    /// The walls' colour, and where [`TerrainBlock::walls_layer`] has no polygon.
+    #[serde(default = "block_walls")]
+    pub walls: crate::color::Rgba,
+    /// A polygon layer, by name (as the terrain's DEM), that colours the walls: along each wall,
+    /// the colour the layer's symbology gives the polygon under the box's edge, its contacts
+    /// straight down (schematic: no dip or thickness). None: the walls are `walls` all along.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walls_layer: Option<String>,
+    /// The outline the ground is cut to inside the box (#2318).
+    #[serde(default, skip_serializing_if = "BlockShape::is_box")]
+    pub shape: BlockShape,
+}
+
+/// The outline a block diagram's ground is cut to (#2318).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockShape {
+    /// The box itself.
+    #[default]
+    Box,
+    /// The largest circle inside the box, centred in it, or one of `radius` (map units) when
+    /// that is smaller.
+    Circle {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        radius: Option<f64>,
+    },
+}
+
+impl BlockShape {
+    pub fn is_box(&self) -> bool {
+        *self == BlockShape::Box
+    }
+}
+
+/// The least depth (metres, before exaggeration) of a block diagram's base below its lowest
+/// ground when no depth is given.
+pub const BLOCK_MIN_DEPTH: f64 = 100.0;
+
+/// The shortest side of a block diagram's box (Web Mercator metres): shorter, it was most likely
+/// given in degrees.
+pub const BLOCK_MIN_SIDE: f64 = 10.0;
+
+/// The deepest a block diagram's base lies below its lowest ground (metres, before exaggeration).
+pub const BLOCK_MAX_DEPTH: f64 = 20_000.0;
+
+impl TerrainBlock {
+    /// Why this block can't be drawn, when it can't: its box (ordered, within the Web Mercator
+    /// world, at least [`BLOCK_MIN_SIDE`] a side and not in degrees), its depth (0 to
+    /// [`BLOCK_MAX_DEPTH`]), a circle's radius (at least half that side) and opaque walls.
+    /// Checked where a block is set and where a project is read, so a saved block that fails it
+    /// is never drawn.
+    pub fn check(&self) -> Result<(), String> {
+        if let Some([x0, y0, x1, y1]) = self.extent {
+            if !([x0, y0, x1, y1].iter().all(|v| v.is_finite()) && x0 < x1 && y0 < y1) {
+                return Err("block's extent is [xmin, ymin, xmax, ymax], numbers with xmin < xmax and ymin < ymax".into());
+            }
+            let world = rustgis_geom::MERCATOR_R * std::f64::consts::PI;
+            if [x0, y0, x1, y1].iter().any(|v| v.abs() > world) {
+                return Err(format!("block's extent is in Web Mercator metres, within ±{world:.0}"));
+            }
+            // Degrees given for metres make a box a fraction of a metre wide, or one within ±180 by
+            // ±90 of (0, 0): a block under 360 m by 180 m in the Gulf of Guinea, never the one meant.
+            let degrees = x0 >= -180.0 && x1 <= 180.0 && y0 >= -90.0 && y1 <= 90.0;
+            if degrees || x1 - x0 < BLOCK_MIN_SIDE || y1 - y0 < BLOCK_MIN_SIDE {
+                return Err(format!(
+                    "block's extent is in Web Mercator metres, at least {BLOCK_MIN_SIDE} a side (longitude and latitude in degrees need converting)"
+                ));
+            }
+        }
+        if let Some(d) = self.depth
+            && !(d.is_finite() && (0.0..=BLOCK_MAX_DEPTH).contains(&d))
+        {
+            return Err(format!("block's depth is metres, 0 to {BLOCK_MAX_DEPTH:.0}"));
+        }
+        if let BlockShape::Circle { radius: Some(r) } = self.shape
+            && !(r.is_finite() && r >= BLOCK_MIN_SIDE / 2.0)
+        {
+            return Err(format!("block's radius is in Web Mercator metres, at least {}", BLOCK_MIN_SIDE / 2.0));
+        }
+        if self.walls.a() != 255 {
+            return Err("block's walls is an opaque colour, #RRGGBB".into());
+        }
+        Ok(())
+    }
+}
+
+/// A terrain's water (#1915): inside each polygon of a layer the ground is flat, at the lowest
+/// height along the polygon's shore or at the value of a field, instead of the DEM's heights
+/// (a surface model is often noisy or stepped over water).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TerrainWater {
+    /// The polygon layer of water bodies, by name (as the terrain's DEM).
+    pub layer: String,
+    /// A numeric field holding each water body's level (metres); a row without one takes its
+    /// shore's lowest height. None: every water body's shore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// How brightly a tilted view's water shines where it would reflect the sun toward the eye,
+    /// 0 (none) to 1 (white at the brightest point).
+    #[serde(default = "water_glint")]
+    pub glint: f64,
+    /// How dark the band along the water's shore is at the outline, 0 (none) to 1 (black),
+    /// fading to nothing a few pixels inside it.
+    #[serde(default = "water_shore")]
+    pub shore: f64,
+}
+
+/// A terrain's water's sun glint when none is given (#1915): broad and faint.
+pub const WATER_GLINT: f64 = 0.3;
+
+fn water_glint() -> f64 {
+    WATER_GLINT
+}
+
+/// A terrain's water's shore band when none is given (#1915): a soft darkening, as relief
+/// artists draw the edge of a lake.
+pub const WATER_SHORE: f64 = 0.35;
+
+fn water_shore() -> f64 {
+    WATER_SHORE
 }
 
 /// The most a terrain's heights are exaggerated.

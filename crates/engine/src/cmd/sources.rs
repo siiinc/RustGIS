@@ -10,14 +10,14 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("sources.list", "List Data Sources", "Home › Add › Data Sources", list).view(),
-        C::new("sources.save", "Save Data Source", "Home › Add › Data Sources", |s, p| keep(s, p, "saved")).view().params(
+        C::new("sources.list", "List Data Sources", "Home › Add › Data Sources", list).roles(&[]).effects(crate::policy::Effects::NONE).view(),
+        C::new("sources.save", "Save Data Source", "Home › Add › Data Sources", |s, p| keep(s, p, "saved")).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"kind": "service"|"database"|"stac"|"file"|"url"|"tiles"|"zarr"|"s3", "address": "its path, web address or connection (never with a password)", "name"?: text, "extra"?: {"type"?: service type, "layer"?: text}}"#,
         ),
-        C::new("sources.favourite", "Favourite Data Source", "Home › Add › Data Sources", favourite)
+        C::new("sources.favourite", "Favourite Data Source", "Home › Add › Data Sources", favourite).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"kind": as sources.save, "address": text, "name"?: text, "extra"?: object, "on"?: bool (false: no longer a favourite)}"#),
-        C::new("sources.remove", "Remove Data Source", "Home › Add › Data Sources", remove)
+        C::new("sources.remove", "Remove Data Source", "Home › Add › Data Sources", remove).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"list": "saved"|"favourites"|"recent", "kind": text, "address": text}"#),
     ]
@@ -68,7 +68,12 @@ fn source(p: &Value) -> Result<Source, String> {
 
 fn keep(s: &mut Session, p: &Value, list: &str) -> CmdResult {
     let src = source(p)?;
+    let before = s.sources.secrets_left_out();
     let kept = s.sources.keep(list, src)?;
+    let left_out = s.sources.secrets_left_out().saturating_sub(before);
+    if left_out > 0 {
+        s.notify(crate::sources::secrets_notice(left_out), false);
+    }
     Ok(shown(&kept))
 }
 
