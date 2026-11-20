@@ -687,6 +687,7 @@ fn web_data_menu(ui: &mut Ui, app: &mut RustGisApp) {
     menu_item(ui, app, "", "Source Cooperative…", "ui.dialog", pane("sourcecoop"));
     menu_item(ui, app, "", "STAC Search…", "ui.stac", Value::Null);
     menu_item(ui, app, "", "Vantor…", "ui.stac.vantor", Value::Null);
+    menu_item(ui, app, "", "Vantor Transform…", "ui.dialog", pane("vantorTransform"));
     ui.separator();
     submenu_row(ui, "", tl!("France"), |ui| {
         menu_item(ui, app, "", "IGN LiDAR HD…", "ui.searchOpenData", svc("ign-lidar"));

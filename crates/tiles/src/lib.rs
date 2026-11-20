@@ -44,6 +44,7 @@ pub mod style;
 pub mod symbols;
 pub mod template;
 pub mod usgis;
+pub mod vantor;
 pub mod vector_export;
 pub mod warp;
 
