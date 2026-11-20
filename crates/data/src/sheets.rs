@@ -5,10 +5,13 @@
 
 use std::io::Cursor;
 
-use calamine::{Data, ExcelDateTime, ExcelDateTimeType, Reader, Sheets, open_workbook_auto_from_rs};
+use calamine::{Data, ExcelDateTime, ExcelDateTimeType, Reader, Sheets, Xls, open_workbook_auto_from_rs, open_workbook_from_rs};
 
 use crate::io::{Columns, CsvOptions, columns_of, read_rows};
-use crate::{DataError, Dataset, ReadReport, Result};
+use crate::{DataError, Dataset, Field, FieldType, ReadReport, Result};
+
+mod biff;
+mod ods;
 
 /// Spreadsheet file types.
 pub const EXTENSIONS: &[&str] = &["xlsx", "xlsm", "xlsb", "xls", "ods"];
@@ -25,9 +28,21 @@ pub fn is_sheet_name(name: &str) -> bool {
 
 /// The sheets of a workbook, in order.
 pub fn sheet_names(bytes: &[u8]) -> Result<Vec<String>> {
-    check_expansion(bytes)?;
-    let wb = open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| DataError::Format(format!("spreadsheet: {e}")))?;
-    Ok(wb.sheet_names())
+    let zip_checked = check_expansion(bytes)?;
+    check_compound(bytes)?;
+    guarded(|| {
+        let wb = open_checked(bytes, zip_checked)?;
+        Ok(wb.sheet_names())
+    })
+}
+
+/// Runs calamine on a workbook, turning a panic into an error. calamine indexes some of a file's
+/// tables without checking them (an `.xls` sector chain that points past its allocation table
+/// panics, even in 0.38), so a damaged file is refused rather than taking the app down. In the
+/// browser, where a panic can't be caught, this guards nothing.
+fn guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(DataError::Format("spreadsheet: the file is damaged and can't be read".into())))
 }
 
 /// Reads one sheet of a workbook (`sheet` by name, without regard to case; the first when `None`),
@@ -36,7 +51,15 @@ pub fn sheet_names(bytes: &[u8]) -> Result<Vec<String>> {
 pub fn read(bytes: &[u8], name: &str, sheet: Option<&str>, opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
     let g = grid(bytes, sheet)?;
     let title = if g.names.len() > 1 { format!("{name} {}", g.pick) } else { name.to_string() };
-    let (ds, mut report) = read_rows(&g.headers, &g.rows, 0, &title, opts)?;
+    let (ds, mut report) = read_rows(&g.headers, &g.rows, 0, &title, opts, Some((&g.dates, &g.phantom_dates)))?;
+    let rounded: usize = g.rounded_dates.iter().sum();
+    if rounded > 0 {
+        let fields: Vec<Field> = g.headers.iter().map(|h| Field::new(h, FieldType::Text)).collect();
+        report.messages.push(format!(
+            "{rounded} serial date values were rounded to the nearest microsecond, in {}",
+            crate::io::named_fields(&fields, &g.rounded_dates)
+        ));
+    }
     let others: Vec<&str> = g.names.iter().filter(|n| **n != g.pick).map(String::as_str).take(20).collect();
     if !others.is_empty() {
         report.messages.push(format!("the workbook has more sheets ({}): add one with \"layer\"", others.join(", ")));
@@ -45,10 +68,10 @@ pub fn read(bytes: &[u8], name: &str, sheet: Option<&str>, opts: &CsvOptions) ->
 }
 
 /// The columns of one sheet of a workbook (`sheet` as [`read`] takes it), and those its geometry
-/// is read from when none are given.
-pub fn columns(bytes: &[u8], sheet: Option<&str>) -> Result<Columns> {
+/// is read from when none are given, respecting the supplied coordinate system.
+pub fn columns(bytes: &[u8], sheet: Option<&str>, crs: Option<crate::raster::Crs>) -> Result<Columns> {
     let g = grid(bytes, sheet)?;
-    Ok(columns_of(&g.headers, &g.rows))
+    columns_of(&g.headers, &g.rows, crs)
 }
 
 /// A sheet as text: the workbook's sheets, the one picked, its column names and its rows.
@@ -57,11 +80,31 @@ struct Grid {
     pick: String,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
+    dates: Vec<Option<FieldType>>,
+    rounded_dates: Vec<usize>,
+    /// Per column that isn't one of dates, the serial-60 cells read as empty.
+    phantom_dates: Vec<usize>,
 }
 
 fn grid(bytes: &[u8], sheet: Option<&str>) -> Result<Grid> {
-    check_expansion(bytes)?;
-    let mut wb = open_workbook_auto_from_rs(Cursor::new(bytes)).map_err(|e| DataError::Format(format!("spreadsheet: {e}")))?;
+    let zip_checked = check_expansion(bytes)?;
+    check_compound(bytes)?;
+    guarded(|| grid_unguarded(open_checked(bytes, zip_checked)?, sheet))
+}
+
+fn open_checked(bytes: &[u8], zip_checked: bool) -> Result<Sheets<Cursor<&[u8]>>> {
+    let reader = Cursor::new(bytes);
+    if zip_checked {
+        open_workbook_auto_from_rs(reader).map_err(|e| DataError::Format(format!("spreadsheet: {e}")))
+    } else {
+        // Embedded ZIP signatures may occur in XLS data. If ZIP preflight did not pass,
+        // never let format detection retry the same bytes as a ZIP-based workbook.
+        open_workbook_from_rs::<Xls<_>, _>(reader).map(Sheets::Xls).map_err(|e| DataError::Format(format!("spreadsheet: {e}")))
+    }
+}
+
+/// Reads a bounded workbook grid, retaining date types from cells rather than guessing ISO text.
+fn grid_unguarded(mut wb: Sheets<Cursor<&[u8]>>, sheet: Option<&str>) -> Result<Grid> {
     let names = wb.sheet_names();
     let pick = match sheet.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => names
@@ -77,7 +120,73 @@ fn grid(bytes: &[u8], sheet: Option<&str>) -> Result<Grid> {
     if h.saturating_mul(w) > MAX_CELLS {
         return Err(DataError::Format(format!("sheet '{pick}' is too large ({h} × {w} cells)")));
     }
-    let mut rows = range.rows().map(|r| r.iter().map(cell).collect::<Vec<String>>());
+    let header_at = range.rows().position(|r| r.iter().any(|c| !cell(c).trim().is_empty())).unwrap_or(0);
+    let mut rounded_dates = vec![0usize; w];
+    for row in range.rows().skip(header_at + 1) {
+        crate::progress::check()?;
+        for (k, d) in row.iter().enumerate() {
+            if let Data::DateTime(dt) = d {
+                let serial = dt.as_f64() + if is_1904(dt) { DAYS_1900_TO_1904 } else { 0.0 };
+                let adjusted = serial + if (1.0..60.0).contains(&serial) { 1.0 } else { 0.0 };
+                if !dt.is_duration()
+                    && serial >= 0.0
+                    && serial.floor() != 60.0
+                    && crate::date::serial_datetime(adjusted, -25_569).is_some_and(|(_, rounded)| rounded)
+                    && let Some(n) = rounded_dates.get_mut(k)
+                {
+                    *n += 1;
+                }
+            }
+        }
+    }
+    let dates = (0..w)
+        .map(|i| {
+            let mut ty = Some(FieldType::Date);
+            let mut seen = false;
+            for row in range.rows().skip(header_at + 1) {
+                crate::progress::check()?;
+                let Some(d) = row.get(i) else { continue };
+                let text = cell(d);
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let temporal = matches!(d, Data::DateTime(t) if !t.is_duration()) || matches!(d, Data::DateTimeIso(_));
+                if !temporal {
+                    ty = None;
+                    break;
+                }
+                // A time without a day is kept as text. Invalid dates in an otherwise typed
+                // column become null and are counted after the rows are read.
+                if text.contains(':') && !text.contains(['T', 't']) {
+                    ty = None;
+                    break;
+                }
+                seen = true;
+                if text.contains(['T', 't']) {
+                    ty = Some(FieldType::DateTime);
+                }
+            }
+            Ok(if seen { ty } else { None })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Serial 60 is the 1900 system's 1900-02-29, a day that never was. A column of dates reads it
+    // as one that isn't a date (null, and counted); in a column of other things it is read as
+    // empty and counted here, as it would not be text of a day.
+    let mut phantom_dates = vec![0usize; w];
+    let mut rows = range.rows().map(|r| {
+        r.iter()
+            .enumerate()
+            .map(|(k, d)| match (d, dates.get(k)) {
+                (Data::DateTime(t), Some(None)) if is_phantom_day(t) => {
+                    if let Some(n) = phantom_dates.get_mut(k) {
+                        *n += 1;
+                    }
+                    String::new()
+                }
+                _ => cell(d),
+            })
+            .collect::<Vec<String>>()
+    });
     // The first row with anything in it names the columns.
     let headers: Vec<String> = rows.by_ref().find(|r| r.iter().any(|c| !c.trim().is_empty())).unwrap_or_default();
     if headers.is_empty() {
@@ -92,25 +201,244 @@ fn grid(bytes: &[u8], sheet: Option<&str>) -> Result<Grid> {
         .map(|(i, h)| if h.trim().is_empty() { column_letter(first_col + i) } else { h.trim().to_string() })
         .collect();
     let rows: Vec<Vec<String>> = rows.filter(|r| r.iter().any(|c| !c.trim().is_empty())).collect();
-    Ok(Grid { names, pick, headers, rows })
+    Ok(Grid { names, pick, headers, rows, dates, rounded_dates, phantom_dates })
 }
 
-/// A zipped workbook (`.xlsx`, `.ods`) that would inflate past [`crate::zip::MAX_TOTAL`] is
-/// refused before it is read: the archive's own reader inflates each part within that budget,
-/// checking its size and checksum against what the archive says (calamine trusts the headers).
-fn check_expansion(bytes: &[u8]) -> Result<()> {
-    if !bytes.starts_with(b"PK\x03\x04") {
+/// Check every ZIP member before calamine opens it, without suffix or case filters. ODS
+/// eagerly materializes every sheet in its constructor, even for a names-only read. Cancel is
+/// looked at between members; inflating one member isn't interrupted. `false` permits only XLS.
+fn check_expansion(bytes: &[u8]) -> Result<bool> {
+    use crate::zip::Failure;
+    if !bytes.windows(4).any(|b| b == b"PK\x03\x04") {
+        return Ok(false);
+    }
+    let entries = match crate::zip::read_all_within(bytes, crate::zip::MAX_TOTAL) {
+        Ok(entries) => entries,
+        Err(Failure::Cancelled) => return Err(DataError::Cancelled),
+        // An .xls can hold these signatures in its data (an embedded workbook, a stray run of
+        // bytes): check_compound judges it. A member of an archive that does read is refused
+        // whatever precedes it.
+        Err(Failure::Layout(_)) if bytes.starts_with(COMPOUND) => return Ok(false),
+        Err(Failure::Layout(m) | Failure::Member(m)) => return Err(DataError::Format(format!("spreadsheet: {m}"))),
+    };
+    let is_ods = entries
+        .iter()
+        .any(|(name, data)| name.eq_ignore_ascii_case("mimetype") && data.starts_with(b"application/vnd.oasis.opendocument.spreadsheet"));
+    for (name, data) in entries {
+        crate::progress::check()?;
+        if is_ods && name.eq_ignore_ascii_case("content.xml") {
+            ods::check(&data, MAX_CELLS, crate::zip::MAX_TOTAL)?;
+        }
+    }
+    Ok(true)
+}
+
+/// The signature of a compound file (`.xls`).
+const COMPOUND: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1";
+/// Sector ids from here up are markers, not sectors.
+const RESERVED_SECTORS: u32 = 0xFFFF_FFFA;
+const DIFAT_SECTOR: u32 = 0xFFFF_FFFC;
+const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
+
+/// Refuses a compound file (`.xls`) whose sector tables calamine can't walk safely. calamine
+/// follows each chain of sectors through an allocation table without checking it: a chain that
+/// loops runs forever, growing memory as it goes, and one that reaches past its table or its data
+/// panics (still so in calamine 0.38). The tables are rebuilt here as calamine builds them (the
+/// FAT, the directory, the mini FAT), and each chain calamine reads (the directory, the mini FAT,
+/// the mini stream and the streams it opens) is replayed as it reads it, to the length it reads.
+/// Other chains, and unused entries with junk in them, are never followed and aren't checked.
+/// Other files pass unchecked.
+fn check_compound(bytes: &[u8]) -> Result<()> {
+    if !bytes.starts_with(COMPOUND) {
         return Ok(());
     }
-    crate::zip::read_matching_within(bytes, |n| n.ends_with(".xml") || n.ends_with(".bin"), crate::zip::MAX_TOTAL)
-        .map(|_| ())
-        .map_err(|e| DataError::Format(format!("spreadsheet: {e}")))
+    let u16_at = |at: usize| bytes.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |at: usize| bytes.get(at..at + 4).map_or(END_OF_CHAIN, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let size: usize = match u16_at(30) {
+        0x09 => 512,
+        0x0C => 4096,
+        // calamine refuses the rest itself.
+        _ => return Ok(()),
+    };
+    // The sectors follow the header, which takes one sector; calamine reads a sector cut short by
+    // the end of the file as far as it goes.
+    let body = bytes.get(size..).unwrap_or(&[]);
+    let sector = |id: u32| -> &[u8] {
+        let start = (id as usize).saturating_mul(size);
+        body.get(start..start.saturating_add(size).min(body.len())).unwrap_or(&[])
+    };
+    let max_sector = body.len() / size;
+    // The FAT's sectors: 109 listed in the header, more in a chain of DIFAT sectors whose last
+    // entry links to the next (calamine takes the link off the end of the list it has gathered).
+    let mut difat = words(bytes.get(76..512).unwrap_or(&[]))?;
+    let mut next = u32_at(68);
+    let mut hops = 0usize;
+    while next < RESERVED_SECTORS {
+        hops += 1;
+        if hops > max_sector + 1 {
+            return damaged("its DIFAT chain loops");
+        }
+        let more = sector(next);
+        if more.is_empty() {
+            // calamine would take the last FAT sector gathered for the next link.
+            return damaged("a DIFAT sector is past the end of the file");
+        }
+        difat.extend(words(more)?);
+        next = difat.pop().unwrap_or(END_OF_CHAIN);
+    }
+    let fat_sectors: Vec<u32> = difat.into_iter().filter(|id| *id < DIFAT_SECTOR).collect();
+    // A file can't hold more FAT sectors than it has sectors.
+    if fat_sectors.len() > max_sector + 1 {
+        return damaged("its allocation table is larger than the file");
+    }
+    let mut fat = Vec::new();
+    for id in fat_sectors {
+        // A FAT sector bypasses Sectors::read. calamine slices from this start even when
+        // EOF was reached before it, and panics instead of returning an error.
+        if (id as usize).saturating_mul(size) > body.len() {
+            return damaged("a FAT sector is past the end of the file");
+        }
+        fat.extend(words(sector(id))?);
+    }
+    let main = Sectors { table: &fat, data_len: body.len(), size };
+    // The directory, one 128-byte entry per stream; its chain starts in the header, and calamine
+    // reads it to its end.
+    let dir: Vec<u8> = main.read(u32_at(48), usize::MAX)?.into_iter().flat_map(sector).copied().collect();
+    let (entries, _) = dir.as_chunks::<128>();
+    // Each stream's length: four bytes with 512-byte sectors, eight with 4096-byte ones, which
+    // calamine expects to fit a `usize` (it panics in the browser on one past 4 GiB).
+    let mut streams = Vec::new();
+    for e in entries {
+        let at = |i: usize| e.get(i..i + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let len = if size == 512 { u64::from(at(120)) } else { u64::from(at(120)) | (u64::from(at(124)) << 32) };
+        let Ok(len) = usize::try_from(len) else {
+            return damaged("a stream is longer than this system can address");
+        };
+        // The name as calamine reads it: decoded as UTF-16 (a byte-order mark is dropped, or
+        // switches it to big-endian), up to the first NUL.
+        let mut name = encoding_rs::UTF_16LE.decode(e.get(..64).unwrap_or(&[])).0.into_owned();
+        if let Some(nul) = name.find('\0') {
+            name.truncate(nul);
+        }
+        streams.push((name, at(116), len));
+    }
+    // Small streams sit in the mini stream (the root entry's chain), in 64-byte sectors laid out
+    // by the mini FAT. calamine reads both only when the header gives the mini FAT a length.
+    let mini_fat_len = u32_at(64) as usize;
+    let (mini_fat, mini_len, root_sectors) = if mini_fat_len > 0 {
+        let (root, root_len) = streams.first().map_or((END_OF_CHAIN, 0), |(_, s, l)| (*s, *l));
+        let root_sectors = main.read(root, root_len)?;
+        let mini_len = root_sectors.iter().map(|id| sector(*id).len()).sum::<usize>().min(root_len);
+        let table_len = mini_fat_len.saturating_mul(size);
+        let mini_fat: Vec<u8> = main.read(u32_at(60), table_len)?.into_iter().flat_map(sector).copied().take(table_len).collect();
+        (words(&mini_fat)?, mini_len, root_sectors)
+    } else {
+        (Vec::new(), 0, Vec::new())
+    };
+    let mini = Sectors { table: &mini_fat, data_len: mini_len, size: 64 };
+    // calamine reads these streams, each the first entry by its name (without regard to case),
+    // through the mini FAT when it is shorter than 4096 bytes. Other entries, unused ones with
+    // junk in them among them, are never read.
+    let has_workbook = streams.iter().any(|(name, ..)| name.eq_ignore_ascii_case("Workbook"));
+    for want in ["Workbook", "Book", "\u{5}SummaryInformation", "\u{5}DocumentSummaryInformation"] {
+        if let Some((_, start, len)) = streams.iter().find(|(name, ..)| name.eq_ignore_ascii_case(want)) {
+            let ids = if *len < 4096 { mini.read(*start, *len)? } else { main.read(*start, *len)? };
+            if want == "Workbook" || (want == "Book" && !has_workbook) {
+                // Fixed, whatever the memory: spreadsheets keep their own limits.
+                if *len as u64 > crate::io::BYTES_FLOOR {
+                    return Err(DataError::Format(format!(
+                        "spreadsheet: the XLS Workbook stream is too large ({len} bytes; at most {} MiB)",
+                        crate::io::BYTES_FLOOR >> 20
+                    )));
+                }
+                // Read only the chosen stream. In the mini stream a 64-byte sector is a slice
+                // of the root's sector chain, which may itself be fragmented.
+                let workbook: Vec<u8> = if *len < 4096 {
+                    ids.iter()
+                        .flat_map(|id| {
+                            let from = (*id as usize).saturating_mul(64);
+                            root_sectors.get(from / size).map_or(&[][..], |root| {
+                                let data = sector(*root);
+                                let offset = from % size;
+                                data.get(offset..offset.saturating_add(64).min(data.len())).unwrap_or(&[])
+                            })
+                        })
+                        .copied()
+                        .take(*len)
+                        .collect()
+                } else {
+                    ids.iter().flat_map(|id| sector(*id)).copied().take(*len).collect()
+                };
+                biff::check(&workbook, MAX_CELLS)
+                    .map_err(|e| DataError::Format(format!("spreadsheet: the .xls file cannot be read safely ({e})")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sectors of `size` bytes over `data_len` bytes of data, chained by `table`.
+struct Sectors<'a> {
+    table: &'a [u32],
+    data_len: usize,
+    size: usize,
+}
+
+impl Sectors<'_> {
+    /// The sectors calamine reads for `len` bytes from `start`, replaying its walk: it reads a
+    /// sector, stops once it has `len` bytes, and only then looks up the next link, unchecked. A
+    /// sector must start within the data (calamine slices its buffer from the sector's start to
+    /// what it could read, which panics for one past the data unless an earlier read happened to
+    /// grow the buffer that far); a link must be in the table; and a chain can't read more sectors
+    /// than there are without looping.
+    fn read(&self, start: u32, len: usize) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        let (mut at, mut got) = (start, 0usize);
+        while at != END_OF_CHAIN {
+            let from = (at as usize).saturating_mul(self.size);
+            if from > self.data_len {
+                return damaged(if ids.is_empty() {
+                    "a chain of sectors starts past the end of its data"
+                } else {
+                    "a chain of sectors runs past the end of its data"
+                });
+            }
+            if ids.len() > self.data_len / self.size + 1 {
+                return damaged("a chain of sectors loops");
+            }
+            ids.push(at);
+            got = got.saturating_add(self.size.min(self.data_len - from));
+            if got >= len {
+                break;
+            }
+            let Some(next) = self.table.get(at as usize) else {
+                return damaged("a chain of sectors runs past its allocation table");
+            };
+            at = *next;
+        }
+        Ok(ids)
+    }
+}
+
+/// A sector's (or a table's) little-endian 32-bit words. calamine asserts that no partial
+/// word remains, so refuse a cut-short table before handing the file to it.
+fn words(b: &[u8]) -> Result<Vec<u32>> {
+    let (whole, tail) = b.as_chunks::<4>();
+    if !tail.is_empty() {
+        return damaged("an allocation table ends with a partial 32-bit word");
+    }
+    Ok(whole.iter().map(|w| u32::from_le_bytes(*w)).collect())
+}
+
+fn damaged<T>(what: &str) -> Result<T> {
+    Err(DataError::Format(format!("spreadsheet: the .xls file is damaged ({what})")))
 }
 
 /// Refuses a sheet whose cells span more than [`MAX_CELLS`] before calamine lays it out as a dense
 /// grid (one cell at `XFD1048576` would ask for 17 billion): an `.xlsx` or `.xlsb` sheet's cells
-/// are read one at a time for their extent first. An `.xls` sheet can't be larger than 65,536 ×
-/// 256 cells, and an `.ods` one is checked after reading.
+/// are read one at a time for their extent first. Every `.xls` sheet's BIFF records and cell
+/// spans are checked by [`check_compound`] before the workbook is opened; ODS repetition and
+/// extents are checked by [`check_expansion`] before its eagerly loaded sheets are allocated.
 fn check_size(wb: &mut Sheets<Cursor<&[u8]>>, sheet: &str) -> Result<()> {
     let mut b: Option<(u32, u32, u32, u32)> = None;
     let mut grow = |(r, c): (u32, u32)| -> Result<()> {
@@ -148,7 +476,7 @@ fn check_size(wb: &mut Sheets<Cursor<&[u8]>>, sheet: &str) -> Result<()> {
 }
 
 /// A cell as text: whole numbers without a decimal point, dates as ISO 8601, times of day as
-/// `HH:MM:SS` and durations as `[h]:MM:SS`.
+/// ISO clock text with fractional seconds and durations as `[h]:MM:SS`.
 fn cell(d: &Data) -> String {
     match d {
         Data::Empty | Data::Error(_) => String::new(),
@@ -161,6 +489,11 @@ fn cell(d: &Data) -> String {
         Data::DateTime(dt) => excel_date(dt.as_f64() + if is_1904(dt) { DAYS_1900_TO_1904 } else { 0.0 }, true),
         Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
     }
+}
+
+/// Whether a date cell is serial 60, the 1900 system's 1900-02-29.
+fn is_phantom_day(dt: &ExcelDateTime) -> bool {
+    !dt.is_duration() && (dt.as_f64() + if is_1904(dt) { DAYS_1900_TO_1904 } else { 0.0 }).floor() == 60.0
 }
 
 /// Days from the 1900 date system's day 0 to the 1904 one's (workbooks made on old Macs).
@@ -186,41 +519,24 @@ fn duration(days: f64) -> String {
 }
 
 /// An Excel serial date (days since 1899-12-30) as `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM:SS` when it
-/// has a time of day; a time alone (a serial below 1) as `HH:MM:SS`.
+/// has a time of day; a time alone (a serial below 1) keeps fractional seconds as ISO text.
 fn excel_date(serial: f64, with_time: bool) -> String {
     if !serial.is_finite() || !(0.0..3_000_000.0).contains(&serial) {
         return serial.to_string();
     }
     if serial < 1.0 && with_time {
-        let secs = ((serial * 86_400.0).round() as i64).min(86_399);
-        return format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+        return crate::date::serial_datetime(serial, 0)
+            .and_then(|(t, _)| t.to_string().split_once('T').map(|(_, clock)| clock.to_string()))
+            .unwrap_or_else(|| serial.to_string());
     }
-    let mut days = serial.floor() as i64;
-    let mut secs = ((serial - serial.floor()) * 86_400.0).round() as i64;
-    // A time that rounds up to midnight is the next day.
-    if secs >= 86_400 {
-        days += 1;
-        secs -= 86_400;
+    // Serial 60 is the workbook's fictitious 1900-02-29. Keep that invalid spelling so
+    // a typed read reports it instead of silently changing it to a real day.
+    if serial.floor() == 60.0 {
+        return "1900-02-29".into();
     }
-    // Excel counts a 29 February 1900 that never was: serials before it are a day early.
-    if days < 60 {
-        days += 1;
-    }
-    // Days from 1970-01-01, then the civil date (Howard Hinnant's algorithm).
-    let z = days - 25_569 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    if with_time && secs > 0 {
-        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
-    } else {
-        format!("{y:04}-{m:02}-{d:02}")
-    }
+    let adjusted = serial + if serial < 60.0 { 1.0 } else { 0.0 };
+    let Some((t, _)) = crate::date::serial_datetime(adjusted, -25_569) else { return serial.to_string() };
+    if !with_time || t.is_date() { t.date().to_string() } else { t.to_string() }
 }
 
 /// A column's letter name: A, B, …, Z, AA, AB…
@@ -297,6 +613,7 @@ pub fn xlsx(sheets: &[(&str, &[&[&str]])]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Value;
 
     #[test]
     fn dates_and_letters() {
@@ -305,8 +622,9 @@ mod tests {
         assert_eq!(excel_date(1.0, false), "1900-01-01");
         assert_eq!(excel_date(59.0, false), "1900-02-28");
         assert_eq!(excel_date(61.0, false), "1900-03-01");
-        assert_eq!(excel_date(45_000.999_999_9, true), "2023-03-16", "rounds up to the next midnight");
+        assert_eq!(excel_date(45_000.999_999_9, true), "2023-03-15T23:59:59.991360", "fractional seconds are kept");
         assert_eq!(excel_date(0.5, true), "12:00:00", "a time of day alone");
+        assert_eq!(excel_date(0.500_001, true), "12:00:00.086400", "clock fractions are kept");
         assert_eq!(excel_date(0.0, true), "00:00:00");
         assert_eq!(duration(1.5), "36:00:00");
         assert_eq!(duration(-0.25), "-6:00:00");
@@ -322,6 +640,111 @@ mod tests {
         assert_eq!(column_letter(26), "AA");
         assert_eq!(column_letter(701), "ZZ");
         assert!(is_sheet_name("a.XLSX") && is_sheet_name("b.ods") && !is_sheet_name("c.csv"));
+    }
+
+    #[test]
+    fn workbook_date_cells_are_typed_but_date_looking_text_is_not() {
+        let book = xlsx(&[(
+            "Dates",
+            &[
+                &["day", "moment", "text", "mixed"],
+                &[
+                    r#"<c t="d"><v>2024-02-29</v></c>"#,
+                    r#"<c t="d"><v>2026-03-05T14:30:00.123456+02:00</v></c>"#,
+                    "2024-02-29",
+                    r#"<c t="d"><v>2024-02-29</v></c>"#,
+                ],
+                &[r#"<c t="d"><v>2026-02-30</v></c>"#, "", "2026-03-05", "other"],
+            ],
+        )]);
+        let (ds, report) = read(&book, "dates", None, &CsvOptions::default()).unwrap();
+        assert_eq!(
+            ds.fields.iter().map(|f| f.ty).collect::<Vec<_>>(),
+            [FieldType::Date, FieldType::DateTime, FieldType::Text, FieldType::Text]
+        );
+        assert_eq!(ds.value(0, 0).to_string(), "2024-02-29");
+        assert_eq!(ds.value(0, 1).to_string(), "2026-03-05T14:30:00.123456+02:00");
+        assert!(ds.value(1, 0).is_null());
+        assert!(report.unread_dates.unwrap().starts_with("1 value"));
+        assert_eq!(ds.value(0, 3), &Value::Text("2024-02-29".into()));
+    }
+
+    /// Native numeric date styles reach the public reader's rounding notice, including
+    /// time-only text. Exact half days stay silent; non-dyadic serials report the field/count.
+    #[test]
+    fn workbook_serial_dates_report_rounding_and_keep_clock_fractions() {
+        for (serial, rounded) in [("45000.5", false), ("45000.1", true), ("0.5", false), ("0.500001", false), ("0.123456789", true)] {
+            let cell = format!(r#"<c s="0"><v>{serial}</v></c>"#);
+            let book = xlsx(&[("Dates", &[&["moment"], &[&cell]])]);
+            let mut entries = crate::zip::read(&book).unwrap();
+            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="22"/></cellXfs></styleSheet>"#.to_vec()));
+            let (ds, report) = read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap();
+            let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded to the nearest microsecond")).collect();
+            assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
+            if rounded {
+                assert!(notices[0].contains("1 serial date") && notices[0].contains("moment"));
+            }
+            if serial == "0.500001" {
+                assert_eq!(ds.fields[0].ty, FieldType::Text);
+                assert_eq!(ds.value(0, 0).to_string(), "12:00:00.086400");
+            }
+            if serial == "0.123456789" {
+                assert_eq!(ds.value(0, 0).to_string(), "02:57:46.666570");
+            }
+        }
+    }
+
+    /// Serial 60, Excel's 1900-02-29, is no day: in a column of dates it is empty and counted, and
+    /// so it is in a column of other things (not text of a day that never was). Other serials
+    /// there, and time-only cells, are as they were.
+    #[test]
+    fn the_phantom_leap_day_is_empty_and_counted_in_a_mixed_column() {
+        let book = |cells: [&str; 3]| {
+            let rows: Vec<String> =
+                cells.iter().map(|c| if *c == "x" { (*c).to_string() } else { format!(r#"<c s="0"><v>{c}</v></c>"#) }).collect();
+            let book = xlsx(&[("Dates", &[&["a"], &[&rows[0]], &[&rows[1]], &[&rows[2]]])]);
+            let mut entries = crate::zip::read(&book).unwrap();
+            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_vec()));
+            read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap()
+        };
+        // A column of dates: the cell is null and counted.
+        let (ds, report) = book(["45000", "60", "45002"]);
+        assert_eq!(ds.fields[0].ty, FieldType::Date);
+        assert!(ds.value(1, 0).is_null());
+        assert_eq!(report.unread_dates.as_deref(), Some("1 value isn't a date and was read as empty, in 'a'"));
+        // A mixed column (text among the dates) says the same, and keeps the rest as text.
+        let (ds, report) = book(["45000", "60", "x"]);
+        assert_eq!(ds.fields[0].ty, FieldType::Text);
+        // (A row left with nothing in it is skipped, as any empty row is.)
+        let seen: Vec<String> = (0..ds.features.len()).map(|r| ds.value(r, 0).to_string()).collect();
+        assert_eq!(seen, ["2023-03-15", "x"], "{seen:?}");
+        assert_eq!(report.unread_dates.as_deref(), Some("1 value isn't a date and was read as empty, in 'a'"));
+        // Without it, nothing is said.
+        let (_, report) = book(["45000", "61", "x"]);
+        assert_eq!(report.unread_dates, None);
+    }
+
+    /// Serial 60 in the WKT column: the cell is empty, so its row has no geometry, and that is said;
+    /// a WKT column without one says nothing of it.
+    #[test]
+    fn the_phantom_leap_day_in_a_wkt_column_is_said() {
+        let book = |second: &str| {
+            let book = xlsx(&[("Places", &[&["name", "wkt"], &["a", "POINT (1 2)"], &["b", second]])]);
+            let mut entries = crate::zip::read(&book).unwrap();
+            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_vec()));
+            let opts = CsvOptions { wkt: Some("wkt".into()), ..CsvOptions::default() };
+            read(&crate::zip::write(&entries).unwrap(), "places", None, &opts).unwrap()
+        };
+        let (ds, report) = book(r#"<c s="0"><v>60</v></c>"#);
+        assert_eq!(ds.features.len(), 2);
+        assert_eq!(ds.features.iter().filter(|f| f.geometry.is_none()).count(), 1);
+        assert!(
+            report.messages.contains(&"1 value in 'wkt' isn't a date and was read as empty, so its row has no geometry".to_string()),
+            "{:?}",
+            report.messages
+        );
+        let (_, report) = book("POINT (3 4)");
+        assert!(!report.messages.iter().any(|m| m.contains("isn't a date")), "{:?}", report.messages);
     }
 
     #[test]
@@ -356,15 +779,31 @@ mod tests {
         assert_eq!(ds.fields[1].name, "B", "a column without a heading is named by its letter");
         assert!(read(&book, "book", Some("Missing"), &CsvOptions::default()).is_err());
         // The columns Add Delimited Text offers, found as the sheet is read.
-        let c = columns(&book, None).unwrap();
+        let c = columns(&book, None, None).unwrap();
         assert_eq!(c.names, ["name", "lon", "lat", "pop"]);
         assert_eq!((c.x.as_deref(), c.y.as_deref(), c.delimiter), (Some("lon"), Some("lat"), None));
-        let c = columns(&book, Some("utm")).unwrap();
+        let c = columns(&book, Some("utm"), None).unwrap();
         assert_eq!((c.x.as_deref(), c.y.as_deref()), (Some("easting"), Some("northing")));
-        assert_eq!(columns(&book, Some("Notes")).unwrap().names, ["text", "B"]);
+        assert_eq!(columns(&book, Some("Notes"), None).unwrap().names, ["text", "B"]);
         for cut in (0..book.len()).step_by(61) {
             let _ = read(&book[..cut], "t", None, &CsvOptions::default());
-            let _ = columns(&book[..cut], None);
+            let _ = columns(&book[..cut], None, None);
+        }
+    }
+
+    /// Spreadsheet defaults respect a projected CRS just as the delimited reader does.
+    #[test]
+    fn coordinate_columns_follow_crs() {
+        use crate::raster::Crs;
+        let book = xlsx(&[("Mixed", &[&["X", "Y", "Longitude", "Latitude"], &["1000", "2000", "3", "4"]])]);
+        for (crs, expected) in [
+            (None, ("Longitude", "Latitude")),
+            (Some(Crs::LonLat), ("Longitude", "Latitude")),
+            (Some(Crs::parse("+proj=latlong +datum=WGS84 +no_defs").unwrap()), ("Longitude", "Latitude")),
+            (Some(Crs::parse("EPSG:2263").unwrap()), ("X", "Y")),
+        ] {
+            let c = columns(&book, None, crs).unwrap();
+            assert_eq!((c.x.as_deref(), c.y.as_deref()), (Some(expected.0), Some(expected.1)));
         }
     }
 
@@ -376,6 +815,653 @@ mod tests {
         let far = xlsx(&[("Far", &[&[r#"<c r="A1"><v>1</v></c>"#], &[r#"<c r="XFD1048576"><v>2</v></c>"#]])]);
         let e = read(&far, "t", None, &CsvOptions::default()).unwrap_err().to_string();
         assert!(e.contains("too large") && e.contains("XFD"), "{e}");
+    }
+    /// Minimal ODS content in a real container, for all three public entry points.
+    fn ods(tables: &str) -> Vec<u8> {
+        crate::zip::write(&[
+            ("mimetype".into(), b"application/vnd.oasis.opendocument.spreadsheet".to_vec()),
+            ("META-INF/manifest.xml".into(), br#"<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"/>"#.to_vec()),
+            ("content.xml".into(), format!(
+                r#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:spreadsheet>{tables}</office:spreadsheet></office:body></office:document-content>"#
+            ).into_bytes()),
+        ]).unwrap()
+    }
+
+    fn prefixed(mut book: Vec<u8>, adjust_offsets: bool) -> Vec<u8> {
+        let prefix = b"harmless workbook preamble\n";
+        if adjust_offsets {
+            let eocd = book.len() - 22;
+            let mut p = u32::from_le_bytes(book[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+            book[eocd + 16..eocd + 20].copy_from_slice(&((p + prefix.len()) as u32).to_le_bytes());
+            while p < eocd {
+                let local = u32::from_le_bytes(book[p + 42..p + 46].try_into().unwrap()) as usize;
+                book[p + 42..p + 46].copy_from_slice(&((local + prefix.len()) as u32).to_le_bytes());
+                let size = |at| u16::from_le_bytes([book[at], book[at + 1]]) as usize;
+                p += 46 + size(p + 28) + size(p + 30) + size(p + 32);
+            }
+        }
+        [prefix.as_slice(), &book].concat()
+    }
+
+    #[test]
+    fn zip_directory_trailer_does_not_shift_member_offsets() {
+        let book = xlsx(&[("S", &[&["name"], &["city"]])]);
+        for mut book in [book.clone(), prefixed(book.clone(), false), prefixed(book, true)] {
+            let end = book.len() - 22;
+            // APPNOTE central-directory digital signature, outside the recorded CD size.
+            book.splice(end..end, *b"PK\x05\x05\x03\x00sig");
+            assert_eq!(sheet_names(&book).unwrap(), ["S"]);
+            assert_eq!(columns(&book, None, None).unwrap().names, ["name"]);
+            let (ds, report) = read(&book, "book", None, &CsvOptions::default()).unwrap();
+            assert_eq!(ds.value(0, 0), &Value::Text("city".into()));
+            assert!(report.messages.is_empty());
+        }
+    }
+
+    fn refused_before_calamine(book: &[u8], expected: &str) {
+        // If the cheap preflight regresses, never run a hostile allocation.
+        let error = check_expansion(book).unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+        assert_eq!(sheet_names(book).unwrap_err().to_string(), error);
+        assert_eq!(columns(book, None, None).unwrap_err().to_string(), error);
+        assert_eq!(read(book, "bad", None, &CsvOptions::default()).unwrap_err().to_string(), error);
+    }
+
+    #[test]
+    fn every_zip_member_is_checked_with_or_without_a_preamble() {
+        for member in ["extra.XML", "extra.BiN", "extra.ReLs", "extra.data", "directory/"] {
+            let mut entries = crate::zip::read(&xlsx(&[("S", &[&["name"], &["city"]])])).unwrap();
+            entries.push((member.into(), vec![1, 2, 3]));
+            let mut book = crate::zip::write(&entries).unwrap();
+            let eocd = book.len() - 22;
+            let mut p = u32::from_le_bytes(book[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+            for _ in 1..entries.len() {
+                let size = |at| u16::from_le_bytes([book[at], book[at + 1]]) as usize;
+                p += 46 + size(p + 28) + size(p + 30) + size(p + 32);
+            }
+            book[p + 24..p + 28].copy_from_slice(&((crate::zip::MAX_TOTAL + 1) as u32).to_le_bytes());
+            refused_before_calamine(&book, "too large");
+            for adjust in [false, true] {
+                refused_before_calamine(&prefixed(book.clone(), adjust), "too large");
+            }
+            // A binary preamble isn't allowed to select the unguarded format fallback.
+            refused_before_calamine(&[COMPOUND, &book].concat(), "too large");
+        }
+        let book = crate::zip::write(&[("one.XML".into(), vec![0; 6]), ("two.rels".into(), vec![0; 6])]).unwrap();
+        let refused = crate::zip::read_all_within(&book, 11);
+        assert!(matches!(refused, Err(crate::zip::Failure::Member(m)) if m.contains("too large")));
+        assert_eq!(crate::zip::read_all_within(&book, 12).ok().map(|entries| entries.len()), Some(2));
+    }
+
+    #[test]
+    fn ods_repetitions_are_bounded_before_the_eager_constructor() {
+        for body in [
+            format!(r#"<table:table-row table:number-rows-repeated="{}"><table:table-cell office:value="1"/></table:table-row>"#, usize::MAX),
+            format!(r#"<table:table-row><table:table-cell table:number-columns-repeated="{}" office:value="1"/></table:table-row>"#, usize::MAX),
+            r#"<table:table-row table:number-rows-repeated="1048576"><table:table-cell table:number-columns-repeated="16384" office:value="1"/></table:table-row>"#.into(),
+            r#"<table:table-row><table:table-cell office:value="1"/></table:table-row><table:table-row table:number-rows-repeated="1048574"/><table:table-row><table:table-cell table:number-columns-repeated="16384" office:value="2"/></table:table-row>"#.into(),
+            r#"<table:table-row table:number-rows-repeated="1048576"><table:table-cell table:number-columns-repeated="16384" table:formula="of:=1"/></table:table-row>"#.into(),
+            r#"<table:table-row table:number-rows-repeated="1048576"/><table:table-row/>"#.into(),
+            format!(r#"<table:table-row><table:table-cell office:value-type="string"><text:p><text:s text:c="{}"/></text:p></table:table-cell></table:table-row>"#, crate::zip::MAX_TOTAL + 1),
+        ] {
+            let book = ods(&format!(r#"<table:table table:name="S">{body}</table:table>"#));
+            refused_before_calamine(&book, "too large");
+            let mut entries = crate::zip::read(&book).unwrap();
+            entries.iter_mut().find(|(name, _)| name == "mimetype").unwrap().1.extend(b"\n");
+            refused_before_calamine(&crate::zip::write(&entries).unwrap(), "too large");
+        }
+        // All sheets load eagerly, including those not selected by read/columns.
+        let rows = MAX_CELLS / 16_384 / 2 + 1;
+        let table = |name| {
+            format!(
+                r#"<table:table table:name="{name}"><table:table-row table:number-rows-repeated="{rows}"><table:table-cell table:number-columns-repeated="16384" office:value="1"/></table:table-row></table:table>"#
+            )
+        };
+        refused_before_calamine(&ods(&(table("first") + &table("second"))), "too large");
+        // Bound cloned strings without allocating their expansion.
+        let xml = br#"<table:table><table:table-row table:number-rows-repeated="2"><table:table-cell table:number-columns-repeated="2" office:string-value="hello"/></table:table-row></table:table>"#;
+        assert!(ods::check(xml, 4, 19).unwrap_err().to_string().contains("too large"));
+        assert!(ods::check(xml, 4, 20).is_ok());
+        // Trailing repeated blank cells are not stored once per encoded row.
+        let row = r#"<table:table-row><table:table-cell office:value="1"/><table:table-cell table:number-columns-repeated="16383"/></table:table-row>"#;
+        assert!(ods::check(format!("<table:table>{row}{row}</table:table>").as_bytes(), 2, 20).is_ok());
+    }
+
+    #[test]
+    fn ods_error_cell_text_counts_against_the_expansion_limit() {
+        let xml = r#"<table:table table:name="S"><table:table-row><table:table-cell office:string-value="message"/></table:table-row><table:table-row><table:table-cell office:string-value="" calcext:value-type="error"><text:p>bad<text:s text:c="2"/>value</text:p></table:table-cell></table:table-row></table:table>"#;
+        assert!(ods::check(xml.as_bytes(), 2, 12).unwrap_err().to_string().contains("too large"));
+        let (ds, report) = read(&ods(xml), "book", None, &CsvOptions::default()).unwrap();
+        assert_eq!(ds.value(0, 0), &Value::Text("bad  value".into()));
+        assert!(report.messages.is_empty());
+    }
+
+    #[test]
+    fn ods_rejects_malformed_nesting_but_preserves_ordinary_annotated_text() {
+        let book = |content| {
+            ods(&format!(
+                r#"<table:table table:name="S"><table:table-row><table:table-cell office:string-value="message"/></table:table-row><table:table-row><table:table-cell office:value-type="string">{content}</table:table-cell></table:table-row></table:table>"#
+            ))
+        };
+        refused_before_calamine(&book("<office:annotation><office:annotation/></office:annotation>"), "nested annotation");
+        for cell in ["<table:table-cell/>", "<table:covered-table-cell/>"] {
+            refused_before_calamine(&book(cell), "nested cell");
+        }
+        let clean = book("<office:annotation><text:p>note</text:p></office:annotation><text:p><text:span>value</text:span></text:p>");
+        let (ds, report) = read(&clean, "book", None, &CsvOptions::default()).unwrap();
+        assert_eq!(ds.value(0, 0), &Value::Text("value".into()));
+        assert!(report.messages.is_empty());
+    }
+
+    #[test]
+    fn ordinary_repeats_preambles_and_mixed_case_members_keep_values_and_notices() {
+        for null in [false, true] {
+            let note = if null { "&lt;Null&gt;" } else { " kept " };
+            let ods = ods(&format!(
+                r#"<table:table table:name="S"><table:table-column table:number-columns-repeated="16384"/><table:table-row><table:table-cell office:string-value="code"/><table:table-cell office:string-value="note"/></table:table-row><table:table-row table:number-rows-repeated="2"><table:table-cell office:string-value=" x "/><table:table-cell office:string-value="{note}"/><table:table-cell table:number-columns-repeated="16382"/></table:table-row><table:table-row table:number-rows-repeated="1048573"><table:table-cell table:number-columns-repeated="16384"/></table:table-row></table:table>"#
+            ));
+            let code_cell = r#"<c t="inlineStr"><is><t xml:space="preserve"> x </t></is></c>"#;
+            let note_cell = format!(r#"<c t="inlineStr"><is><t xml:space="preserve">{note}</t></is></c>"#);
+            let xlsx = xlsx(&[("S", &[&["code", "note"], &[code_cell, &note_cell], &[code_cell, &note_cell]])]);
+            for book in [ods, xlsx] {
+                let mut entries = crate::zip::read(&book).unwrap();
+                if let Some((name, _)) = entries.iter_mut().find(|(name, _)| name == "xl/worksheets/sheet1.xml") {
+                    *name = "xl/worksheets/sheet1.XmL".into();
+                }
+                entries.push(("Extra.ReLs".into(), b"harmless metadata".to_vec()));
+                let book = crate::zip::write(&entries).unwrap();
+                for book in [book.clone(), prefixed(book.clone(), false), prefixed(book, true)] {
+                    assert_eq!(sheet_names(&book).unwrap(), ["S"]);
+                    assert_eq!(columns(&book, None, None).unwrap().names, ["code", "note"]);
+                    let (ds, report) = read(&book, "book", None, &CsvOptions::default()).unwrap();
+                    assert_eq!(ds.features.len(), 2);
+                    assert_eq!(ds.value(0, 0), &Value::Text(" x ".into()));
+                    assert_eq!(ds.value(1, 1), &if null { Value::Null } else { Value::Text(" kept ".into()) });
+                    assert_eq!(
+                        report.messages.iter().filter(|m| m.contains("2 values written as Null")).count(),
+                        usize::from(null),
+                        "{report:?}"
+                    );
+                    if !null {
+                        assert!(report.messages.is_empty(), "{report:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A compound-file (`.xls`) header with the given fields, followed by `body`.
+    fn ole2(sector_shift: u16, fat_sectors: u32, first_dir: u32, difat_start: u32, difat_sectors: u32, body: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; 512];
+        b[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        b[24..26].copy_from_slice(&0x3Eu16.to_le_bytes());
+        b[26..28].copy_from_slice(&3u16.to_le_bytes());
+        b[28..30].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        b[30..32].copy_from_slice(&sector_shift.to_le_bytes());
+        b[32..34].copy_from_slice(&6u16.to_le_bytes());
+        b[44..48].copy_from_slice(&fat_sectors.to_le_bytes());
+        b[48..52].copy_from_slice(&first_dir.to_le_bytes());
+        b[56..60].copy_from_slice(&4096u32.to_le_bytes());
+        b[60..64].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
+        b[68..72].copy_from_slice(&difat_start.to_le_bytes());
+        b[72..76].copy_from_slice(&difat_sectors.to_le_bytes());
+        // The header's DIFAT points every FAT sector at sector 0.
+        for i in 0..109 {
+            let v: u32 = if i == 0 { 0 } else { 0xFFFF_FFFF };
+            b[76 + i * 4..80 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(body);
+        b
+    }
+
+    #[test]
+    fn hostile_xls_is_refused() {
+        // RUSTSEC-2026-0436: calamine before 0.38 panicked or allocated without bound on a
+        // malformed compound file, and 0.38 still panics on a sector chain past the allocation
+        // table. Each of these must be an error, not a crash.
+        let sector = [0xFFu8; 512];
+        let books = [
+            ole2(9, u32::MAX, 0, 0xFFFF_FFFE, 0, &sector),
+            ole2(9, 1, u32::MAX - 1, 0xFFFF_FFFE, 0, &sector),
+            ole2(9, 1, 0, 0, 0x7FFF_FFFF, &sector),
+            ole2(31, 1, 0, 0xFFFF_FFFE, 0, &sector),
+            ole2(0, 1, 0, 0xFFFF_FFFE, 0, &sector),
+            ole2(9, 1, 0, 0xFFFF_FFFE, 0, &[]),
+            ole2(9, 1, 0, 0xFFFF_FFFE, 0, &[0u8; 512]),
+        ];
+        for (i, book) in books.iter().enumerate() {
+            assert!(read(book, "t.xls", None, &CsvOptions::default()).is_err(), "book {i}");
+            // Some damaged headers still list no sheets; none may panic.
+            let _ = sheet_names(book);
+            assert!(columns(book, None, None).is_err(), "book {i}");
+        }
+    }
+
+    /// Little-endian words as bytes, padded with `fill` to whole 512-byte sectors.
+    fn sectors(words: &[u32], fill: u8) -> Vec<u8> {
+        let mut b: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        b.resize(b.len().div_ceil(512).max(1) * 512, fill);
+        b
+    }
+
+    /// A small compound file: FAT in sector 0, directory in sector 1 (a root entry and a
+    /// "Workbook" stream of `stream_len` bytes starting at `stream_start`), mini FAT in sector 2
+    /// (`mini_fat`), mini stream in sector 3.
+    fn small_book(fat: &[u32], stream_start: u32, stream_len: u32, mini_fat: &[u32]) -> Vec<u8> {
+        let entry = |name: &str, kind: u8, start: u32, len: u32| {
+            let mut e = [0u8; 128];
+            let utf16: Vec<u8> = name.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+            e[..utf16.len()].copy_from_slice(&utf16);
+            e[64..66].copy_from_slice(&(utf16.len() as u16).to_le_bytes());
+            e[66] = kind;
+            e[116..120].copy_from_slice(&start.to_le_bytes());
+            e[120..124].copy_from_slice(&len.to_le_bytes());
+            e
+        };
+        let mut dir = Vec::new();
+        dir.extend(entry("Root Entry", 5, 3, 64));
+        dir.extend(entry("Workbook", 2, stream_start, stream_len));
+        dir.resize(512, 0);
+        let mut body = sectors(fat, 0xFF);
+        body.extend(dir);
+        body.extend(sectors(mini_fat, 0xFF));
+        body.extend([0u8; 512]);
+        let mut b = ole2(9, 1, 1, 0xFFFF_FFFE, 0, &body);
+        b[60..64].copy_from_slice(&2u32.to_le_bytes());
+        b[64..68].copy_from_slice(&1u32.to_le_bytes());
+        b
+    }
+
+    /// A BIFF8 workbook in a sound compound container, with small worksheet streams.
+    fn biff_book(globals: &[(u16, Vec<u8>)], sheets: &[Vec<(u16, Vec<u8>)>]) -> Vec<u8> {
+        fn record(out: &mut Vec<u8>, kind: u16, data: &[u8]) {
+            out.extend(kind.to_le_bytes());
+            out.extend((data.len() as u16).to_le_bytes());
+            out.extend(data);
+        }
+        let bof = |kind: u16| {
+            let mut data = vec![0u8; 16];
+            data[..2].copy_from_slice(&0x0600u16.to_le_bytes());
+            data[2..4].copy_from_slice(&kind.to_le_bytes());
+            data
+        };
+        let mut stream = Vec::new();
+        record(&mut stream, 0x0809, &bof(5));
+        for (kind, data) in globals {
+            record(&mut stream, *kind, data);
+        }
+        let mut offsets = Vec::new();
+        for i in 0..sheets.len() {
+            offsets.push(stream.len() + 4);
+            let mut data = vec![0, 0, 0, 0, 0, 0, 1, 0];
+            data.push(b'A' + i as u8);
+            record(&mut stream, 0x0085, &data);
+        }
+        record(&mut stream, 0x000A, &[]);
+        for (i, records) in sheets.iter().enumerate() {
+            let offset = stream.len() as u32;
+            stream[offsets[i]..offsets[i] + 4].copy_from_slice(&offset.to_le_bytes());
+            record(&mut stream, 0x0809, &bof(0x0010));
+            for (kind, data) in records {
+                record(&mut stream, *kind, data);
+            }
+            record(&mut stream, 0x000A, &[]);
+        }
+        assert!(stream.len() <= 512);
+        let mut book = small_book(
+            &[0xFFFF_FFFD, END_OF_CHAIN, END_OF_CHAIN, END_OF_CHAIN],
+            0,
+            stream.len() as u32,
+            &[1, 2, 3, 4, 5, 6, 7, END_OF_CHAIN],
+        );
+        book[1024 + 120..1024 + 124].copy_from_slice(&512u32.to_le_bytes());
+        book[2048..2048 + stream.len()].copy_from_slice(&stream);
+        book
+    }
+
+    /// BIFF fields are checked before calamine runs, including browser entry points (#1495).
+    #[test]
+    fn xls_biff_records_are_checked_before_the_parser() {
+        let refuses = |book: &[u8], kind: &str| {
+            assert!(check_compound(book).is_err(), "{kind} reached the unchecked BIFF parser");
+            assert!(sheet_names(book).is_err(), "{kind}: names");
+            assert!(columns(book, None, None).is_err(), "{kind}: columns");
+            assert!(read(book, "bad.xls", None, &CsvOptions::default()).is_err(), "{kind}: read");
+        };
+        for kind in [0x002F, 0x0042, 0x0022, 0x0809, 0x0085, 0x0018, 0x0017] {
+            refuses(&biff_book(&[(kind, vec![])], &[]), &format!("short global {kind:x}"));
+        }
+        for len in 0..14 {
+            refuses(&biff_book(&[(0x0018, vec![0; len])], &[]), "short defined name");
+        }
+        let mut name = vec![0; 15];
+        name[4..6].copy_from_slice(&100u16.to_le_bytes());
+        refuses(&biff_book(&[(0x0018, name)], &[]), "defined-name formula length");
+        for token in [0x3a, 0x3b, 0x3c, 0x3d, 0x5a, 0x7b] {
+            let mut name = vec![0; 16];
+            name[3] = 1;
+            name[4..6].copy_from_slice(&1u16.to_le_bytes());
+            name[15] = b'N';
+            name.push(token);
+            refuses(&biff_book(&[(0x0018, name)], &[]), "short defined-name reference");
+        }
+        for kind in [0x0203, 0x0204, 0x0205, 0x027E, 0x00FD, 0x00BD, 0x00E5, 0x0006] {
+            refuses(&biff_book(&[], &[vec![(kind, vec![])]]), &format!("short cell record {kind:x}"));
+        }
+        let mut formula = vec![0; 22];
+        formula[20..22].copy_from_slice(&200u16.to_le_bytes());
+        refuses(&biff_book(&[], &[vec![(0x0006, formula)]]), "cell formula length");
+        let mut reversed = vec![0; 6];
+        reversed[2..4].copy_from_slice(&10u16.to_le_bytes());
+        reversed[4..6].copy_from_slice(&1u16.to_le_bytes());
+        refuses(&biff_book(&[], &[vec![(0x00bd, reversed)]]), "reversed MulRk columns");
+        refuses(&biff_book(&[], &[vec![(0x00e5, vec![0xff, 0xff])]]), "merge count past its record");
+        for token in [0x3a, 0x3b, 0x3c, 0x3d, 0x18, 0x19, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x2a, 0x2b, 0x39] {
+            let mut formula = vec![0; 22];
+            formula[20..22].copy_from_slice(&1u16.to_le_bytes());
+            formula.push(token);
+            refuses(&biff_book(&[], &[vec![(0x0006, formula)]]), &format!("short formula token {token:x}"));
+        }
+        for flags in [0x08, 0x04, 0x0c] {
+            let mut sst = vec![0; 8];
+            sst.extend([1, 0, flags]);
+            refuses(&biff_book(&[(0x00fc, sst)], &[]), "short rich string header");
+        }
+        let mut sst = vec![0; 8];
+        sst.extend([1, 0, 0]);
+        refuses(&biff_book(&[(0x00fc, sst), (0x003c, vec![])], &[]), "empty string continuation");
+        let mut offset = vec![0; 9];
+        offset[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        offset[6] = 1;
+        offset[8] = b'X';
+        refuses(&biff_book(&[(0x0085, offset)], &[]), "sheet past Workbook");
+    }
+
+    /// Declared and actual cell spans, across every eagerly read sheet, have one bound (#1495).
+    #[test]
+    fn xls_biff_allocations_are_bounded_before_the_parser() {
+        let dimensions = |first: u32, end: u32, cols: u16| {
+            let mut data = Vec::new();
+            data.extend(first.to_le_bytes());
+            data.extend(end.to_le_bytes());
+            data.extend(0u16.to_le_bytes());
+            data.extend(cols.to_le_bytes());
+            data.extend(0u16.to_le_bytes());
+            (0x0200, data)
+        };
+        for dims in [dimensions(50, 1, 1), dimensions(0, u32::MAX, 256)] {
+            let book = biff_book(&[], &[vec![dims]]);
+            assert!(check_compound(&book).is_err(), "Dimensions reached the unchecked allocator");
+        }
+        let mut number = vec![0; 14];
+        number[..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        number[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        let book = biff_book(&[], &[vec![(0x0203, vec![0; 14]), (0x0203, number)]]);
+        assert!(check_compound(&book).is_err(), "far-apart cells reached the dense-grid allocator");
+        let book = biff_book(&[], &[vec![dimensions(0, 65_536, 256)], vec![dimensions(0, 65_536, 256)]]);
+        assert!(check_compound(&book).is_err(), "the budget applies to all sheets, including unselected ones");
+        // Normal cached formula values remain readable, and names-only reads still work.
+        let mut header = vec![0; 6];
+        header.extend(7.0f64.to_le_bytes());
+        let mut formula = vec![0; 22];
+        formula[..2].copy_from_slice(&1u16.to_le_bytes());
+        formula[6..14].copy_from_slice(&8.0f64.to_le_bytes());
+        formula[20..22].copy_from_slice(&3u16.to_le_bytes());
+        formula.extend([0x1e, 8, 0]);
+        let book = biff_book(&[], &[vec![(0x0203, header), (0x0006, formula)]]);
+        assert!(check_compound(&book).is_ok());
+        assert_eq!(sheet_names(&book).unwrap(), ["A"]);
+        let (ds, report) = read(&book, "clean.xls", None, &CsvOptions::default()).unwrap();
+        assert_eq!(ds.features.len(), 1);
+        assert!(report.messages.is_empty());
+    }
+
+    #[test]
+    fn xls_biff_mutations_accepted_by_the_guard_do_not_panic() {
+        let mut header = vec![0; 6];
+        header.extend(7.0f64.to_le_bytes());
+        let mut formula = vec![0; 22];
+        formula[..2].copy_from_slice(&1u16.to_le_bytes());
+        formula[6..14].copy_from_slice(&8.0f64.to_le_bytes());
+        formula[20..22].copy_from_slice(&3u16.to_le_bytes());
+        formula.extend([0x1e, 8, 0]);
+        let mut sst = vec![0; 8];
+        sst[..4].copy_from_slice(&2u32.to_le_bytes());
+        sst[4..8].copy_from_slice(&2u32.to_le_bytes());
+        sst.extend([4, 0, 0]);
+        sst.extend(b"name");
+        sst.extend([4, 0, 0]);
+        sst.extend(b"city");
+        let mut first = vec![0; 10];
+        let mut second = first.clone();
+        second[..2].copy_from_slice(&1u16.to_le_bytes());
+        second[6..10].copy_from_slice(&1u32.to_le_bytes());
+        first[6..10].copy_from_slice(&0u32.to_le_bytes());
+        for seed in [
+            biff_book(&[], &[vec![(0x0203, header), (0x0006, formula)]]),
+            biff_book(&[(0x00fc, sst)], &[vec![(0x00fd, first), (0x00fd, second)]]),
+        ] {
+            assert!(check_compound(&seed).is_ok());
+            assert!(open_workbook_auto_from_rs(Cursor::new(seed.as_slice())).is_ok());
+            let len = u32::from_le_bytes(seed[1272..1276].try_into().unwrap()) as usize;
+            for i in 0..len {
+                for value in [0, 0x80, 0xff] {
+                    let mut mutated = seed.clone();
+                    mutated[2048 + i] = value;
+                    if check_compound(&mutated).is_ok() {
+                        let result = std::panic::catch_unwind(|| open_workbook_auto_from_rs(Cursor::new(mutated.as_slice())));
+                        assert!(result.is_ok(), "BIFF byte {i}, value {value:x}, passed the guard but panicked");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xls_sector_tables_are_checked() {
+        const FAT: u32 = 0xFFFF_FFFD;
+        const END: u32 = 0xFFFF_FFFE;
+        let damaged = |book: &[u8], what: &str| {
+            let e = read(book, "t.xls", None, &CsvOptions::default()).unwrap_err().to_string();
+            assert!(e.contains("damaged") && e.contains(what), "{what}: {e}");
+            assert!(columns(book, None, None).is_err() && sheet_names(book).is_err(), "{what}");
+        };
+        // The tables are sound: the check passes it on, and calamine reads it (it has no sheets).
+        let sound = small_book(&[FAT, END, END, END], 0, 64, &[END]);
+        assert!(check_compound(&sound).is_ok());
+        // A directory chain that links past the end of the file (it holds sectors 0 to 3), or to
+        // a sector after a file cut short mid-sector (calamine reads that one only if an earlier
+        // read happened to reach that far), or that loops.
+        damaged(&small_book(&[FAT, 0x100, END, END], 0, 64, &[END]), "runs past the end");
+        damaged(&small_book(&[FAT, 5, END, END], 0, 64, &[END]), "runs past the end");
+        let mut cut = small_book(&[FAT, 4, END, END], 0, 64, &[END]);
+        cut.truncate(cut.len() - 100);
+        damaged(&cut, "runs past the end");
+        damaged(&small_book(&[FAT, 1, END, END], 0, 64, &[END]), "loops");
+        // The directory's chain links past the FAT (128 entries) from a sector the file holds.
+        let mut far = ole2(9, 1, 128, 0xFFFF_FFFE, 0, &sectors(&[FAT, END], 0xFF));
+        far.resize(512 * 131, 0);
+        damaged(&far, "allocation table");
+        // calamine stops at a stream's length without looking up the last sector's link: a junk
+        // link there (the root entry's, 64 bytes in one sector) passes.
+        assert!(check_compound(&small_book(&[FAT, END, END, 0x100], 0, 64, &[END])).is_ok());
+        // Unused FAT entries left as zeros, as some writers do, aren't followed and pass.
+        let mut zeros = vec![FAT, END, END, END];
+        zeros.resize(128, 0);
+        assert!(check_compound(&small_book(&zeros, 0, 64, &[END])).is_ok());
+        // Small streams: one that starts past the mini stream (one 64-byte mini sector), one whose
+        // chain runs past it, one that loops on an empty mini sector, and an empty one, whose
+        // first sector calamine reads all the same.
+        damaged(&small_book(&[FAT, END, END, END], 200, 100, &[END]), "starts past");
+        damaged(&small_book(&[FAT, END, END, END], 0, 100, &[2, END]), "runs past");
+        damaged(&small_book(&[FAT, END, END, END], 1, 100, &[0, 1]), "loops");
+        damaged(&small_book(&[FAT, END, END, END], 200, 0, &[END]), "starts past");
+        // A mini sector starting right at the end of the mini stream reads as empty, and passes.
+        assert!(check_compound(&small_book(&[FAT, END, END, END], 0, 100, &[1, END])).is_ok());
+        // Without a mini FAT there is no mini stream: an empty stream at sector 0 reads nothing
+        // and passes, one with bytes in it has no table to follow.
+        let no_mini = |start: u32, len: u32| {
+            let mut b = small_book(&[FAT, END, END, END], start, len, &[END]);
+            b[64..68].copy_from_slice(&0u32.to_le_bytes());
+            b
+        };
+        assert!(check_compound(&no_mini(0, 0)).is_ok());
+        damaged(&no_mini(0, 100), "allocation table");
+        // calamine drops a byte-order mark from a name: "\u{FEFF}Workbook" is the Workbook stream.
+        let mut bom = small_book(&[FAT, END, END, END], 200, 100, &[END]);
+        let name: Vec<u8> = "\u{FEFF}Workbook".encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        let entry = 512 + 512 + 128;
+        bom[entry..entry + name.len()].copy_from_slice(&name);
+        bom[entry + 64..entry + 66].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        damaged(&bom, "starts past");
+        // A DIFAT chain whose next sector is past the end of the file.
+        damaged(&ole2(9, 1, 0, 50, 1, &sectors(&[FAT, END], 0xFF)), "past the end");
+    }
+
+    #[test]
+    fn truncated_xls_allocation_tables_are_refused_before_calamine() {
+        const END: u32 = 0xFFFF_FFFE;
+        // Both sector sizes, each table calamine interprets as u32 words, and each partial
+        // word length. Generate the container rather than keeping opaque fuzz artifacts.
+        for shift in [9, 12] {
+            let size = 1usize << shift;
+            for table in ["FAT", "DIFAT", "mini FAT"] {
+                for tail in 1..=3 {
+                    let mut book = ole2(shift, 1, 1, END, 0, &[]);
+                    book.resize(size, 0);
+                    let mut fat = vec![0xFF; size];
+                    fat[..4].copy_from_slice(&0xFFFF_FFFDu32.to_le_bytes());
+                    fat[4..8].copy_from_slice(&END.to_le_bytes());
+                    fat[8..12].copy_from_slice(&END.to_le_bytes());
+                    book.extend(fat);
+                    let mut dir = vec![0; size];
+                    dir[116..120].copy_from_slice(&END.to_le_bytes());
+                    book.extend(dir);
+                    book.extend(END.to_le_bytes());
+                    book.extend(vec![0xFF; tail]);
+                    match table {
+                        "FAT" => book[80..84].copy_from_slice(&2u32.to_le_bytes()),
+                        "DIFAT" => book[68..72].copy_from_slice(&2u32.to_le_bytes()),
+                        _ => {
+                            book[60..64].copy_from_slice(&2u32.to_le_bytes());
+                            book[64..68].copy_from_slice(&1u32.to_le_bytes());
+                        }
+                    }
+                    let check = check_compound(&book).unwrap_err().to_string();
+                    assert!(check.contains("partial 32-bit word"), "{shift}/{table}/{tail}: {check}");
+                    for error in [
+                        sheet_names(&book).unwrap_err().to_string(),
+                        columns(&book, None, None).unwrap_err().to_string(),
+                        read(&book, "cut.xls", None, &CsvOptions::default()).unwrap_err().to_string(),
+                    ] {
+                        assert_eq!(error, check, "{shift}/{table}/{tail}: parser must never be reached");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xls_fat_sectors_past_eof_are_refused_before_calamine() {
+        const END: u32 = 0xFFFF_FFFE;
+        // A 1541-byte container, as in #1952: after the 512-byte header there are two
+        // sectors and five bytes. FAT id 3 begins after those bytes, although id 0 is sound.
+        let mut body = sectors(&[0xFFFF_FFFD, END], 0xFF);
+        body.extend([0; 512]);
+        body.extend([0; 5]);
+        for id in [3u32, 0x7FFF_FFFF] {
+            let mut book = ole2(9, 1, 1, END, 0, &body);
+            book[80..84].copy_from_slice(&id.to_le_bytes());
+            let check = check_compound(&book).unwrap_err().to_string();
+            assert!(check.contains("a FAT sector is past the end"), "{check}");
+            assert_eq!(sheet_names(&book).unwrap_err().to_string(), check);
+            assert_eq!(columns(&book, None, None).unwrap_err().to_string(), check);
+            assert_eq!(read(&book, "cut.xls", None, &CsvOptions::default()).unwrap_err().to_string(), check);
+        }
+    }
+
+    #[test]
+    fn xls_unused_and_word_aligned_trailing_bytes_still_pass() {
+        const END: u32 = 0xFFFF_FFFE;
+        let mut book = small_book(&[0xFFFF_FFFD, END, END, END], 0, 64, &[END]);
+        // Extra file bytes don't matter unless read as an allocation table.
+        book.extend([0xFF; 3]);
+        assert!(check_compound(&book).is_ok());
+        // A table cut at a whole word is still safe for calamine's word conversion.
+        assert_eq!(words(&END.to_le_bytes()).unwrap(), [END]);
+        assert!(words(&[]).unwrap().is_empty());
+    }
+
+    /// An `.xls` whose data holds ZIP signatures (an embedded workbook, a stray run of bytes) is
+    /// not taken for a ZIP archive that failed to read; its own checks judge it.
+    #[test]
+    fn an_xls_holding_zip_signatures_is_not_refused_as_a_zip() {
+        const END: u32 = 0xFFFF_FFFE;
+        let mut book = small_book(&[0xFFFF_FFFD, END, END, END], 0, 64, &[END]);
+        book.extend(b"PK\x03\x04 an embedded part, then an end record: PK\x05\x06");
+        // Not the ZIP64 sentinel: this run only fails as "not a zip archive".
+        book.extend([b'x'; 40]);
+        assert!(check_compound(&book).is_ok());
+        assert!(check_expansion(&book).is_ok());
+        for e in [sheet_names(&book).err(), columns(&book, None, None).err()].into_iter().flatten() {
+            assert!(!e.to_string().contains("zip archive"), "{e}");
+        }
+    }
+
+    #[test]
+    fn unchecked_zip_does_not_open_through_the_xls_fallback() {
+        let workbook = xlsx(&[("S", &[&["name"], &["city"]])]);
+        let mut end = crate::zip::write(&[]).unwrap();
+        // A second directory declaration whose offset leaves no room for a central header.
+        end[8..12].copy_from_slice(&[1, 0, 1, 0]);
+        end[16..20].copy_from_slice(&((workbook.len() - 1) as u32).to_le_bytes());
+        let ambiguous = [workbook.as_slice(), &end].concat();
+        assert!(matches!(sheet_names(&ambiguous), Err(DataError::Format(m)) if m.contains("ambiguous")));
+        let compound = [COMPOUND, &ambiguous].concat();
+        assert!(matches!(sheet_names(&compound), Err(DataError::Format(_))));
+        assert!(matches!(columns(&compound, None, None), Err(DataError::Format(_))));
+        assert!(matches!(read(&compound, "book", None, &CsvOptions::default()), Err(DataError::Format(_))));
+    }
+
+    /// ZIP64 and entry-count refusals aren't deferred to the compound checks: a ZIP64 workbook
+    /// behind a compound-file header is one other readers open.
+    #[test]
+    fn a_zip64_workbook_behind_a_compound_header_is_still_refused() {
+        let book = xlsx(&[("S", &[&["name"], &["city"]])]);
+        let eocd = book.len() - 22;
+        let central = u32::from_le_bytes(book[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        let mut member = book.clone();
+        member[central + 24..central + 28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut end = book.clone();
+        end[eocd + 16..eocd + 20].copy_from_slice(&u32::MAX.to_le_bytes());
+        for zip64 in [member, end] {
+            for book in [zip64.clone(), [COMPOUND, &zip64].concat()] {
+                let e = check_expansion(&book).unwrap_err().to_string();
+                assert!(e.contains("ZIP64"), "{e}");
+                assert_eq!(sheet_names(&book).unwrap_err().to_string(), e);
+            }
+        }
+    }
+
+    /// Cancel is looked at between members, and is Cancel, not a damaged file.
+    #[test]
+    fn a_cancelled_run_stops_between_zip_members() {
+        use std::sync::{Arc, atomic::Ordering};
+        let book = xlsx(&[("S", &[&["name"], &["city"]])]);
+        assert!(check_expansion(&book).is_ok());
+        let probe = Arc::new(crate::progress::tests::Counted::default());
+        probe.cancel.store(true, Ordering::Relaxed);
+        let _installed = crate::progress::install(Some(probe));
+        assert!(matches!(check_expansion(&book), Err(DataError::Cancelled)));
+        assert!(matches!(sheet_names(&book), Err(DataError::Cancelled)));
+        assert!(matches!(columns(&book, None, None), Err(DataError::Cancelled)));
+        assert!(matches!(read(&book, "book", None, &CsvOptions::default()), Err(DataError::Cancelled)));
+    }
+
+    #[test]
+    fn a_panic_in_calamine_is_an_error() {
+        let e = guarded(|| -> Result<()> { panic!("calamine indexed past a table") }).unwrap_err();
+        assert!(e.to_string().contains("damaged"), "{e}");
     }
 
     #[test]

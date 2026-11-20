@@ -5,6 +5,8 @@
 //! Everything here came from the server or the network, so it is untrusted text: bounded,
 //! stripped of markup and control characters, and only ever shown as text.
 
+use rustgis_data::date::http_date;
+
 /// Headers kept from a failed answer: who answered, what it wants, and the request's id.
 pub const KEPT_HEADERS: [&str; 13] = [
     "server",
@@ -69,7 +71,16 @@ impl Failure {
     pub fn new(url: &str, message: impl Into<String>) -> Self {
         let message = message.into();
         let reason = crate::cache::http_status(&message).filter(|s| *s >= 400).map_or(Reason::Other, Reason::Status);
-        Failure { url: url.to_string(), message, reason, answer: None }
+        // Known address occurrences, wherever they are, are sanitized whole first, so an
+        // unescaped secret value can't be mistaken for the reason or force the cut that drops it.
+        let message = if !url.is_empty() && message.contains(url) {
+            rustgis_data::diagnostics::with_address_sanitized(url, &message)
+        } else {
+            message
+        };
+        let message = crate::logins::scrub_error(&message);
+        let url = if url.contains(rustgis_data::login_address::PREFIX) { crate::logins::scrub_error(url) } else { url.to_string() };
+        Failure { url, message, reason, answer: None }
     }
 
     /// A failure that never reached an answer.
@@ -86,10 +97,11 @@ impl Failure {
             }
         }
         let html = kept.iter().any(|(k, v)| k == "content-type" && v.to_ascii_lowercase().contains("html"));
+        let wait = kept.iter().find(|(k, _)| k == "retry-after").map(|(_, v)| v.as_str());
         Failure {
-            url: url.to_string(),
+            url: crate::logins::inner(url).to_string(),
             // As ureq has always said it, so text that reads the status back still finds it.
-            message: format!("http status: {status}"),
+            message: with_retry_after(format!("http status: {status}"), status, wait),
             reason: Reason::Status(status),
             answer: Some(Box::new(Answer { headers: kept, excerpt: excerpt(body, html), user_agent: None })),
         }
@@ -190,6 +202,33 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
+}
+
+/// The longest a server's `Retry-After` is waited for: a longer wait (or a hostile one) is cut
+/// to it, so the read is tried again within the hour.
+pub(crate) const MAX_RETRY_AFTER: u64 = 3600;
+
+/// A refusal's text (`http status: 503`, or the browser's `HTTP 503`), with how long the server
+/// asked to be left (`… (retry after 30 s)`) when it refused with 429 or 503 and its `Retry-After`
+/// header (`retry_after`) says so, in seconds or as a date. Read back by
+/// [`crate::cache::retry_after`].
+pub fn with_retry_after(text: String, status: u16, retry_after: Option<&str>) -> String {
+    let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    match retry_after.filter(|_| matches!(status, 429 | 503)).and_then(|v| retry_after_secs(v, now)) {
+        Some(secs) => format!("{text} (retry after {secs} s)"),
+        None => text,
+    }
+}
+
+/// A `Retry-After` header's wait in seconds (at least one, at most [`MAX_RETRY_AFTER`]): a number
+/// of seconds, or an HTTP date (`Wed, 21 Oct 2015 07:28:00 GMT`) after `now` (seconds since 1970).
+fn retry_after_secs(value: &str, now: u64) -> Option<u64> {
+    let value = value.trim();
+    let secs = match value.parse::<u64>() {
+        Ok(secs) => secs,
+        Err(_) => u64::try_from(http_date(value)?).ok()?.saturating_sub(now),
+    };
+    Some(secs.clamp(1, MAX_RETRY_AFTER))
 }
 
 /// A status's usual name (`403` → `Forbidden`), for the common ones.
@@ -297,12 +336,21 @@ fn entities(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn inactive_runtime_bindings_are_removed_from_failure_fields() {
+        let bound = rustgis_data::login_address::bind("0123456789abcdef", "https://failure.test", "https://failure.test/tile").unwrap();
+        let failure = Failure::new(&bound, format!("failed to fetch {bound}"));
+        assert!(!failure.url.contains("rustgis-login:") && !failure.url.contains("0123456789abcdef"));
+        assert!(!failure.message.contains("rustgis-login:") && !failure.message.contains("0123456789abcdef"));
+    }
+
     fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
     #[test]
     fn a_cloudflare_block_is_named_with_its_page_title() {
+        let _turn = crate::cache::turn();
         let body = b"<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title><style>x{}</style></head><body>Sorry, you have been blocked</body></html>";
         let f = Failure::answered(
             "https://example.org/MapServer?f=json",
@@ -383,5 +431,35 @@ mod tests {
         assert_eq!(Failure::new("u", "too many redirects").reason, Reason::Other);
         assert_eq!(Failure::without_answer("u", "timeout: global", Reason::Timeout).reason, Reason::Timeout);
         assert_eq!((status_name(403), status_name(299)), (Some("Forbidden"), None));
+    }
+
+    /// A 429 or 503 refusal says how long its server asked to be left, from its `Retry-After`
+    /// header in seconds or as a date, within an hour; other refusals, and a header that can't be
+    /// read, say nothing more.
+    #[test]
+    fn retry_after_on_429_and_503() {
+        let _turn = crate::cache::turn();
+        let base = || "http status: 503".to_string();
+        assert_eq!(with_retry_after(base(), 503, Some("30")), "http status: 503 (retry after 30 s)");
+        assert_eq!(with_retry_after("HTTP 429".into(), 429, Some(" 2 ")), "HTTP 429 (retry after 2 s)");
+        assert_eq!(with_retry_after(base(), 503, Some("0")), "http status: 503 (retry after 1 s)");
+        assert_eq!(with_retry_after(base(), 503, Some("86400")), "http status: 503 (retry after 3600 s)");
+        assert_eq!(with_retry_after(base(), 503, Some("soon")), "http status: 503");
+        assert_eq!(with_retry_after(base(), 503, None), "http status: 503");
+        assert_eq!(with_retry_after("http status: 500".into(), 500, Some("30")), "http status: 500");
+        // A date: the seconds until it (Sun, 06 Nov 1994 08:49:37 GMT is 784 111 777).
+        assert_eq!(http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777));
+        assert_eq!(retry_after_secs("Sun, 06 Nov 1994 08:50:37 GMT", 784_111_777), Some(60));
+        assert_eq!(retry_after_secs("Sun, 06 Nov 1994 08:49:37 GMT", 784_200_000), Some(1), "past: at once, after a second");
+        assert_eq!(http_date("Sun, 06 Nov 1994 08:49:37 PST"), None);
+        assert_eq!(http_date("Sun, 32 Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(http_date("Wed, 31 Feb 2024 00:00:00 GMT"), None, "no 31 February");
+        assert_eq!(http_date("Sun, 06 Nov 1994 -8:49:37 GMT"), None, "no negative hour");
+        assert_eq!(http_date("Sun, 06 Nov 1994 +8:49:37 GMT"), None, "no sign on an hour");
+        assert_eq!(http_date("Sun, +6 Nov 1994 08:49:37 GMT"), None, "no sign on a day");
+        assert!(http_date("Thu, 29 Feb 2024 00:00:00 GMT").is_some() && http_date("Sat, 29 Feb 2025 00:00:00 GMT").is_none());
+        // A refused answer's own header.
+        let headers = vec![("Retry-After".to_string(), "12".to_string())];
+        assert_eq!(Failure::answered("u", 429, &headers, b"").message, "http status: 429 (retry after 12 s)");
     }
 }

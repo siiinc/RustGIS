@@ -19,7 +19,7 @@ mod index;
 pub use cache::use_temporary_index_dir;
 pub use cache::{Emptied, empty_index_cache};
 
-use super::{Batch, FeatureSource, Reproject, Request, SourceInfo, clamp_limit};
+use super::{Batch, FeatureSource, Reproject, Request, SourceInfo, clamp_limit, in_request};
 use crate::io::group_rings;
 use crate::{DataError, Feature, Field, FieldType, Geometry, GeometryType, Result, Value};
 use rustgis_geom::{Coord, Extent};
@@ -75,7 +75,7 @@ const BUFFER: usize = 1 << 20;
 
 /// The largest record read: one past it is skipped rather than given a buffer that size, since a
 /// record's length is only checked against the file's, which can be gigabytes (#1055).
-const MAX_RECORD: u64 = crate::io::MAX_BYTES;
+const MAX_RECORD: u64 = crate::io::BYTES_FLOOR;
 
 impl ShpSource {
     /// Opens `path` (the `.shp`) with the `.dbf` and optional `.prj` and `.cpg` beside it.
@@ -89,7 +89,7 @@ impl ShpSource {
         if let Some(c) = crs {
             c.transformer().map_err(DataError::Format)?;
         }
-        let dbf = path.with_extension("dbf");
+        let dbf = crate::io::dbf_sidecar(path);
         if !dbf.is_file() {
             return Err(bad(format!("{} is missing", dbf.display())));
         }
@@ -101,7 +101,7 @@ impl ShpSource {
         if shp_len > u64::from(u32::MAX) {
             return Err(bad("the .shp is larger than the format's 4 GB"));
         }
-        let mut f = BufReader::with_capacity(BUFFER, File::open(path)?);
+        let mut f = BufReader::with_capacity(BUFFER, crate::provenance::open(path)?);
         let mut header = [0u8; 100];
         f.read_exact(&mut header).map_err(|_| bad("the .shp header is cut short"))?;
         if be_i32(&header, 0) != Some(9994) {
@@ -127,9 +127,60 @@ impl ShpSource {
         }
         let reproject = match crs {
             Some(c) => Reproject::from_crs(c, &mut notes),
-            None => shp_reproject(crate::raster::read_prj(path).as_deref(), &mut notes),
+            None => shp_reproject(crate::raster::read_prj(path).as_deref(), &mut notes)?,
         };
-        let extent = if native.is_empty() || !native.min_x.is_finite() { Extent::EMPTY } else { reproject.extent_to_lonlat(&native) };
+        // The records' own boxes frame the layer, as the index holds them (rounded outward to f32);
+        // with none (no records, or every shape null, empty or not a number) it has no extent,
+        // never the 0, 0, 0, 0 a header often holds then (Null Island). The header's box, exact,
+        // stands for them when it is their box (the specification's minimum bounding rectangle);
+        // one that isn't is set aside: said when it misses a shape or isn't a box (a corner that
+        // isn't a number, #1985, or stale after records were added), not when it only holds more
+        // (editors that only grow it, or junk) or is 0, 0, 0, 0 (no box kept).
+        let header = native;
+        // A box at all: its corners numbers, in order.
+        let a_box = [header.min_x, header.min_y, header.max_x, header.max_y].iter().all(|v| v.is_finite()) && !header.is_empty();
+        // 0, 0, 0, 0: what writers put when they keep no box, not a box that's wrong; set aside
+        // without a word.
+        let zero = [header.min_x, header.min_y, header.max_x, header.max_y].iter().all(|v| *v == 0.0);
+        let native = index.bounds.map(|[x0, y0, x1, y1]| {
+            // Rounded outward as the records' boxes are, the header is theirs on every side: so a
+            // header written exactly always passes, whatever its size, as does one off by less
+            // than one f32 step (a meter or two at UTM and Web Mercator northings).
+            let [h0, h1, h2, h3] = [f32_down(header.min_x), f32_down(header.min_y), f32_up(header.max_x), f32_up(header.max_y)];
+            if a_box && h0 == x0 && h1 == y0 && h2 == x1 && h3 == y1 {
+                return header;
+            }
+            // Larger than the shapes but holding them (left so by editors that only grow it, or
+            // junk): the shapes' box, with nothing to say. One that misses a shape, or isn't a box,
+            // is said.
+            if !zero && !(a_box && h0 <= x0 && h1 <= y0 && h2 >= x1 && h3 >= y1) {
+                notes.push(
+                    "the .shp header's bounding box doesn't hold its shapes, or isn't a box: the layer's extent is taken from the shapes"
+                        .into(),
+                );
+            }
+            Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
+        });
+        // Records, every shape null or empty, under a header that says otherwise (a box, or one
+        // that isn't, such as a corner that isn't a number; not the 0, 0, 0, 0 such a file usually
+        // holds): said, as the layer has no extent. A file of no records loses nothing by it;
+        // shapes there but without a usable box are said below instead.
+        if native.is_none() && index.count > 0 && index.unboxed == 0 && !zero {
+            notes.push("the .shp has no shapes to frame: its header's box isn't used, and the layer has no extent".into());
+        }
+        // Records with no usable box, neither stored nor from their own points (a coordinate that
+        // isn't a number or past f32's range, or a record that can't be read; a backwards stored
+        // box over good points is framed by the points instead) are left out of the extent and of
+        // every read by area (the R-tree and the scan alike): said, with how many, and when
+        // nothing else frames the layer, so.
+        if index.unboxed > 0 {
+            let none = if native.is_none() { ", so the layer has no extent" } else { "" };
+            notes.push(format!(
+                "{} shape(s) have no usable bounding box (a coordinate that isn't a number or is out of range, a record that can't be read, or a shape RustGIS doesn't read, such as a multipatch): they're left out of the layer's extent and of reads by area{none}",
+                index.unboxed
+            ));
+        }
+        let extent = native.map_or(Extent::EMPTY, |n| reproject.extent_to_lonlat(&n));
         if reproject.is_lonlat()
             && !extent.is_empty()
             && (extent.min_x < -180.5 || extent.max_x > 180.5 || extent.min_y < -90.5 || extent.max_y > 90.5)
@@ -151,7 +202,7 @@ impl ShpSource {
             count: Some(index.count),
             // A system the .prj defines, as one given, by its PROJ definition, so the layer keeps it
             // (`SourceInfo::coordinate_system`) as a whole read does.
-            crs: reproject.crs.custom_def().map(|d| d.proj4.clone()).unwrap_or_else(|| reproject.label()),
+            crs: reproject.crs.definition_text(),
             indexed: index.indexed(),
             notes,
             zm_dropped: false,
@@ -169,10 +220,16 @@ impl FeatureSource for ShpSource {
         &self.info
     }
 
+    /// Samples indexed records, falling back to geometry matches when the native view is refused.
+    /// The fallback counts records and checks Cancel before reading each one.
     fn read(&self, req: &Request) -> Result<Batch> {
         let encoding = self.encoding.decoder();
         let limit = clamp_limit(req.limit);
-        let extent = req.extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let extent = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        // Keep indexed zero-limit counts; a refused view has no cheap candidate count.
+        if limit == 0 && req.extent.is_some() && extent.is_none() {
+            return Err(super::unbounded_count());
+        }
         if extent.is_some_and(|e| e.is_empty()) {
             return Ok(Batch { complete: super::stride(0, limit) == 1, ..Batch::default() });
         }
@@ -182,8 +239,18 @@ impl FeatureSource for ShpSource {
         let mut buf = Vec::new();
         let mut row = vec![0u8; self.table.row_len];
         let mut features = Vec::new();
-        let mut skipped = 0;
-        let (matched, complete) = self.index.visit(bounds, limit, |i, place| {
+        let (mut skipped, mut unread_dates, mut null_text) = (0, Vec::new(), Vec::new());
+        // An extent the file's system couldn't bound (#1925) has no boxes for the index to sample
+        // by: every record is visited, tested, and the matches sampled as they come.
+        let late = req.extent.is_some() && bounds.is_none();
+        let mut sample = super::Sampler::new(limit);
+        if late {
+            crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
+        }
+        let mut each = |i: u32, place: Place| {
+            if late {
+                crate::progress::step(1)?;
+            }
             if u64::from(place.len) > MAX_RECORD {
                 skipped += 1;
                 return Ok(());
@@ -194,6 +261,12 @@ impl FeatureSource for ShpSource {
                 return Ok(());
             }
             let geometry = match parse_shape(&buf) {
+                // A coordinate that isn't a number (NaN or infinite) has no place: the record is
+                // left out and counted, as one that can't be converted (#1985).
+                Ok(Some(g)) if !g.is_finite() => {
+                    skipped += 1;
+                    return Ok(());
+                }
                 Ok(Some(g)) => match self.reproject.geometry(g) {
                     Some(g) => Some(g),
                     None => {
@@ -207,6 +280,11 @@ impl FeatureSource for ShpSource {
                     return Ok(());
                 }
             };
+            // The index's boxes are rounded outward to f32, so it can match a shape just outside. A
+            // shape without geometry doesn't match an extent, bounded natively or not.
+            if geometry.as_ref().map_or(req.extent.is_some(), |g| !in_request(g, req)) {
+                return Ok(());
+            }
             let attrs = if u64::from(i) < self.table.rows {
                 let at = self.table.header_len + u64::from(i) * self.table.row_len as u64;
                 if dbf.read_at(at, &mut row).is_err() {
@@ -217,22 +295,43 @@ impl FeatureSource for ShpSource {
                 if row.first() == Some(&b'*') {
                     return Ok(());
                 }
-                self.table.columns.iter().map(|c| value(c, row.get(1 + c.offset..1 + c.offset + c.len).unwrap_or(&[]), &encoding)).collect()
+                if late && !sample.wants() {
+                    return Ok(());
+                }
+                self.table.values(&row, &encoding, &mut unread_dates, &mut null_text)
             } else {
+                if late && !sample.wants() {
+                    return Ok(());
+                }
                 vec![Value::Null; self.table.columns.len()]
             };
-            features.push(Feature { id: u64::from(i) + 1, geometry, attrs });
+            let f = Feature { id: u64::from(i) + 1, geometry, attrs };
+            if late {
+                sample.keep(f)
+            } else {
+                features.push(f)
+            }
             Ok(())
-        })?;
-        Ok(Batch { features, matched, complete, skipped })
+        };
+        let (matched, complete) = if late {
+            self.index.visit_complete(None, &mut each)?;
+            features = std::mem::take(&mut sample.items);
+            (sample.seen(), sample.complete())
+        } else {
+            self.index.visit(bounds, limit, &mut each)?
+        };
+        Ok(Batch { features, matched, complete, skipped, unread_dates, rounded_dates: Vec::new(), null_text, notes: Vec::new() })
     }
     fn streams_chunks(&self) -> bool {
         true
     }
+    /// Visits located shapes in a spatial request; geometry-less rows belong only to whole reads.
+    /// Counts scanned records and checks Cancel before filtering them.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let encoding = self.encoding.decoder();
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
-        let extent = extent.map(|e| self.reproject.extent_from_lonlat(&e));
+        let req = Request { extent, limit: usize::MAX };
+        let extent = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         if extent.is_some_and(|e| e.is_empty()) {
             return Ok(Batch { complete: true, ..Batch::default() });
         }
@@ -241,13 +340,15 @@ impl FeatureSource for ShpSource {
         let mut dbf = Cursor::open(&self.dbf)?;
         let mut buf = Vec::new();
         let mut row = vec![0u8; self.table.row_len];
-        let mut skipped = 0;
+        let (mut skipped, mut unread_dates, mut null_text) = (0, Vec::new(), Vec::new());
         // The same directory, ordering, extent rules and read-only scan fallback as sampled
         // reads, with no interaction row cap. The index visits records without materializing
         // their directory or the complete feature collection in memory.
         // Every record id fits u32. This format bound visits them all while keeping SQLite's
         // LIMIT within its signed integer range on 64-bit hosts.
+        crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
         let (matched, complete) = self.index.visit_complete(bounds, |i, place| {
+            crate::progress::step(1)?;
             if u64::from(place.len) > MAX_RECORD {
                 skipped += 1;
                 return Ok(());
@@ -258,6 +359,12 @@ impl FeatureSource for ShpSource {
                 return Ok(());
             }
             let geometry = match parse_shape(&buf) {
+                // A coordinate that isn't a number (NaN or infinite) has no place: the record is
+                // left out and counted, as one that can't be converted (#1985).
+                Ok(Some(g)) if !g.is_finite() => {
+                    skipped += 1;
+                    return Ok(());
+                }
                 Ok(Some(g)) => match self.reproject.geometry(g) {
                     Some(g) => Some(g),
                     None => {
@@ -271,6 +378,10 @@ impl FeatureSource for ShpSource {
                     return Ok(());
                 }
             };
+            // As in `read`, the shape itself is checked.
+            if geometry.as_ref().map_or(req.extent.is_some(), |g| !in_request(g, &req)) {
+                return Ok(());
+            }
             let attrs = if u64::from(i) < self.table.rows {
                 let at = self.table.header_len + u64::from(i) * self.table.row_len as u64;
                 if dbf.read_at(at, &mut row).is_err() {
@@ -281,14 +392,23 @@ impl FeatureSource for ShpSource {
                 if row.first() == Some(&b'*') {
                     return Ok(());
                 }
-                self.table.columns.iter().map(|c| value(c, row.get(1 + c.offset..1 + c.offset + c.len).unwrap_or(&[]), &encoding)).collect()
+                self.table.values(&row, &encoding, &mut unread_dates, &mut null_text)
             } else {
                 vec![Value::Null; self.table.columns.len()]
             };
             chunks.push(Feature { id: u64::from(i) + 1, geometry, attrs })
         })?;
         chunks.flush()?;
-        Ok(Batch { features: Vec::new(), matched, complete, skipped })
+        Ok(Batch {
+            features: Vec::new(),
+            matched,
+            complete,
+            skipped,
+            unread_dates,
+            rounded_dates: Vec::new(),
+            null_text,
+            notes: Vec::new(),
+        })
     }
 }
 
@@ -300,7 +420,7 @@ struct Cursor {
 
 impl Cursor {
     fn open(path: &Path) -> Result<Cursor> {
-        Ok(Cursor { f: BufReader::with_capacity(BUFFER, File::open(path)?), pos: 0 })
+        Ok(Cursor { f: BufReader::with_capacity(BUFFER, crate::provenance::open(path)?), pos: 0 })
     }
 
     fn read_at(&mut self, at: u64, buf: &mut [u8]) -> std::io::Result<()> {
@@ -333,32 +453,92 @@ fn le_f64(b: &[u8], at: usize) -> Option<f64> {
 }
 
 /// A record's box from the start of its content (shape type, then a point or a box), rounded
-/// outward to `f32`; NaN for a null or unreadable shape, so no extent meets it.
-fn record_box(c: &[u8]) -> [f32; 4] {
+/// outward to `f32`. NaN for a null or empty shape, which has nothing to frame, so no extent meets
+/// it; infinite for a record whose box isn't one (a coordinate that isn't a number or past `f32`'s
+/// range, an unknown shape type, or a record too short for what it says), so it is counted where
+/// it's left out ([`index::Index::unboxed`]). A backwards box is given as stored, finite but out of
+/// order, for the index to put right from its points where they read ([`index::scan_boxed`]).
+/// `len` is the record's content length as its header gives it: one too short for the points its
+/// counts say, or a line or polygon whose parts' starts don't fit its points ([`parse_shape`]'s
+/// rules, so a record it won't read frames nothing), isn't a box. `c` holds a line's or polygon's
+/// whole array of parts' starts where the record has room for it.
+fn record_box(c: &[u8], len: u64) -> [f32; 4] {
     const NONE: [f32; 4] = [f32::NAN; 4];
+    const NOT_A_BOX: [f32; 4] = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
     let b = match le_i32(c, 0) {
+        Some(0) => return NONE,
         Some(1 | 11 | 21) => match (le_f64(c, 4), le_f64(c, 12)) {
-            (Some(x), Some(y)) => [x, y, x, y],
-            _ => return NONE,
+            (Some(x), Some(y)) if len >= 20 => [x, y, x, y],
+            _ => return NOT_A_BOX,
         },
-        Some(3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28 | 31) => match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
-            (Some(a), Some(b), Some(x), Some(y)) => [a, b, x, y],
-            _ => return NONE,
-        },
-        _ => return NONE,
+        // A multipatch, which the reader doesn't read, frames nothing it draws: counted.
+        Some(t @ (3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28)) => {
+            // The counts follow the box: a multipoint's points at 36, else the parts at 36 and
+            // the points at 40. A record too short to hold them, or the parts' starts and points
+            // they count (as a read needs), or a count below 0, can't be read; one that reads but
+            // has no points, or no parts (an empty geometry some writers give a 0, 0, 0, 0 box),
+            // has nothing to frame.
+            let (parts, points) = if matches!(t, 8 | 18 | 28) { (Some(1), le_i32(c, 36)) } else { (le_i32(c, 36), le_i32(c, 40)) };
+            let (Some(parts), Some(points)) = (parts, points) else { return NOT_A_BOX };
+            if parts < 0 || points < 0 {
+                return NOT_A_BOX;
+            }
+            let (parts, points) = (parts.unsigned_abs(), points.unsigned_abs());
+            let need =
+                if matches!(t, 8 | 18 | 28) { 40 + 16 * u64::from(points) } else { 44 + 4 * u64::from(parts) + 16 * u64::from(points) };
+            if parts as usize > MAX_PARTS || points as usize > MAX_PARTS || len < need {
+                return NOT_A_BOX;
+            }
+            // Each part runs from its start to the next one's (the last to the end of the points):
+            // a start below 0, past the next, or past the points can't be read.
+            if !matches!(t, 8 | 18 | 28) {
+                let start = |p: u32| le_i32(c, 44 + 4 * p as usize).and_then(|s| u32::try_from(s).ok());
+                for p in 0..parts {
+                    let end = if p + 1 < parts { start(p + 1) } else { Some(points) };
+                    match (start(p), end) {
+                        (Some(s), Some(e)) if s <= e && e <= points => {}
+                        _ => return NOT_A_BOX,
+                    }
+                }
+                // Starts in order, the last part running to the end of the points: every part is
+                // empty when the first starts there, and the shape reads as empty, framing nothing
+                // whatever its stored box.
+                if parts > 0 && start(0) == Some(points) {
+                    return NONE;
+                }
+            }
+            if parts == 0 || points == 0 {
+                return NONE;
+            }
+            match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
+                (Some(x0), Some(y0), Some(x1), Some(y1)) => [x0, y0, x1, y1],
+                _ => return NOT_A_BOX,
+            }
+        }
+        _ => return NOT_A_BOX,
     };
     if b.iter().any(|v| !v.is_finite()) {
-        return NONE;
+        return NOT_A_BOX;
     }
-    let down = |v: f64| {
-        let f = v as f32;
-        if f64::from(f) > v { f.next_down() } else { f }
-    };
-    let up = |v: f64| {
-        let f = v as f32;
-        if f64::from(f) < v { f.next_up() } else { f }
-    };
-    [down(b[0]), down(b[1]), up(b[2]), up(b[3])]
+    // Past f32's range, a corner rounds to an infinity: not a box either, and counted so.
+    // A backwards side is rounded the other way (its min up, its max down), so it stays backwards
+    // even when the two are less than an f32 step apart, for the index to frame from the points;
+    // rounded outward, it could come out in order and be taken as a box.
+    let side = |lo: f64, hi: f64| if lo > hi { (f32_up(lo), f32_down(hi)) } else { (f32_down(lo), f32_up(hi)) };
+    let ((x0, x1), (y0, y1)) = (side(b[0], b[2]), side(b[1], b[3]));
+    [x0, y0, x1, y1]
+}
+
+/// The nearest f32 at or below `v`, as the index rounds a box's low corner.
+fn f32_down(v: f64) -> f32 {
+    let f = v as f32;
+    if f64::from(f) > v { f.next_down() } else { f }
+}
+
+/// The nearest f32 at or above `v`, as the index rounds a box's high corner.
+fn f32_up(v: f64) -> f32 {
+    let f = v as f32;
+    if f64::from(f) < v { f.next_up() } else { f }
 }
 
 /// Most parts and points one shape may have (a record's own length bounds them first).
@@ -416,7 +596,7 @@ fn parse_shape(c: &[u8]) -> std::result::Result<Option<Geometry>, ()> {
 
 /// Reads a `.dbf` header: its row layout and columns.
 fn read_table(path: &Path) -> Result<Table> {
-    let mut f = BufReader::new(File::open(path)?);
+    let mut f = BufReader::new(crate::provenance::open(path)?);
     let mut head = [0u8; 32];
     f.read_exact(&mut head).map_err(|_| bad("the .dbf header is cut short"))?;
     let rows = u64::from(u32::from_le_bytes(head.get(4..8).and_then(|b| b.try_into().ok()).unwrap_or([0; 4])));
@@ -440,6 +620,7 @@ fn read_table(path: &Path) -> Result<Table> {
             b'I' => FieldType::Integer,
             b'N' | b'F' | b'O' | b'Y' => FieldType::Double,
             b'L' => FieldType::Boolean,
+            b'D' => FieldType::Date,
             _ => FieldType::Text,
         };
         columns.push(Column { ty, offset, len, out });
@@ -451,9 +632,48 @@ fn read_table(path: &Path) -> Result<Table> {
     Ok(Table { header_len, row_len, rows, columns, ldid: head.get(29).copied().unwrap_or(0) })
 }
 
+impl Table {
+    /// A row's values (after its deletion flag), counting in `unread_dates` the dates that
+    /// aren't ones ([`Batch::unread_dates`]) and in `null_text` the text `<Null>` read as null
+    /// ([`Batch::null_text`]).
+    fn values(
+        &self,
+        row: &[u8],
+        encoding: &dyn shapefile::dbase::Encoding,
+        unread_dates: &mut Vec<usize>,
+        null_text: &mut Vec<usize>,
+    ) -> Vec<Value> {
+        let mut out = Vec::with_capacity(self.columns.len());
+        for (k, c) in self.columns.iter().enumerate() {
+            let b = row.get(1 + c.offset..1 + c.offset + c.len).unwrap_or(&[]);
+            out.push(if c.ty == b'D' && std::str::from_utf8(padded(b)).is_ok_and(Value::is_null_marker) {
+                // `<Null>` is a missing value's marker, counted as one, not as a date that isn't.
+                super::null_text_at(null_text, k);
+                Value::Null
+            } else if c.ty == b'D' {
+                crate::dbf::date(b)
+                    .unwrap_or_else(|()| {
+                        super::unread_date(unread_dates, k);
+                        None
+                    })
+                    .map_or(Value::Null, Value::Date)
+            } else {
+                let v = value(c, b, encoding);
+                if c.ty == b'C' && matches!(&v, Value::Text(t) if Value::is_null_marker(t)) {
+                    super::null_text_at(null_text, k);
+                    Value::Null
+                } else {
+                    v
+                }
+            });
+        }
+        out
+    }
+}
+
 /// The `.dbf`'s column names, in order (read again: the layout above keeps only offsets).
 fn read_names(path: &Path, n: usize, encoding: &dyn shapefile::dbase::Encoding) -> Result<Vec<String>> {
-    let mut f = BufReader::new(File::open(path)?);
+    let mut f = BufReader::new(crate::provenance::open(path)?);
     f.seek(SeekFrom::Start(32))?;
     let mut out = Vec::with_capacity(n);
     let mut d = [0u8; 32];
@@ -467,6 +687,13 @@ fn read_names(path: &Path, n: usize, encoding: &dyn shapefile::dbase::Encoding) 
     Ok(out)
 }
 
+/// A text field's bytes up to the first NUL, without the padding after them: spaces before the
+/// text are the text's, as a Shapefile read whole keeps them.
+fn padded(b: &[u8]) -> &[u8] {
+    let b = b.get(..b.iter().position(|c| *c == 0).unwrap_or(b.len())).unwrap_or(&[]);
+    b.get(..b.iter().rposition(|c| *c != b' ').map_or(0, |e| e + 1)).unwrap_or(&[])
+}
+
 /// A field's bytes up to the first NUL, without the spaces around them.
 fn trimmed(b: &[u8]) -> &[u8] {
     let b = b.get(..b.iter().position(|c| *c == 0).unwrap_or(b.len())).unwrap_or(&[]);
@@ -475,7 +702,8 @@ fn trimmed(b: &[u8]) -> &[u8] {
     b.get(start..end).unwrap_or(&[])
 }
 
-/// One `.dbf` value, as a Shapefile read whole gives it (blank and unreadable values are null).
+/// One `.dbf` value, as a Shapefile read whole gives it (blank and unreadable values are null;
+/// [`Table::values`] counts the dates).
 fn value(c: &Column, b: &[u8], encoding: &dyn shapefile::dbase::Encoding) -> Value {
     let text = || encoding.decode(trimmed(b)).unwrap_or_else(|_| String::from_utf8_lossy(trimmed(b))).into_owned();
     let number = || {
@@ -487,8 +715,12 @@ fn value(c: &Column, b: &[u8], encoding: &dyn shapefile::dbase::Encoding) -> Val
     };
     match c.ty {
         b'C' => {
-            let t = text();
-            if t.is_empty() { Value::Null } else { Value::Text(t) }
+            let t = padded(b);
+            if t.is_empty() {
+                Value::Null
+            } else {
+                Value::Text(encoding.decode(t).unwrap_or_else(|_| String::from_utf8_lossy(t)).into_owned())
+            }
         }
         // A whole-number column's values as integers, exactly (its at most 18 digits fit an i64);
         // one written with a point or exponent (`12.0`, `1e3`) too, and one that isn't whole is
@@ -510,16 +742,7 @@ fn value(c: &Column, b: &[u8], encoding: &dyn shapefile::dbase::Encoding) -> Val
             Some(b'0' | b'F' | b'f' | b'N' | b'n') => Value::Bool(false),
             _ => Value::Null,
         },
-        b'D' => {
-            let t = trimmed(b);
-            match t.get(..8) {
-                Some(d) if d.iter().all(u8::is_ascii_digit) => {
-                    let part = |r: std::ops::Range<usize>| String::from_utf8_lossy(d.get(r).unwrap_or(&[])).into_owned();
-                    Value::Text(format!("{}-{}-{}", part(0..4), part(4..6), part(6..8)))
-                }
-                _ => Value::Null,
-            }
-        }
+        b'D' => crate::dbf::date(b).ok().flatten().map_or(Value::Null, Value::Date),
         // Memos (in a `.dbt` beside the file), date-times and binary fields aren't read.
         b'M' | b'T' | b'@' | b'B' | b'G' | b'P' => Value::Null,
         _ => {
@@ -529,22 +752,27 @@ fn value(c: &Column, b: &[u8], encoding: &dyn shapefile::dbase::Encoding) -> Val
     }
 }
 
-/// The coordinate system in a `.prj`, with what couldn't be understood said in the notes.
-fn shp_reproject(prj: Option<&str>, notes: &mut Vec<String>) -> Reproject {
-    let crs = match prj.map(crate::raster::wkt::read_wkt) {
+/// The coordinate system in a `.prj`, with what couldn't be understood said in the notes. Another
+/// body's system that can't be read is an error, as when the file is read whole.
+fn shp_reproject(prj: Option<&str>, notes: &mut Vec<String>) -> Result<Reproject> {
+    use crate::raster::planetary;
+    let crs = match prj.map(|p| (p, crate::raster::wkt::read_wkt(p))) {
         None => crate::raster::Crs::LonLat,
-        Some(Ok((c, note))) => {
+        Some((_, Ok((c, note)))) => {
             if let Some(n) = note {
                 notes.push(format!("the .prj file: {n}"));
             }
             c
         }
-        Some(Err(e)) => {
+        Some((p, Err(e))) => {
+            if let Some(refused) = planetary::refused_wkt(p, &e) {
+                return Err(DataError::Format(format!("the .prj file: {refused}")));
+            }
             notes.push(format!("the .prj file: {e}; coordinates are read as longitude/latitude"));
             crate::raster::Crs::LonLat
         }
     };
-    Reproject::from_crs(crs, notes)
+    Ok(Reproject::from_crs(crs, notes))
 }
 
 #[cfg(test)]

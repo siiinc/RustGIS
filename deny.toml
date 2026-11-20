@@ -3,7 +3,7 @@
 
 [graph]
 all-features = false
-exclude-dev = true
+exclude-dev = false
 
 [licenses]
 confidence-threshold = 0.8
@@ -29,3 +29,13 @@ allow = [
 [licenses.private]
 # RustGIS's own apps and xtask (`publish = false`).
 ignore = true
+
+# Dependencies currently come only from crates.io. An intentional git or registry source must
+# be reviewed here too; git sources must name a revision rather than follow a branch or tag.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# terrio-crs, pinned by `rev` in Cargo.toml until a release after 0.2.4 (opengeos/RustGIS#2032).
+allow-git = ["https://github.com/opengeos/terrio"]
+required-git-spec = "rev"

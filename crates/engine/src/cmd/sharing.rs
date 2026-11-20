@@ -4,7 +4,7 @@
 //! and web tools. Each share is recorded as a shared item (Status › Jobs) that the Manage
 //! commands update in place, written to a path or a registered data store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -37,10 +37,14 @@ const MAX_FEATURES: usize = 200_000;
 const MAX_PAGE_PICTURES: usize = 64 << 20;
 /// Largest glTF geometry buffer of a web scene.
 const MAX_SCENE_BYTES: usize = 128 << 20;
+/// Highest an extrusion reaches in a web scene (metres): its base and height together stay within it.
+const SCENE_TOP: f64 = 1e6;
 /// Most nodes in a link chart.
 const MAX_NODES: usize = 3000;
 /// Most links in a link chart (its page lays them all out every frame).
 const MAX_LINKS: usize = 20_000;
+/// Most links a link chart draws from one feature.
+const MAX_FEATURE_LINKS: usize = 200;
 /// Most shared items and data stores kept.
 const MAX_ITEMS: usize = 1000;
 /// Largest file an upload copies.
@@ -126,9 +130,23 @@ fn web_link_chart(s: &mut Session, p: &Value) -> CmdResult {
 }
 const MANAGE: &str = r#"{"item"?: id|name (default: the last of its kind), "map"?: re-share from another map}"#;
 
+/// Publish shared items and import models, checking file compatibility before creating a model.
 pub fn commands() -> Vec<C> {
     let share_as = |id: &'static str, label: &'static str, run: fn(&mut Session, &Value) -> CmdResult, params: &'static str| {
-        C::new(id, label, "Publish › Share As", run).params(params)
+        C::new(id, label, "Publish › Share As", run)
+            .inputs(match id {
+                "share.webMap" => web_map_inputs,
+                "share.webScene" => web_scene_inputs,
+                "share.geodataService" => geodata_inputs,
+                "share.webTool" => web_tool_inputs,
+                "share.linkChart" => link_inputs,
+                "share.webStyle" => style_inputs,
+                "share.locator" => locator_inputs,
+                _ => layer_inputs,
+            })
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+            .params(params)
     };
     vec![
         share_as("share.webMap", "Web Map", web_map, r#"{"map"?: name (default: the active map), "path"?: "*.html" (default: the first data store)}"#),
@@ -142,46 +160,94 @@ pub fn commands() -> Vec<C> {
         C::new("share.jobs", "Jobs", "Publish › Share As", |s, _| {
             let items: Vec<Value> = s.project.shared.iter().rev().map(|i| serde_json::to_value(i).unwrap_or(Value::Null)).collect();
             Ok(json!({"items": items, "stores": s.project.data_stores}))
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
-        C::new("share.saveWebMap", "Save Web Map", "Publish › Manage", |s, p| update_item(s, p, "webMap", ps(p, "map"))).when(need_items).params(MANAGE),
-        C::new("share.replaceWebLayer", "Replace Web Layer", "Publish › Manage", |s, p| update_item(s, p, "webLayer", ps(p, "layer")))
+        C::new("share.saveWebMap", "Save Web Map", "Publish › Manage", |s, p| update_item(s, p, "webMap", ps(p, "map"))).inputs(update_web_map_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).when(need_items).params(MANAGE),
+        C::new("share.replaceWebLayer", "Replace Web Layer", "Publish › Manage", |s, p| update_item(s, p, "webLayer", ps(p, "layer"))).inputs(update_layer_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .when(need_items)
             .params(r#"{"item"?: id|name (default: the last web layer), "layer"?: the layer replacing it (default: the one it was made from)}"#),
-        C::new("share.dataStore", "Data Stores", "Publish › Manage", data_store).params(r#"{"name"?, "path"?: folder, "remove"?: name (no parameters: list them)}"#),
-        C::new("share.upload", "Upload File", "Publish › Manage", upload).params(r#"{"path": file, "store"?: name (default: the first data store)}"#),
-        C::new("share.saveWebScene", "Save Web Scene", "Publish › Manage", |s, p| update_item(s, p, "webScene", ps(p, "map"))).when(need_items).params(MANAGE),
-        C::new("share.saveWebLinkChart", "Save Web Link Chart", "Publish › Manage", |s, p| update_item(s, p, "linkChart", ps(p, "relationship")))
+        C::new("share.dataStore", "Data Stores", "Publish › Manage", data_store).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(r#"{"name"?, "path"?: folder, "remove"?: name (no parameters: list them)}"#),
+        C::new("share.upload", "Upload File", "Publish › Manage", upload).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(r#"{"path": file, "store"?: name (default: the first data store)}"#),
+        C::new("share.saveWebScene", "Save Web Scene", "Publish › Manage", |s, p| update_item(s, p, "webScene", ps(p, "map"))).inputs(update_web_scene_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).when(need_items).params(MANAGE),
+        C::new("share.saveWebLinkChart", "Save Web Link Chart", "Publish › Manage", |s, p| update_item(s, p, "linkChart", ps(p, "relationship"))).inputs(update_links_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .when(need_items)
             .params(r#"{"item"?: id|name (default: the last link chart), "relationship"?: re-share another relationship}"#),
-        C::new("locator.find", "Find Place", "Home › Inspect", find).params(r#"{"locator"?: shared item name or *.rgisloc path (default: the last locator), "text": search text, "limit"?: 1..100, "zoom"?: bool (go to the best match)}"#),
+        C::new("locator.find", "Find Place", "Home › Inspect", find).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(r#"{"locator"?: shared item name or *.rgisloc path (default: the last locator), "text": search text, "limit"?: 1..100, "zoom"?: bool (go to the best match)}"#),
         C::new("model.import", "Import Model", "Analyze › Geoprocessing", |s, p| {
             let text = super::items::read_text(p)?;
             let v: Value = serde_json::from_str(&text).map_err(|e| format!("not a RustGIS web tool: {e}"))?;
+            crate::model::check_file(&v)?;
             let name = v["name"].as_str().unwrap_or("Tool").chars().take(200).collect::<String>();
             // A model file (`*.model.json`) holds a graph; a web tool its steps.
-            if let Some(graph) = v.get("graph") {
-                return s.run("model.new", &json!({"name": name, "graph": graph, "imported": true}));
+            let mark = s.notice_mark();
+            let imported = if let Some(graph) = v.get("graph") {
+                s.run("model.new", &json!({"name": name, "graph": graph, "imported": true}))?
+            } else {
+                let steps = v.get("steps").cloned().ok_or("not a RustGIS model or web tool (no graph or steps)")?;
+                s.run("model.new", &json!({"name": name, "steps": steps, "imported": true}))?
+            };
+            // A name `model.new` cut to tell it apart is said once, by it (#1923), unless this cut
+            // it first: `model.new` saw only the first 200 characters, so that cut is said here.
+            let said = s.notices_since(mark).iter().any(|n| n.text.starts_with("ModelBuilder: a model has that name already"));
+            let cut_here = v["name"].as_str().is_some_and(|n| n.chars().count() > 200);
+            if (cut_here || !said) && v.get("name").map_or(Some("Tool"), Value::as_str) != imported.get("model").and_then(Value::as_str) {
+                // A cut to the 200 says how much it cut.
+                let text = match v["name"].as_str() {
+                    Some(n) if cut_here => format!("1 model name was cut from {} to 200 characters, a model name's limit, during import.", n.chars().count()),
+                    _ => "1 model name was trimmed, shortened, replaced or made unique during import.".to_string(),
+                };
+                s.notify(text, false);
             }
-            let steps = v.get("steps").cloned().ok_or("not a RustGIS model or web tool (no graph or steps)")?;
-            s.run("model.new", &json!({"name": name, "steps": steps, "imported": true}))
-        })
+            Ok(imported)
+        }).roles(&[crate::ParamRole { key: "text", role: crate::Role::Document(crate::Document::Model) }]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))
         .params(r#"{"path"?: "*.model.json" | "*.rgistool", "text"?: file JSON, "data"?: base64 file}"#),
     ]
 }
 
-/// The shared item bytes of a kind: its name, bytes and source.
+/// The shared item bytes of a kind: its name, bytes and source. Rasters drawn into it without
+/// their cast shadows are said (see [`super::share::saying_shadows`]).
 pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, String), String> {
+    let (name, bytes, source, notes) = share_output(s, kind, p)?;
+    for note in notes {
+        s.notify(note, false);
+    }
+    Ok((name, bytes, source))
+}
+
+/// Shared-item construction notes are deferred when a front end still needs to deliver bytes.
+pub(crate) fn share_output(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, String, Vec<String>), String> {
+    let what = match kind {
+        "webMap" => "The web map",
+        "webLayer" => "The web layer",
+        _ => "The shared item",
+    };
+    let notes = match kind {
+        "webMap" | "geodataService" | "webScene" if s.constructions.len > 0 => {
+            let m = map_of(s, p)?;
+            s.constructions.output_notes(m.layers.iter().filter(|l| shared_layer(kind, l)).map(|l| (m.instance_id(), l)))?
+        }
+        "webLayer" | "locator" => {
+            let l = layer_of(s, p)?;
+            s.constructions.export_notes(s.map().instance_id(), &l)?
+        }
+        _ => Vec::new(),
+    };
+    let (name, bytes, source) = super::share::saying_shadows(s, what, |s| share_bytes_inner(s, kind, p))?;
+    Ok((name, bytes, source, notes))
+}
+
+/// Build the saved payload for each share kind; web tools carry capabilities of their steps.
+fn share_bytes_inner(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, String), String> {
     match kind {
         "webMap" => {
             let mut m = map_of(s, p)?;
-            m.layers.iter_mut().filter(|l| l.visible).try_for_each(load_whole)?;
+            m.layers.iter_mut().filter(|l| shared_layer("webMap", l)).try_for_each(|l| load_whole(s, l))?;
             let html = web_map_html(&m, &m.name)?;
             Ok((m.name.clone(), html.into_bytes(), m.name))
         }
         "webLayer" => {
             let mut l = layer_of(s, p)?;
-            load_whole(&mut l)?;
+            load_whole(s, &mut l)?;
             Ok((l.name.clone(), web_layer_zip(s, &l)?, l.name.clone()))
         }
         "webStyle" => {
@@ -198,68 +264,75 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
         }
         "geodataService" => {
             let mut m = map_of(s, p)?;
-            m.layers.iter_mut().filter(|l| !l.is_raster() && !l.graphics).try_for_each(load_whole)?;
-            let mut layers: Vec<&Dataset> = m.layers.iter().filter(|l| !l.is_raster() && !l.graphics).map(|l| &l.dataset).collect();
+            m.layers.iter_mut().filter(|l| shared_layer("geodataService", l)).try_for_each(|l| load_whole(s, l))?;
+            let mut layers: Vec<&Dataset> = m.layers.iter().filter(|l| shared_layer("geodataService", l)).map(|l| &l.dataset).collect();
             layers.extend(s.project.tables.iter().map(|t| &t.dataset));
             Ok((m.name.clone(), ogc_zip(&m.name, &layers, &[])?, m.name.clone()))
         }
         "webTool" => {
-            let ms = &s.project.models;
-            let m = match ps(p, "model") {
-                Some(n) => ms.iter().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no model '{n}'"))?,
-                None => ms.last().ok_or("make a model first (ModelBuilder)")?,
-            };
-            let params: Vec<Value> = m
-                .steps
-                .iter()
-                .enumerate()
-                .flat_map(|(i, st)| {
-                    st.params
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .map(move |(k, v)| json!({"step": i + 1, "tool": st.tool, "name": k, "default": v}))
-                })
-                .collect();
-            let tool = json!({"format": "RustGIS web tool", "version": 1, "name": m.name, "steps": m.steps, "parameters": params});
-            Ok((m.name.clone(), serde_json::to_vec_pretty(&tool).map_err(|e| e.to_string())?, m.name.clone()))
+            let i = shared_model(s, p)?;
+            let m = s.project.models.get_mut(i).ok_or("make a model first (ModelBuilder)")?;
+            let name = m.name.clone();
+            let (bytes, report) = crate::durable::output(m, None, |m| {
+                let tool = crate::model::to_web_tool_file(&m.name, &m.steps);
+                serde_json::to_vec_pretty(&tool).map_err(|e| e.to_string())
+            })?;
+            crate::durable::notify(s, &report);
+            Ok((name.clone(), bytes, name))
         }
         "webScene" => {
             let mut m = map_of(s, p)?;
-            m.layers.iter_mut().filter(|l| l.visible && !l.is_raster()).try_for_each(load_whole)?;
-            Ok((m.name.clone(), gltf(&m, s.view_size)?, m.name.clone()))
+            m.layers.iter_mut().filter(|l| shared_layer("webScene", l)).try_for_each(|l| load_whole(s, l))?;
+            let scene = gltf(&m, s.view_size)?;
+            for note in scene.notes() {
+                s.notify(note, false);
+            }
+            Ok((m.name.clone(), scene.bytes, m.name.clone()))
         }
         "linkChart" => {
-            let rel = ps(p, "relationship").map(str::to_string);
-            let html = link_chart(s, rel.as_deref())?;
-            // Every relationship is recorded with an empty source (a relationship may be called
-            // "Relationships").
-            let name = rel.clone().unwrap_or_else(|| "Relationships".into());
-            Ok((name, html.into_bytes(), rel.unwrap_or_default()))
+            let (item, note) = link_chart_item(s, p)?;
+            if let Some(note) = note {
+                s.notify(note, false);
+            }
+            Ok(item)
         }
         k => Err(format!("unknown share '{k}'")),
     }
 }
 
+/// A link chart's shared item, and what its limits leave out when they do (#1947), for whoever
+/// shares it to say: `share` says it last, after "Shared …", so the status bar keeps it.
+fn link_chart_item(s: &Session, p: &Value) -> Result<((String, Vec<u8>, String), Option<String>), String> {
+    let rel = ps(p, "relationship").map(str::to_string);
+    let (html, left) = link_chart(s, rel.as_deref())?;
+    // Every relationship is recorded with an empty source (a relationship may be called
+    // "Relationships").
+    let name = rel.clone().unwrap_or_else(|| "Relationships".into());
+    let note = left.map(|left| format!("{name}: {left}"));
+    Ok(((name, html.into_bytes(), rel.unwrap_or_default()), note))
+}
+
 /// A map to share, its layer groups folded into their layers (the shared formats have none).
 fn map_of(s: &Session, p: &Value) -> Result<Map, String> {
-    let mut m = match ps(p, "map") {
-        Some(n) => s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(n)).cloned().ok_or_else(|| format!("no map '{n}'"))?,
-        None => s.map().clone(),
-    };
+    let mut m = shared_map(s, p)?.clone();
     m.bake_groups();
     Ok(m)
 }
 
-/// A streamed layer shares its whole source, not the features read for the current view.
-fn load_whole(l: &mut Layer) -> Result<(), String> {
+/// A streamed layer shares its whole source, not the features read for the current view; what
+/// that read couldn't read as it is (rows left out, dates read as null or rounded) is said.
+fn load_whole(s: &mut Session, l: &mut Layer) -> Result<(), String> {
     if l.is_streamed() {
-        l.dataset = l.load_all()?;
+        let (ds, unread) = l.load_all_counted()?;
+        l.dataset = ds;
+        super::whole::Unread::of(l.name.clone(), unread).say(s);
     }
     Ok(())
 }
 
-fn layer_of(s: &Session, p: &Value) -> Result<Layer, String> {
+fn layer_of(input: &impl super::InputSource, p: &Value) -> Result<Layer, String> {
+    let context = input.input_context();
+    let s = &context;
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).cloned().ok_or("no such layer")?;
     if l.is_raster() {
@@ -269,7 +342,9 @@ fn layer_of(s: &Session, p: &Value) -> Result<Layer, String> {
 }
 
 /// Where a share goes: `path`, else the named or first data store.
-fn target(s: &Session, p: &Value, name: &str, ext: &str) -> Result<String, String> {
+fn target(input: &impl super::InputSource, p: &Value, name: &str, ext: &str) -> Result<String, String> {
+    let context = input.input_context();
+    let s = &context;
     if let Some(path) = ps(p, "path") {
         return Ok(path.to_string());
     }
@@ -282,7 +357,8 @@ fn target(s: &Session, p: &Value, name: &str, ext: &str) -> Result<String, Strin
 }
 
 fn share(s: &mut Session, p: &Value, kind: &str) -> CmdResult {
-    let (name, bytes, source) = share_bytes(s, kind, p)?;
+    let written = s.notice_mark();
+    let ((name, bytes, source), chart_note) = if kind == "linkChart" { link_chart_item(s, p)? } else { (share_bytes(s, kind, p)?, None) };
     let ext = KINDS.iter().find(|k| k.0 == kind).map_or("bin", |k| k.1);
     let path = target(s, p, &name, ext)?;
     // A share of another kind (or an uploaded file) at that path isn't replaced.
@@ -290,6 +366,7 @@ fn share(s: &mut Session, p: &Value, kind: &str) -> CmdResult {
         return Err(format!("{path} already holds the shared {} '{}'; choose another name or path", other.kind, other.name));
     }
     rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+    s.retain_written_notices(written);
     let t = now();
     let shared = &mut s.project.shared;
     let id = match shared.iter_mut().find(|i| i.path == path) {
@@ -316,34 +393,22 @@ fn share(s: &mut Session, p: &Value, kind: &str) -> CmdResult {
             id
         }
     };
-    s.notify(format!("Shared {name} to {path}"), false);
+    let written = s.notice_mark();
+    s.notify_written(format!("Shared {name} to {path}"), false);
     // After it, so the status bar, which shows the last notice, keeps saying it.
     note_label_classes(s, kind, p);
     note_export(s, kind, p, &path);
+    // What a link chart's limits leave out, last of all, so the status bar shows it.
+    if let Some(note) = chart_note {
+        s.notify(note, false);
+    }
+    s.retain_written_notices(written);
     Ok(json!({"item": id, "path": path, "bytes": bytes.len()}))
 }
 
 /// Re-shares an item in place, from its source or a new one.
 fn update_item(s: &mut Session, p: &Value, kind: &str, new_source: Option<&str>) -> CmdResult {
-    let item = match p.get("item") {
-        Some(Value::Number(n)) => s.project.shared.iter().find(|i| Some(u64::from(i.id)) == n.as_u64() && i.kind == kind),
-        Some(Value::String(n)) => s.project.shared.iter().rev().find(|i| i.kind == kind && i.name.eq_ignore_ascii_case(n)),
-        _ => s.project.shared.iter().rev().find(|i| i.kind == kind),
-    }
-    .cloned()
-    .ok_or_else(|| format!("no shared {} to update", KINDS.iter().find(|k| k.0 == kind).map_or(kind, |k| k.2).to_ascii_lowercase()))?;
-    if !item.this_session {
-        return Err(format!(
-            "'{}' came with the opened project; share it again with Share As (choosing where it goes) before updating it",
-            item.name
-        ));
-    }
-    let source = new_source.unwrap_or(&item.source).to_string();
-    let q = match kind {
-        "webLayer" => json!({"layer": source, "path": item.path}),
-        "linkChart" => json!({"relationship": if source.is_empty() { Value::Null } else { json!(source) }, "path": item.path}),
-        _ => json!({"map": source, "path": item.path}),
-    };
+    let q = update_params(s, p, kind, new_source)?;
     share(s, &q, kind)
 }
 
@@ -394,7 +459,7 @@ fn upload(s: &mut Session, p: &Value) -> CmdResult {
     // create_new is the real guard (the check above only gives a clearer message): the file is
     // created new, never through an existing file or link. A copy that fails part way is removed,
     // so a retry can write it.
-    let from = std::fs::File::open(src).map_err(|e| format!("{src}: {e}"))?;
+    let from = rustgis_data::provenance::open(src).map_err(|e| format!("{src}: {e}"))?;
     if !from.metadata().is_ok_and(|m| m.len() <= MAX_UPLOAD) {
         return Err(format!("{src}: uploads are at most {} MB", MAX_UPLOAD >> 20));
     }
@@ -441,33 +506,37 @@ fn css(c: Rgba) -> String {
     format!("rgba({},{},{},{:.3})", c.r(), c.g(), c.b(), f64::from(c.a()) / 255.0)
 }
 
-/// A layer's visible features as GeoJSON, each with its drawn style.
-fn styled_features(l: &Layer, budget: &mut usize) -> Vec<Value> {
+/// A layer's visible features as GeoJSON, each with its drawn style: in longitude/latitude,
+/// whatever system the layer holds its coordinates in; refused, naming the feature, when one of
+/// its places can't be given there.
+fn styled_features(l: &Layer, budget: &mut usize) -> Result<Vec<Value>, String> {
     let rows = l.visible_rows();
     let opacity = 1.0 - f64::from(l.transparency.clamp(0.0, 100.0)) / 100.0;
     let mut out = Vec::new();
     // Its symbol by expression (no map scale: the page zooms on its own).
     let styler = l.styler(None);
-    for (row, ft) in l.dataset.features.iter().enumerate() {
+    let to = l.dataset.lonlat_conversion().map_err(|e| format!("{}: {e}", l.name))?;
+    for (row, ft) in l.dataset.features.rows().enumerate() {
         if *budget == 0 {
             break;
         }
         if rows.get(row) != Some(&true) {
             continue;
         }
-        let Some(g) = &ft.geometry else { continue };
+        let Some(g) = ft.geometry() else { continue };
+        let g = rustgis_data::Dataset::geometry_to_lonlat_by(&to, g).map_err(|e| format!("{}: feature {}: {e}", l.name, ft.id()))?;
         let sym = styler.symbol(row);
         let props: serde_json::Map<String, Value> =
             l.dataset.fields.iter().enumerate().map(|(i, f)| (f.name.clone(), json!(l.dataset.value(row, i).to_string()))).collect();
         out.push(json!({
             "type": "Feature",
-            "geometry": rustgis_data::io::geometry_to_geojson(g),
+            "geometry": rustgis_data::io::geometry_to_geojson(&g),
             "properties": props,
             "style": {"fill": css(sym.fill), "stroke": css(sym.stroke), "width": sym.stroke_width, "size": sym.size, "opacity": opacity},
         }));
         *budget -= 1;
     }
-    out
+    Ok(out)
 }
 
 /// A self-contained web map page: the map's layers (rasters as images) drawn on a canvas in Web
@@ -506,7 +575,7 @@ fn web_map_html(m: &Map, title: &str) -> Result<String, String> {
                 json!({"name": l.name, "image": base64::engine::general_purpose::STANDARD.encode(png), "bounds": [a.x, a.y, b.x, b.y]}),
             );
         } else {
-            layers.push(json!({"name": l.name, "features": styled_features(l, &mut budget)}));
+            layers.push(json!({"name": l.name, "features": styled_features(l, &mut budget)?}));
         }
     }
     let c = m.center_lonlat();
@@ -598,6 +667,14 @@ pub(crate) fn note_label_classes(s: &mut Session, kind: &str, p: &Value) {
         format!("{}'s style draws every feature with one symbol ({which}): its classes by expression aren't in it.", l.name)
     });
     if let Some(text) = classes {
+        s.notify(text, false);
+    }
+    // A size mapping has no MapLibre equivalent written for it: its points keep their classes' sizes.
+    let sized = s.layer_id(p).ok().and_then(|id| s.map().layer(id)).and_then(|l| {
+        let by = l.size_by.as_ref().filter(|_| rustgis_map::symbol_by::SizeBy::applies_to(l))?;
+        Some(format!("{}'s style draws its points at their classes' sizes: their sizes by {} aren't in it.", l.name, by.field))
+    });
+    if let Some(text) = sized {
         s.notify(text, false);
     }
     let Some(l) = s.layer_id(p).ok().and_then(|id| s.map().layer(id)).filter(|l| l.labels.enabled) else { return };
@@ -781,7 +858,7 @@ fn ogc_zip(title: &str, layers: &[&Dataset], extra: &[(String, Vec<u8>)]) -> Res
             id = format!("{base}_{}", *n + 1);
         }
         taken.insert(id.clone());
-        let e = ds.extent();
+        let e = ds.lonlat_extent();
         let mut col = json!({
             "id": id, "title": ds.name, "itemType": "feature",
             "links": [{"href": format!("collections/{id}/items.json"), "rel": "items", "type": "application/geo+json"}],
@@ -791,7 +868,8 @@ fn ogc_zip(title: &str, layers: &[&Dataset], extra: &[(String, Vec<u8>)]) -> Res
                 json!({"spatial": {"bbox": [[e.min_x, e.min_y, e.max_x, e.max_y]], "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"}});
         }
         entries.push((format!("collections/{id}.json"), serde_json::to_vec_pretty(&col).map_err(|e| e.to_string())?));
-        let mut fc = rustgis_data::io::to_geojson(ds);
+        // GeoJSON is longitude/latitude, whatever system the layer holds its coordinates in.
+        let mut fc = rustgis_data::io::to_geojson(&*ds.in_lonlat()?);
         fc["numberReturned"] = json!(ds.features.len());
         entries.push((format!("collections/{id}/items.json"), serde_json::to_vec(&fc).map_err(|e| e.to_string())?));
         cols.push(col);
@@ -809,7 +887,7 @@ fn ogc_zip(title: &str, layers: &[&Dataset], extra: &[(String, Vec<u8>)]) -> Res
 /// A web layer: the layer as an OGC API Features collection, its style, and a viewer page.
 fn web_layer_zip(s: &Session, l: &Layer) -> Result<Vec<u8>, String> {
     let style = serde_json::to_vec_pretty(&web_style(l)).map_err(|e| e.to_string())?;
-    let geojson = serde_json::to_vec(&rustgis_data::io::to_geojson(&l.dataset)).map_err(|e| e.to_string())?;
+    let geojson = serde_json::to_vec(&rustgis_data::io::to_geojson(&*l.dataset.in_lonlat()?)).map_err(|e| e.to_string())?;
     let mut m = s.map().clone();
     m.layers = vec![l.clone()];
     let e = l.extent();
@@ -850,6 +928,7 @@ fn locator(l: &Layer, fields: Option<&[String]>) -> Result<Locator, String> {
     if fis.is_empty() {
         return Err("pick the fields to search (the layer has no text fields)".into());
     }
+    let lonlat = ds.lonlat_conversion()?;
     let mut entries = Vec::new();
     for (row, ft) in ds.features.iter().enumerate().take(MAX_FEATURES) {
         let Some(g) = &ft.geometry else { continue };
@@ -861,6 +940,10 @@ fn locator(l: &Layer, fields: Option<&[String]>) -> Result<Locator, String> {
             Geometry::Point(p) => *p,
             _ => e.center(),
         };
+        // In longitude/latitude, the entries' system. The identity keeps the place as it is, as
+        // before; a place another system can't convert is left out (unreachable while every
+        // dataset is in longitude/latitude), as a NaN entry would make the locator unreadable.
+        let Some(c) = (if lonlat.is_identity() { Some(c) } else { lonlat.point(c) }) else { continue };
         for &fi in &fis {
             let t = match ds.value(row, fi) {
                 rustgis_data::Value::Null => continue,
@@ -876,23 +959,7 @@ fn locator(l: &Layer, fields: Option<&[String]>) -> Result<Locator, String> {
 
 fn find(s: &mut Session, p: &Value) -> CmdResult {
     let text = ps(p, "text").map(str::trim).filter(|t| !t.is_empty()).ok_or("text is required")?.to_lowercase();
-    let path = match ps(p, "locator") {
-        Some(n) => s
-            .project
-            .shared
-            .iter()
-            .rev()
-            .find(|i| i.kind == "locator" && i.name.eq_ignore_ascii_case(n))
-            .map_or_else(|| n.to_string(), |i| i.path.clone()),
-        None => s
-            .project
-            .shared
-            .iter()
-            .rev()
-            .find(|i| i.kind == "locator")
-            .map(|i| i.path.clone())
-            .ok_or("share a locator first (Share As › Locator)")?,
-    };
+    let path = locator_path(s, p)?;
     let body = super::items::read_text(&json!({"path": path}))?;
     let loc: Locator = serde_json::from_str(&body).map_err(|e| format!("not a RustGIS locator: {e}"))?;
     let limit = p.get("limit").and_then(Value::as_u64).unwrap_or(10).clamp(1, 100) as usize;
@@ -931,11 +998,64 @@ fn find(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"matches": out}))
 }
 
+/// A glTF scene's bytes, and what it approximates or leaves out.
+#[derive(Default)]
+struct SceneBytes {
+    bytes: Vec<u8>,
+    fanned: usize,
+    out_of_range: usize,
+    limited: usize,
+    skipped_outer: usize,
+    holes_dropped: usize,
+    single_vertex_lines: usize,
+    /// Features left out because a place of theirs can't be given in longitude/latitude.
+    unplaced: usize,
+    /// Per layer, in scene order: its name and how many features had their base or height held
+    /// to [`SCENE_TOP`].
+    held: Vec<(String, usize)>,
+}
+
+impl SceneBytes {
+    /// The same counted explanations accompany a usable scene and an empty-result error.
+    fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.fanned > 0 {
+            notes.push(super::items::fanned_caps_note(self.fanned));
+        }
+        if self.out_of_range > 0 {
+            notes.push(format!("{} feature(s) left out of the scene: a coordinate is too far from the map's centre", self.out_of_range));
+        }
+        if self.limited > 0 {
+            notes.push(format!("{} feature(s) left out of the scene: the {MAX_FEATURES} feature limit was reached", self.limited));
+        }
+        if self.unplaced > 0 {
+            notes.push(format!("{} feature(s) left out of the scene: a place can't be given in longitude/latitude", self.unplaced));
+        }
+        if self.skipped_outer > 0 {
+            notes.push(format!("Skipped {} polygon(s) whose outer ring has fewer than 3 vertices", self.skipped_outer));
+        }
+        if self.holes_dropped > 0 {
+            notes.push(format!("Dropped {} hole(s) with fewer than 3 vertices", self.holes_dropped));
+        }
+        if self.single_vertex_lines > 0 {
+            notes.push(format!("Skipped {} line part(s) with a single vertex", self.single_vertex_lines));
+        }
+        for (layer, n) in &self.held {
+            notes.push(format!(
+                "{n} feature(s) of '{layer}' had their extrusion base or height held to the web scene's limit: base plus height stays within 1,000 km"
+            ));
+        }
+        notes
+    }
+}
+
 /// A glTF 2.0 scene (embedded buffer): polygon layers extruded by their extrusion setting (flat
 /// otherwise), lines and points, coloured by their symbology. Metres east (x), up (y) and south
 /// (z) of the map's centre, with a camera where the map view (`view` points across) looks
-/// from: its bearing and pitch, as far off as MapLibre's camera would be.
-fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
+/// from: its bearing and pitch, as far off as MapLibre's camera would be. Also the number of
+/// polygon caps that are fans (the triangulator gave up, or fell back to one), and counted
+/// explanations of features or parts left out.
+fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
     let c = m.center_lonlat();
     let origin = rustgis_geom::lonlat_to_merc(c);
     let k = c.y.to_radians().cos().abs().max(0.01);
@@ -946,14 +1066,14 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
     let mut buffer: Vec<u8> = Vec::new();
     let (mut views, mut accessors, mut meshes, mut nodes, mut materials) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut budget = MAX_FEATURES;
+    let mut scene = SceneBytes::default();
     for l in m.layers.iter().rev().filter(|l| l.visible && !l.is_raster()) {
         // Per colour, its positions and (for triangles) indices.
         // Ordered, so the same scene always writes the same file.
         let mut tri: std::collections::BTreeMap<[u8; 4], (Vec<[f32; 3]>, Vec<u32>)> = Default::default();
         let mut lines: std::collections::BTreeMap<[u8; 4], Vec<[f32; 3]>> = Default::default();
         let ex = l.extrusion.as_ref();
-        let hf = ex.and_then(|e| e.field.as_deref()).and_then(|f| l.dataset.field_index(f));
-        let (base_h, factor) = ex.map_or((0.0, 0.0), |e| (e.height, e.factor));
+        let columns = ex.map(|e| e.columns(&l.dataset)).unwrap_or_default();
         let rows = l.visible_rows();
         let styler = l.styler(Some(m.scale()));
         // The bytes built so far: a feature only adds to its own colour, so each step adds what
@@ -964,14 +1084,51 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
             tri.get(k).map_or(0, |(p, i)| p.len() * 12 + i.len() * 4) + lines.get(k).map_or(0, |v| v.len() * 12)
         };
         let (mut built, mut last): (usize, Option<([u8; 4], usize)>) = (0, None);
+        let mut held = 0usize;
+        // The layer's conversion to longitude/latitude, made once (none: a system that can't be
+        // converted, whose features are all left out, and said).
+        let to_lonlat = l.dataset.lonlat_conversion().ok();
         for (row, ft) in l.dataset.features.iter().enumerate() {
             if let Some((k, before)) = last.take() {
                 built += size(&tri, &lines, &k).saturating_sub(before);
             }
-            if budget == 0 || rows.get(row) != Some(&true) {
+            if rows.get(row) != Some(&true) {
                 continue;
             }
             let Some(g) = &ft.geometry else { continue };
+            if budget == 0 {
+                scene.limited += 1;
+                continue;
+            }
+            // Placed from longitude/latitude, whatever system the layer holds its coordinates in; a
+            // feature with a place that can't be given there is left out, and said, as one too far.
+            let Some(lonlat) = to_lonlat.as_ref().and_then(|to| rustgis_data::Dataset::converted_to_lonlat(to, g)) else {
+                scene.unplaced += 1;
+                continue;
+            };
+            let g = &*lonlat;
+            // A position too far for 32 bits would make the scene invalid: the feature is left out,
+            // and said. Only what would be drawn counts (not a degenerate ring or a one-vertex line).
+            let far = |c: &Coord| {
+                let (x, z) = xy(*c);
+                !x.is_finite() || !z.is_finite()
+            };
+            let drawn = |r: &&Vec<Coord>| r.len() - usize::from(r.len() > 1 && r.first() == r.last()) >= 3;
+            let too_far = match g {
+                Geometry::Polygon(polys) => polys
+                    .iter()
+                    .filter(|rings| rings.first().is_some_and(|r| drawn(&r)))
+                    .flat_map(|rings| rings.iter().filter(drawn))
+                    .flatten()
+                    .any(far),
+                Geometry::Line(parts) => parts.iter().filter(|p| p.len() >= 2).flatten().any(far),
+                Geometry::Point(p) => far(p),
+                Geometry::MultiPoint(ps_) => ps_.iter().any(far),
+            };
+            if too_far {
+                scene.out_of_range += 1;
+                continue;
+            }
             budget -= 1;
             // The geometry built so far, with the buffer already written, stays under the cap
             // (checked as it grows, so a few huge polygons can't run away first).
@@ -979,8 +1136,19 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
                 return Err("the scene would be too large; share fewer features".into());
             }
             let sym = styler.symbol(row);
-            let h = (hf.and_then(|fi| l.dataset.value(row, fi).as_f64()).filter(|v| v.is_finite()).unwrap_or(base_h) * factor)
-                .clamp(0.0, 1e6) as f32;
+            // A layer without an extrusion stands flat on the ground; the base and the height
+            // together stay within SCENE_TOP (the base is never NaN, so the height's cap is a
+            // number); a feature held to it is counted once it draws something.
+            let (h, foot, clipped) = ex.map_or((0.0, 0.0, false), |e| {
+                let (base, height) = (e.base_metres_at(&l.dataset, row, columns), e.metres_at(&l.dataset, row, columns));
+                let foot = base.clamp(0.0, SCENE_TOP);
+                let h = height.clamp(0.0, SCENE_TOP - foot);
+                // Held when the sum passes the top: `SCENE_TOP - foot` can round below a height
+                // that, added to the base, reaches the top exactly.
+                (h as f32, foot as f32, base > foot || base + height > SCENE_TOP)
+            });
+            // The walls stand from the base, the cap sits on them.
+            let top = foot + h;
             let key = [sym.fill.r(), sym.fill.g(), sym.fill.b(), sym.fill.a()];
             last = Some((key, size(&tri, &lines, &key)));
             match g {
@@ -1000,16 +1168,43 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
                             .collect();
                         // A polygon whose outer ring is degenerate is skipped (a hole never
                         // stands in for it); degenerate holes are dropped.
-                        let Some(outer) = open.first().filter(|r| r.len() >= 3) else { continue };
+                        let Some(outer) = open.first().filter(|r| r.len() >= 3) else {
+                            scene.skipped_outer += 1;
+                            continue;
+                        };
+                        scene.holes_dropped += open.iter().skip(1).filter(|r| r.len() < 3).count();
                         let open: Vec<Vec<(f64, f64)>> =
                             std::iter::once(outer.clone()).chain(open.iter().skip(1).filter(|r| r.len() >= 3).cloned()).collect();
                         let Some(outer) = open.first() else { continue };
-                        let Some(tris) = rustgis_geom::triangulate::triangulate(outer, open.get(1..).unwrap_or(&[])) else { continue };
-                        let (pos, idx) = tri.entry(key).or_default();
                         let flat: Vec<(f64, f64)> = open.iter().flatten().copied().collect();
+                        // Past the triangulator's limits, the cap is a fan over the outer ring, as in
+                        // OBJ and STL (the polygon's walls and the rest stay in the scene); its holes'
+                        // positions aren't written for it.
+                        let found = rustgis_geom::triangulate::triangulate_reporting(outer, open.get(1..).unwrap_or(&[]));
+                        let (cap, triangles) = match &found {
+                            Some((tris, _)) => (flat.len(), tris.len()),
+                            None => (outer.len(), outer.len().saturating_sub(2)),
+                        };
+                        // What this polygon adds (its cap's positions and indices, and its walls),
+                        // checked before it is built, so a fan over a huge ring can't run away.
+                        let walls = if h > 0.0 { flat.len() * (4 * 12 + 6 * 4) } else { 0 };
+                        let grown = size(&tri, &lines, &key).saturating_sub(last.map_or(0, |(_, before)| before));
+                        if buffer.len() + built + grown + cap * 12 + triangles * 12 + walls > MAX_SCENE_BYTES {
+                            return Err("the scene would be too large; share fewer features".into());
+                        }
+                        // The fallback fan follows the ring, which may run either way: it is wound
+                        // counter-clockwise (in x, z) like the triangulator's answer, so it faces up too.
+                        let (tris, fan) = found.unwrap_or_else(|| {
+                            let ccw =
+                                outer.iter().zip(outer.iter().cycle().skip(1)).map(|(a, b)| a.0 * b.1 - b.0 * a.1).sum::<f64>() >= 0.0;
+                            let fan = (1..outer.len().saturating_sub(1)).map(|i| if ccw { [0, i, i + 1] } else { [0, i + 1, i] }).collect();
+                            (fan, true)
+                        });
+                        scene.fanned += usize::from(fan);
+                        let (pos, idx) = tri.entry(key).or_default();
                         let base = pos.len() as u32;
-                        for (x, z) in &flat {
-                            pos.push([*x as f32, h, *z as f32]);
+                        for (x, z) in flat.get(..cap).unwrap_or(&[]) {
+                            pos.push([*x as f32, top, *z as f32]);
                         }
                         for t in &tris {
                             // Seen from above (+y), with z pointing south: reverse the winding.
@@ -1023,7 +1218,7 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
                                     let (a, b) = (flat.get(first + i).copied(), flat.get(first + (i + 1) % n).copied());
                                     let (Some(a), Some(b)) = (a, b) else { continue };
                                     let w = pos.len() as u32;
-                                    for (p, y) in [(a, 0.0), (b, 0.0), (b, h), (a, h)] {
+                                    for (p, y) in [(a, foot), (b, foot), (b, top), (a, top)] {
                                         pos.push([p.0 as f32, y, p.1 as f32]);
                                     }
                                     idx.extend([w, w + 1, w + 2, w, w + 2, w + 3]);
@@ -1036,29 +1231,35 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
                 Geometry::Line(parts) => {
                     let seg = lines.entry(key).or_default();
                     for part in parts {
+                        scene.single_vertex_lines += usize::from(part.len() == 1);
                         for w in part.windows(2) {
                             let ((ax, az), (bx, bz)) = (xy(w[0]), xy(w[1]));
-                            seg.push([ax, h, az]);
-                            seg.push([bx, h, bz]);
+                            seg.push([ax, top, az]);
+                            seg.push([bx, top, bz]);
                         }
                     }
                 }
                 Geometry::Point(p) => {
                     let (x, z) = xy(*p);
                     let seg = lines.entry(key).or_default();
-                    // A vertical stick, as tall as the feature (or 50 m).
-                    seg.push([x, 0.0, z]);
-                    seg.push([x, h.max(50.0), z]);
+                    // A vertical stick from the base, as tall as the feature (or 50 m).
+                    seg.push([x, foot, z]);
+                    seg.push([x, top.max(foot + 50.0), z]);
                 }
                 Geometry::MultiPoint(ps_) => {
                     let seg = lines.entry(key).or_default();
                     for p in ps_ {
                         let (x, z) = xy(*p);
-                        seg.push([x, 0.0, z]);
-                        seg.push([x, h.max(50.0), z]);
+                        seg.push([x, foot, z]);
+                        seg.push([x, top.max(foot + 50.0), z]);
                     }
                 }
             }
+            // A feature adds only to its own colour: it drew something when that grew.
+            held += usize::from(clipped && last.is_some_and(|(k, before)| size(&tri, &lines, &k) > before));
+        }
+        if held > 0 {
+            scene.held.push((l.name.clone(), held));
         }
         let mut primitives = Vec::new();
         let material = |key: [u8; 4], materials: &mut Vec<Value>| -> usize {
@@ -1112,7 +1313,9 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
         }
     }
     if nodes.is_empty() {
-        return Err("the map has no features to put in a scene".into());
+        let notes = scene.notes();
+        let why = if notes.is_empty() { String::new() } else { format!(": {}", notes.join("; ")) };
+        return Err(format!("the map has no features to put in a scene{why}"));
     }
     // As drawn: a camera set from outside a command may not be clamped yet.
     let mut at = m.camera;
@@ -1134,7 +1337,8 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<Vec<u8>, String> {
         "extras": {"origin": [c.x, c.y], "units": "metres east, up and south of origin (longitude, latitude)",
             "bearing": at.bearing, "pitch": at.pitch},
     });
-    serde_json::to_vec(&doc).map_err(|e| e.to_string())
+    scene.bytes = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
+    Ok(scene)
 }
 
 /// The glTF camera of a scene and the node placing it: looking at the map's centre (the scene's
@@ -1166,26 +1370,11 @@ fn viewpoint(m: &Map, at: &rustgis_map::Camera, view: (f64, f64)) -> (Value, Val
 
 /// A link chart: the features joined by the map's relationships, as a node-link diagram (a
 /// self-contained page with a force layout; drag nodes, hover for names).
-fn link_chart(s: &Session, rel: Option<&str>) -> Result<String, String> {
-    let rels: Vec<&rustgis_map::design::Relationship> = s
-        .project
-        .maps
-        .iter()
-        .flat_map(|m| m.editing.relationships.iter())
-        .filter(|r| rel.is_none_or(|n| r.name.eq_ignore_ascii_case(n)))
-        .collect();
-    if rels.is_empty() {
-        return Err(match rel {
-            Some(n) => format!("no relationship '{n}'"),
-            None => "the project has no relationships (Data Design › Relationships)".into(),
-        });
-    }
-    // A layer by name (the active map first) and the map it's in.
-    let active = s.project.active_map;
-    let find = |n: &str| {
-        let in_map = |mi: usize| s.project.maps.get(mi).and_then(|m| m.layer_by_name(n)).map(|l| (mi, l));
-        in_map(active).or_else(|| (0..s.project.maps.len()).find_map(in_map))
-    };
+/// The page, and what the chart's limits leave out of it when they do: said by whoever shares
+/// it, and on the page (#1947).
+fn link_chart(s: &Session, rel: Option<&str>) -> Result<(String, Option<String>), String> {
+    let rels = link_relationships(s, rel)?;
+    let find = |name: &str| link_layer(s, name).and_then(|(m, l)| s.project.maps.iter().position(|p| std::ptr::eq(p, m)).map(|i| (i, l)));
     let mut nodes: Vec<Value> = Vec::new();
     // Nodes by map, layer id and row (same-named layers in different maps stay apart).
     let mut index: HashMap<(usize, u32, usize), usize> = HashMap::new();
@@ -1199,10 +1388,23 @@ fn link_chart(s: &Session, rel: Option<&str>) -> Result<String, String> {
             .or_else(|| ds.fields.iter().position(|f| !f.ty.is_numeric()));
         fi.map(|i| ds.value(row, i).to_string()).unwrap_or_else(|| format!("{} {}", l.name, row + 1))
     };
-    'rels: for (gi, r) in rels.iter().enumerate() {
-        if nodes.len() >= MAX_NODES {
-            break;
+    // A feature's node, made while the chart has room for one.
+    let node = |index: &mut HashMap<(usize, u32, usize), usize>, nodes: &mut Vec<Value>, mi: usize, l: &Layer, row: usize, gi: usize| {
+        if let Some(&i) = index.get(&(mi, l.id, row)) {
+            return Some(i);
         }
+        if nodes.len() >= MAX_NODES {
+            return None;
+        }
+        nodes.push(json!({"name": label(l, row), "layer": l.name, "group": gi}));
+        index.insert((mi, l.id, row), nodes.len() - 1);
+        Some(nodes.len() - 1)
+    };
+    // What the chart would show without its limits, to say what they leave out: each related
+    // feature once, and each relation.
+    let mut related: HashSet<(usize, u32, usize)> = HashSet::new();
+    let mut relations = 0u64;
+    for (gi, r) in rels.iter().enumerate() {
         let (Some((om, o)), Some((dm, d))) = (find(&r.origin), find(&r.destination)) else { continue };
         let (Some(ok), Some(dk)) = (o.dataset.field_index(&r.origin_key), d.dataset.field_index(&r.destination_key)) else { continue };
         let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1219,31 +1421,80 @@ fn link_chart(s: &Session, rel: Option<&str>) -> Result<String, String> {
                 by_key.entry(v).or_default().push(row);
             }
         }
+        // The features a key relates to are counted once, however many features share it.
+        let mut counted: HashSet<String> = HashSet::new();
+        // Where a key's destinations already in the chart sit among its destinations, found when
+        // the chart has no room for another one and kept while it stays that size: a full chart
+        // then looks at these only, not at every destination of every feature.
+        let mut in_chart: HashMap<String, (usize, Vec<usize>)> = HashMap::new();
         for orow in 0..o.dataset.features.len() {
             let Some(key) = key_of(&o.dataset, orow, ok) else { continue };
             let Some(drows) = by_key.get(&key) else { continue };
-            if nodes.len() >= MAX_NODES {
-                break 'rels;
+            related.insert((om, o.id, orow));
+            // Counted in 64 bits: relations can pass `usize` in the browser (32 bits).
+            relations += drows.len() as u64;
+            if counted.insert(key.clone()) {
+                related.extend(drows.iter().map(|&drow| (dm, d.id, drow)));
             }
-            let mut node = |mi: usize, l: &Layer, row: usize, nodes: &mut Vec<Value>| -> usize {
-                *index.entry((mi, l.id, row)).or_insert_with(|| {
-                    nodes.push(json!({"name": label(l, row), "layer": l.name, "group": gi}));
-                    nodes.len() - 1
-                })
-            };
-            let a = node(om, o, orow, &mut nodes);
-            for &drow in drows.iter().take(200) {
-                if nodes.len() >= MAX_NODES || links.len() >= MAX_LINKS {
-                    break 'rels;
+            if links.len() >= MAX_LINKS {
+                continue;
+            }
+            // The feature is drawn with its first link, never alone: each link needs room for
+            // whichever of its ends the chart doesn't hold yet. A feature without room is left
+            // out; one already in the chart may still be linked.
+            // Up to 200 links drawn from it: destinations the chart has no room for don't count
+            // toward them, so a later one it can draw still is.
+            let mut a = index.get(&(om, o.id, orow)).copied();
+            // A feature the chart has no room for can't be drawn, so none of its links can be.
+            if a.is_none() && nodes.len() >= MAX_NODES {
+                continue;
+            }
+            let mut drawn_here = 0;
+            let mut i = 0;
+            while i < drows.len() {
+                if drawn_here >= MAX_FEATURE_LINKS || links.len() >= MAX_LINKS {
+                    break;
                 }
-                let b = node(dm, d, drow, &mut nodes);
-                links.push(json!({"source": a, "target": b, "relationship": r.name}));
+                let drow = drows[i];
+                // A feature related to itself is one end, not two.
+                let origin_new = a.is_none();
+                let dest_new = !index.contains_key(&(dm, d.id, drow)) && !(origin_new && (om, o.id, orow) == (dm, d.id, drow));
+                let new = usize::from(origin_new) + usize::from(dest_new);
+                if nodes.len() + new > MAX_NODES {
+                    // No room for a destination the chart doesn't hold: on to the next one it
+                    // does, or to the feature itself.
+                    let (at, rows) = in_chart.entry(key.clone()).or_insert((usize::MAX, Vec::new()));
+                    if *at != nodes.len() {
+                        *rows = (0..drows.len()).filter(|&j| index.contains_key(&(dm, d.id, drows[j]))).collect();
+                        *at = nodes.len();
+                    }
+                    let next_held = rows.get(rows.partition_point(|&j| j <= i)).copied();
+                    let next_self =
+                        if origin_new && (om, o.id) == (dm, d.id) { drows.binary_search(&orow).ok().filter(|&j| j > i) } else { None };
+                    match next_held.into_iter().chain(next_self).min() {
+                        Some(j) => i = j,
+                        None => break,
+                    }
+                    continue;
+                }
+                let (Some(from), Some(to)) =
+                    (a.or_else(|| node(&mut index, &mut nodes, om, o, orow, gi)), node(&mut index, &mut nodes, dm, d, drow, gi))
+                else {
+                    i += 1;
+                    continue;
+                };
+                a = Some(from);
+                links.push(json!({"source": from, "target": to, "relationship": r.name}));
+                drawn_here += 1;
+                i += 1;
             }
         }
     }
     if links.is_empty() {
         return Err("no features are related through those relationships".into());
     }
+    let left = (nodes.len() < related.len() || (links.len() as u64) < relations)
+        .then(|| format!("{} of the {} related features and {} of the {} links", nodes.len(), related.len(), links.len(), relations));
     let title = rel.unwrap_or("Relationships");
     let mut legend = String::new();
     let layers: Vec<String> = {
@@ -1255,7 +1506,11 @@ fn link_chart(s: &Session, rel: Option<&str>) -> Result<String, String> {
     for (i, l) in layers.iter().enumerate() {
         let _ = write!(legend, "<span><i style=\"background:hsl({},60%,50%)\"></i>{}</span>", i * 137 % 360, html_escape(l));
     }
-    Ok(format!(
+    // Whoever opens the page sees that it shows part of what's related.
+    if let Some(left) = &left {
+        let _ = write!(legend, "<br><small>Shows {}.</small>", html_escape(left));
+    }
+    let html = format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
 <style>html,body{{margin:0;height:100%;font-family:system-ui,sans-serif;background:#fafbfc}}svg{{width:100%;height:100%}}line{{stroke:#9aa5b1;stroke-opacity:.6}}circle{{stroke:#fff;stroke-width:1.5;cursor:grab}}
 #k{{position:fixed;left:8px;top:8px;background:#fffe;padding:6px 10px;border-radius:6px;font-size:13px;box-shadow:0 1px 4px #0002}}#k span{{margin-right:10px}}#k i{{display:inline-block;width:10px;height:10px;border-radius:5px;margin-right:4px}}</style></head>
@@ -1282,5 +1537,215 @@ const moving=N.reduce((m,a)=>Math.max(m,Math.abs(a.vx),Math.abs(a.vy)),0);if(mov
         nodes = script_json(&Value::Array(nodes)),
         links = script_json(&Value::Array(links)),
         layers = script_json(&json!(layers)),
-    ))
+    );
+    let said = left.map(|left| {
+        format!(
+            "the link chart shows {left}; a link chart takes at most {MAX_NODES} features, {MAX_LINKS} links and {MAX_FEATURE_LINKS} links from one feature in each relationship"
+        )
+    });
+    Ok((html, said))
+}
+
+/// Resolves saved/default and literal locator paths without reading their contents.
+pub(crate) fn locator_path(s: &Session, p: &Value) -> Result<String, String> {
+    match ps(p, "locator") {
+        Some(n) => Ok(s
+            .project
+            .shared
+            .iter()
+            .rev()
+            .find(|i| i.kind == "locator" && i.name.eq_ignore_ascii_case(n))
+            .map_or_else(|| n.to_string(), |i| i.path.clone())),
+        None => s
+            .project
+            .shared
+            .iter()
+            .rev()
+            .find(|i| i.kind == "locator")
+            .map(|i| i.path.clone())
+            .ok_or_else(|| "share a locator first (Share As › Locator)".to_string()),
+    }
+}
+
+/// Sharing accepts a string map name; every other value selects the active map.
+fn shared_map<'a>(input: &'a impl super::InputSource, p: &Value) -> Result<&'a Map, String> {
+    let context = input.input_context();
+    let s = &context;
+    match ps(p, "map") {
+        Some(n) => s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no map '{n}'")),
+        None => Ok(s.map()),
+    }
+}
+/// Reconstructs a managed item's effective stored source and path exactly as re-sharing uses them.
+fn update_params(input: &impl super::InputSource, p: &Value, kind: &str, new_source: Option<&str>) -> Result<Value, String> {
+    let context = input.input_context();
+    let s = &context;
+    let item = match p.get("item") {
+        Some(Value::Number(n)) => s.project.shared.iter().find(|i| Some(u64::from(i.id)) == n.as_u64() && i.kind == kind),
+        Some(Value::String(n)) => s.project.shared.iter().rev().find(|i| i.kind == kind && i.name.eq_ignore_ascii_case(n)),
+        _ => s.project.shared.iter().rev().find(|i| i.kind == kind),
+    }
+    .cloned()
+    .ok_or_else(|| format!("no shared {} to update", KINDS.iter().find(|k| k.0 == kind).map_or(kind, |k| k.2).to_ascii_lowercase()))?;
+    if !item.this_session {
+        return Err(format!(
+            "'{}' came with the opened project; share it again with Share As (choosing where it goes) before updating it",
+            item.name
+        ));
+    }
+    let source = new_source.unwrap_or(&item.source).to_string();
+    Ok(match kind {
+        "webLayer" => json!({"layer": source, "path": item.path}),
+        "linkChart" => json!({"relationship": if source.is_empty() { Value::Null } else { json!(source) }, "path": item.path}),
+        _ => json!({"map": source, "path": item.path}),
+    })
+}
+
+/// Binds the managed web map's effective source and saved output path.
+fn update_web_map_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    update_source_inputs(input, p, "webMap", ps(p, "map"))
+}
+/// Binds the managed scene's effective source and saved output path.
+fn update_web_scene_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    update_source_inputs(input, p, "webScene", ps(p, "map"))
+}
+/// Binds a managed feature layer even when the request omits its source.
+fn update_layer_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    update_source_inputs(input, p, "webLayer", ps(p, "layer"))
+}
+/// Binds the managed chart's stored relationship selection and saved path.
+fn update_links_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    update_source_inputs(input, p, "linkChart", ps(p, "relationship"))
+}
+/// Uses the same effective parameter reconstruction as the actual managed update.
+fn update_source_inputs(input: &impl super::InputSource, p: &Value, kind: &str, new_source: Option<&str>) -> Result<super::Inputs, String> {
+    let q = update_params(input, p, kind, new_source)?;
+    let mut inputs = share_kind_inputs(input, &q, kind)?;
+    inputs.state = json!({"source":inputs.state,"effective":q});
+    Ok(inputs)
+}
+
+/// Keeps every matching relationship in project order, or all relationships when omitted.
+fn link_relationships<'a>(
+    input: &'a impl super::InputSource,
+    rel: Option<&str>,
+) -> Result<Vec<&'a rustgis_map::design::Relationship>, String> {
+    let context = input.input_context();
+    let s = &context;
+    let rels = s
+        .project
+        .maps
+        .iter()
+        .flat_map(|m| &m.editing.relationships)
+        .filter(|r| rel.is_none_or(|n| r.name.eq_ignore_ascii_case(n)))
+        .collect::<Vec<_>>();
+    if rels.is_empty() {
+        return Err(match rel {
+            Some(n) => format!("no relationship '{n}'"),
+            None => "the project has no relationships (Data Design › Relationships)".into(),
+        });
+    }
+    Ok(rels)
+}
+/// Relationship endpoints resolve in the active map first, then the first project match.
+fn link_layer<'a>(input: &'a impl super::InputSource, name: &str) -> Option<(&'a Map, &'a Layer)> {
+    let context = input.input_context();
+    let s = &context;
+    let in_map = |m: &'a Map| m.layer_by_name(name).map(|l| (m, l));
+    in_map(s.map()).or_else(|| s.project.maps.iter().find_map(in_map))
+}
+/// Collects the actual existing relationship endpoints without constructing the chart.
+fn link_source_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let rels = link_relationships(input, ps(p, "relationship"))?;
+    let mut inputs =
+        super::Inputs::layers(rels.iter().flat_map(|r| [r.origin.as_str(), r.destination.as_str()]).filter_map(|n| link_layer(input, n)));
+    inputs.state = json!({"relationships":rels});
+    Ok(inputs)
+}
+
+/// Layer inclusion is shared by the serializer's whole-source preparation and its pure selector.
+fn shared_layer(kind: &str, l: &Layer) -> bool {
+    match kind {
+        "geodataService" => !l.is_raster() && !l.graphics,
+        "webScene" => l.visible && !l.is_raster(),
+        _ => l.visible,
+    }
+}
+/// Selects a named model case-insensitively, otherwise the last model, for web-tool serialization.
+fn shared_model(input: &impl super::InputSource, p: &Value) -> Result<usize, String> {
+    let context = input.input_context();
+    let s = &context;
+    match ps(p, "model") {
+        Some(n) => s.project.models.iter().position(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no model '{n}'")),
+        None => s.project.models.len().checked_sub(1).ok_or_else(|| "make a model first (ModelBuilder)".into()),
+    }
+}
+/// Binds effective included datasets and the actual target path without producing export bytes.
+fn share_kind_inputs(input: &impl super::InputSource, p: &Value, kind: &str) -> Result<super::Inputs, String> {
+    let context = input.input_context();
+    let s = &context;
+    let (mut inputs, name) = match kind {
+        "webMap" | "webScene" | "geodataService" => {
+            let map = shared_map(input, p)?;
+            let mut baked = map.clone();
+            baked.bake_groups();
+            let mut inputs = super::Inputs::layers(
+                baked.layers.iter().filter(|l| shared_layer(kind, l)).filter_map(|l| map.layer(l.id)).map(|l| (map, l)),
+            );
+            inputs.maps.push(map.instance_id());
+            if kind == "geodataService" {
+                inputs.tables.extend(s.project.tables.iter().map(|t| t.id));
+            }
+            (inputs, map.name.clone())
+        }
+        "webTool" => {
+            let i = shared_model(input, p)?;
+            let model = s.project.models.get(i).ok_or("no model")?;
+            let mut inputs = super::Inputs::layers(std::iter::empty());
+            inputs.state = json!({"model":model});
+            (inputs, model.name.clone())
+        }
+        "linkChart" => (link_source_inputs(s, p)?, ps(p, "relationship").unwrap_or("Relationships").to_string()),
+        _ => {
+            let l = layer_of(input, p)?;
+            (super::Inputs::primary(s, p)?, l.name)
+        }
+    };
+    let ext = KINDS.iter().find(|k| k.0 == kind).map_or("bin", |k| k.1);
+    let path = target(input, p, &name, ext)?;
+    inputs.review_places.push(path.clone());
+    inputs.state = json!({"selection":inputs.state,"path":path});
+    Ok(inputs)
+}
+/// Binds visible web-map sources after applying the same group visibility as export.
+fn web_map_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    share_kind_inputs(input, p, "webMap")
+}
+/// Binds visible feature sources that the scene exporter materializes.
+fn web_scene_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    share_kind_inputs(input, p, "webScene")
+}
+/// Binds the feature map and standalone tables consumed by geodata export.
+fn geodata_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    share_kind_inputs(input, p, "geodataService")
+}
+/// Freezes the selected model's executable definition for this output operation.
+fn web_tool_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    share_kind_inputs(input, p, "webTool")
+}
+/// Binds chart relationships together with the effective export destination.
+fn link_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    share_kind_inputs(input, p, "linkChart")
+}
+/// Binds the shared feature layer and its effective destination.
+fn layer_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    share_kind_inputs(input, p, "webLayer")
+}
+/// Binds the style's owning feature layer and effective JSON destination.
+fn style_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    share_kind_inputs(input, p, "webStyle")
+}
+/// Binds the locator's feature layer and effective locator destination.
+fn locator_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    share_kind_inputs(input, p, "locator")
 }

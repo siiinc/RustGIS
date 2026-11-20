@@ -5,7 +5,11 @@
 
 use serde_json::Value;
 
+pub mod area;
+pub mod bands;
 pub mod catalog;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dated;
 
 /// Element 84's Earth Search (Sentinel-2, Landsat, Copernicus DEM and more, on AWS), the default.
 pub const EARTH_SEARCH: &str = "https://earth-search.aws.element84.com/v1";
@@ -30,6 +34,8 @@ const MAX_TEXT: usize = 2000;
 const MAX_FOOTPRINT: usize = 20_000;
 /// The most properties kept with an item.
 const MAX_PROPERTIES: usize = 100;
+/// The most codes for a failed retrieval kept with an asset.
+pub const MAX_INVALID: usize = 32;
 
 /// A collection an API offers.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,6 +60,198 @@ pub struct Asset {
     /// Its first band's stored no-data value (`raster:bands` or `eo:bands` `nodata`), for files
     /// whose own header doesn't name it.
     pub nodata: Option<f64>,
+    /// Stored values that are codes for a failed retrieval rather than values (JAXA Earth's
+    /// `je:rasters` `dn.error`).
+    pub invalid: Vec<f64>,
+    /// Whether its metadata names such codes but they couldn't be read whole (one isn't a number,
+    /// or there are more than are kept): its values can't be told from them.
+    pub codes_unread: bool,
+    /// Each band of its file as the catalog describes it (`eo:bands`, `raster:bands`, or STAC 1.1's
+    /// `bands`), in file order; empty when it describes none. See [`bands`].
+    pub bands: Vec<BandInfo>,
+    /// Whether the catalog describes more bands than are kept (`bands` stops at the first
+    /// [`MAX_BANDS`]): the ones past them can't be found by name.
+    pub bands_cut: bool,
+    /// Whether JAXA Earth's `je:rasters` gives its first band's scale, offset or no-data as something
+    /// that isn't a number (a string, say): not read, so a band made from it is refused where it is used.
+    pub je_unread: bool,
+    /// Whether a band list (`eo:bands`, `raster:bands`, `bands`) is there but isn't a list: none of its
+    /// numbers or names were read, so every band of the asset is refused where it is used.
+    pub lists_unread: bool,
+    /// How many bands the catalog says the file has (more than `bands` keeps, when it is cut).
+    pub declared_bands: usize,
+}
+
+/// One band of an asset's file, as its catalog describes it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BandInfo {
+    /// Its common name (`red`, `nir`, `swir16`…), lower case; empty when it has none.
+    pub common: String,
+    /// Its `raster:bands` scale and offset: a stored value `v` means `v · scale + offset`.
+    pub scale: Option<f64>,
+    pub offset: Option<f64>,
+    /// Its stored no-data value, when the catalog gives a number (`"nan"` is not one).
+    pub nodata: Option<f64>,
+    /// Whether the catalog gives its scale, offset or no-data as something that isn't a number (a
+    /// string such as `"0.0001"`, or a number that isn't finite): they were not read, and a band
+    /// made from it would come out unscaled, so it is refused where it is used.
+    pub unread: bool,
+}
+
+/// The most bands of one asset that are kept.
+const MAX_BANDS: usize = 64;
+
+/// How many bands an asset describes, before the cut to [`MAX_BANDS`].
+fn declared_bands(asset: &Value) -> usize {
+    let list = |key: &str| asset.get(key).and_then(Value::as_array);
+    let named = list("eo:bands").or_else(|| list("bands"));
+    named.map_or(0, |l| l.len()).max(list("raster:bands").map_or(0, |l| l.len()))
+}
+
+/// The longest common name kept, in characters.
+const MAX_NAME: usize = 32;
+
+/// Whether a band of the asset (or the asset itself) has a common name that `asset_bands` doesn't keep whole: longer
+/// than [`MAX_NAME`] characters (cut), or not text (dropped). Said like the bands past
+/// [`MAX_BANDS`] are (`bands_cut`).
+fn long_name(asset: &Value) -> bool {
+    let name_is_long = |v: &Value| match v {
+        Value::Null => false,
+        Value::String(t) => t.trim().chars().count() > MAX_NAME,
+        _ => true,
+    };
+    let list = |key: &str| asset.get(key).and_then(Value::as_array);
+    // The asset's own `eo:common_name` (a file of one band described by no list) is held to the same.
+    asset.get("eo:common_name").is_some_and(name_is_long)
+        || list("eo:bands").or_else(|| list("bands")).is_some_and(|l| {
+            l.iter().take(MAX_BANDS).any(|b| b.get("common_name").or_else(|| b.get("eo:common_name")).is_some_and(name_is_long))
+        })
+}
+
+/// Whether a band list (`eo:bands`, `raster:bands`, STAC 1.1's `bands`) is there but isn't a list (an
+/// object, or text): none of its numbers or names are read, which is said like an unreadable number.
+fn bands_odd(asset: &Value) -> bool {
+    ["eo:bands", "raster:bands", "bands"].iter().any(|k| asset.get(*k).is_some_and(|v| !v.is_null() && !v.is_array()))
+}
+
+/// Whether JAXA Earth's `je:rasters` gives the number `field` (`scale`, `offset` or `nodata`, as
+/// `dn2value.slope`, `dn2value.offset`, `dn.nodata`) that is there but not a number (a string such
+/// as `"0.0001"`, or one that isn't finite); a no-data may be `"nan"`, `"inf"` or `"-inf"`, as in
+/// [`odd_numbers`].
+fn je_field_odd(asset: &Value, field: &str) -> bool {
+    let Some(je) = asset.get("je:rasters") else { return false };
+    let (group, name, nodata) = match field {
+        "scale" => ("dn2value", "slope", false),
+        "offset" => ("dn2value", "offset", false),
+        "nodata" => ("dn", "nodata", true),
+        _ => return false,
+    };
+    match je.get(group).and_then(|g| g.get(name)) {
+        None | Some(Value::Null) => false,
+        Some(Value::Number(n)) => !n.as_f64().is_some_and(f64::is_finite),
+        Some(Value::String(s)) => !(nodata && matches!(s.as_str(), "nan" | "inf" | "-inf")),
+        Some(_) => true,
+    }
+}
+
+/// Whether any of JAXA's numbers is odd (see [`je_field_odd`]).
+fn je_odd(asset: &Value) -> bool {
+    // Only for a number the asset itself leaves undeclared: a declared one is read before JAXA's.
+    NUMBER_FIELDS.iter().any(|(keys, _)| !declares(Some(asset), keys) && je_field_odd(asset, keys[0]))
+}
+
+/// Whether an asset describes no bands at all (no list, no `eo:common_name`): it is read as one band,
+/// numbered from the asset itself.
+fn describes_no_bands(asset: &Value) -> bool {
+    declared_bands(asset) == 0 && asset.get("eo:common_name").and_then(Value::as_str).is_none()
+}
+
+/// Whether a band's scale, offset or no-data is there but not a number: a string (`"0.0001"`) or
+/// a number that isn't finite. A no-data may be `"nan"`, `"inf"` or `"-inf"`, which the raster
+/// extension allows, and is then not odd. [`item_json`] marks a band it passed on with `rg:unread`.
+fn odd_numbers(band: Option<&Value>) -> bool {
+    let Some(band) = band else { return false };
+    band.get("rg:unread").and_then(Value::as_bool) == Some(true)
+        || NUMBER_FIELDS.iter().any(|(keys, nodata)| odd_field(band, keys, *nodata))
+}
+
+/// The numbers a band carries, each as the keys it may be spelled with (bare or `raster:`), and whether
+/// it is a no-data, which may be `"nan"`, `"inf"` or `"-inf"`.
+const NUMBER_FIELDS: [(&[&str], bool); 3] =
+    [(&["scale", "raster:scale"], false), (&["offset", "raster:offset"], false), (&["nodata", "raster:nodata"], true)];
+
+/// Whether the object gives one of the number's keys at all (a value, odd or not; null is none).
+fn declares(object: Option<&Value>, keys: &[&str]) -> bool {
+    keys.iter().any(|k| object.and_then(|o| o.get(*k)).is_some_and(|v| !v.is_null()))
+}
+
+/// Whether the object's number is there but not a number: a string (`"0.0001"`), an object, or a
+/// number that isn't finite. Without the mark [`item_json`] writes (the asset's is JAXA's).
+fn odd_field(object: &Value, keys: &[&str], nodata: bool) -> bool {
+    keys.iter().any(|k| match object.get(*k) {
+        None | Some(Value::Null) => false,
+        Some(Value::Number(n)) => !n.as_f64().is_some_and(f64::is_finite),
+        Some(Value::String(s)) => !(nodata && matches!(s.as_str(), "nan" | "inf" | "-inf")),
+        Some(_) => true,
+    })
+}
+
+/// Whether an asset that describes no bands (no list, no `eo:common_name`: it is read as one band,
+/// numbered from the asset itself) gives its scale, offset or no-data as something that isn't a number.
+/// For an asset with bands, `asset_bands` marks the ones that would take the asset's number.
+fn lone_odd(asset: &Value) -> bool {
+    declared_bands(asset) == 0
+        && asset.get("eo:common_name").and_then(Value::as_str).is_none()
+        && NUMBER_FIELDS.iter().any(|(keys, nodata)| odd_field(asset, keys, *nodata))
+}
+
+/// The bands an asset describes, from `eo:bands` (names) or STAC 1.1's unified `bands`, and
+/// `raster:bands` (scale, offset, no-data), matched by position. Both spellings of the raster
+/// terms are read (`scale` and `raster:scale`). A band's own declaration of a number (even
+/// `"nodata": "nan"`) is its own: only a band that declares none takes the asset's, then, for the
+/// first band, JAXA's; an asset's number given as text marks the bands that would take it unread.
+/// Hostile input: at most [`MAX_BANDS`], text cut (an asset with more says so in `bands_cut`).
+fn asset_bands(asset: &Value) -> Vec<BandInfo> {
+    let list = |key: &str| asset.get(key).and_then(Value::as_array);
+    let named = list("eo:bands").or_else(|| list("bands"));
+    let raster = list("raster:bands");
+    // STAC's EO extension allows the name on the asset itself, for a file of one band described by no list.
+    let asset_name = asset.get("eo:common_name").and_then(Value::as_str);
+    // An asset whose own number is text makes one band of it, so that band is refused by name.
+    let odd_asset = NUMBER_FIELDS.iter().any(|(keys, nodata)| odd_field(asset, keys, *nodata));
+    let count = declared_bands(asset).max(usize::from(asset_name.is_some() || odd_asset)).min(MAX_BANDS);
+    let number = |band: Option<&Value>, keys: &[&str]| keys.iter().find_map(|k| band?.get(*k)?.as_f64()).filter(|v| v.is_finite());
+    (0..count)
+        .map(|i| {
+            let (named, raster) = (named.and_then(|l| l.get(i)), raster.and_then(|l| l.get(i)));
+            let first = i == 0;
+            // Whether the band declares the number itself, and what it is: that stops every fallback.
+            let own = |keys: &[&str]| declares(raster, keys) || declares(named, keys);
+            let pick = |(keys, _): (&[&str], bool)| {
+                if own(keys) {
+                    number(raster, keys).or_else(|| number(named, keys))
+                } else {
+                    number(Some(asset), keys).or_else(|| first.then(|| band_number(asset, keys[0])).flatten())
+                }
+            };
+            // The asset's number given as text, for a band that takes it from there.
+            let inherited_odd = NUMBER_FIELDS.iter().any(|(keys, nodata)| !own(keys) && odd_field(asset, keys, *nodata))
+                // The first band takes JAXA's number only for a field it, and the asset, leave undeclared.
+                || (first && NUMBER_FIELDS.iter().any(|(keys, _)| !own(keys) && number(Some(asset), keys).is_none() && je_field_odd(asset, keys[0])));
+            BandInfo {
+                common: named
+                    .and_then(|b| b.get("common_name").or_else(|| b.get("eo:common_name")))
+                    .and_then(Value::as_str)
+                    .or_else(|| (first && named.is_none()).then_some(asset_name).flatten())
+                    .map(|t| t.trim().to_ascii_lowercase().chars().take(MAX_NAME).collect())
+                    .unwrap_or_default(),
+                scale: pick(NUMBER_FIELDS[0]),
+                offset: pick(NUMBER_FIELDS[1]),
+                nodata: pick(NUMBER_FIELDS[2]),
+                unread: odd_numbers(raster) || odd_numbers(named) || inherited_odd,
+            }
+        })
+        .collect()
 }
 
 /// An item: a scene (or tile) with its footprint, time and assets.
@@ -62,6 +260,10 @@ pub struct Item {
     pub id: String,
     pub collection: String,
     pub datetime: String,
+    /// Whether `datetime` is the item's own `properties.datetime`: false when that is null or
+    /// missing, and `datetime` stands in with `start_datetime` (which an API sorting on
+    /// `datetime` did not sort by).
+    pub own_datetime: bool,
     /// West, south, east, north.
     pub bbox: Option<[f64; 4]>,
     /// Its footprint, a GeoJSON geometry.
@@ -75,6 +277,8 @@ pub struct Item {
     /// `self` link, which it could point anywhere); `None` for an item given whole, whose assets
     /// may then only be public web addresses.
     pub origin: Option<String>,
+    /// Observed network reach of the document this item was read from.
+    pub origin_reach: crate::address::Reach,
     /// Its properties, to show: the first hundred plain values (not objects or arrays), long
     /// text cut.
     pub properties: Option<Value>,
@@ -90,6 +294,9 @@ pub struct Search {
     pub collections: Vec<String>,
     /// West, south, east, north, in longitude/latitude.
     pub bbox: Option<[f64; 4]>,
+    /// A shape the items must meet (STAC's `intersects`), in longitude/latitude, as
+    /// [`area::merge`] makes it. It replaces `bbox`: Item Search takes one or the other.
+    pub intersects: Option<rustgis_data::Geometry>,
     /// A date or a range: `2024-06-01`, `2024-06-01/2024-06-30`, `2024-06-01/..`, or RFC 3339.
     pub datetime: Option<String>,
     pub limit: usize,
@@ -105,13 +312,15 @@ pub struct Search {
 pub fn api(url: Option<&str>) -> Result<String, String> {
     let Some(u) = url.map(str::trim).filter(|u| !u.is_empty()) else { return Ok(EARTH_SEARCH.to_string()) };
     crate::address::check(u, None)?;
-    let u = u.split(['?', '#']).next().unwrap_or(u).trim_end_matches('/');
-    Ok(u.strip_suffix("/search").or_else(|| u.strip_suffix("/collections")).unwrap_or(u).to_string())
+    let inner = crate::logins::inner(u);
+    let inner = inner.split(['?', '#']).next().unwrap_or(inner).trim_end_matches('/');
+    let inner = inner.strip_suffix("/search").or_else(|| inner.strip_suffix("/collections")).unwrap_or(inner);
+    Ok(crate::logins::inherit(u, inner))
 }
 
 /// The request for an API's collections.
 pub fn collections_url(api: &str) -> String {
-    format!("{api}/collections")
+    crate::template::join(api, &format!("{}/collections", crate::logins::inner(api)))
 }
 
 /// The request for a search (STAC API's `GET /search`).
@@ -121,7 +330,14 @@ pub fn search_url(api: &str, s: &Search) -> Result<String, String> {
     if !ids.is_empty() {
         q.push(format!("collections={}", encode(&ids.join(","))));
     }
-    if let Some([w, south, e, n]) = s.bbox {
+    if let Some(shape) = &s.intersects {
+        let json = intersects_json(shape)?;
+        // The query carries it as JSON, and servers refuse a long one.
+        if json.len() > MAX_GET_SHAPE {
+            return Err("the search area is too detailed to send in a web address: simplify it".into());
+        }
+        q.push(format!("intersects={}", encode(&json)));
+    } else if let Some([w, south, e, n]) = s.bbox {
         let ok = |x: f64, lim: f64| x.is_finite() && (-lim..=lim).contains(&x);
         if !(ok(w, 180.0) && ok(e, 180.0) && ok(south, 90.0) && ok(n, 90.0) && south < n) {
             return Err("bbox is [west, south, east, north] in longitude/latitude".into());
@@ -135,23 +351,126 @@ pub fn search_url(api: &str, s: &Search) -> Result<String, String> {
         let c = c.clamp(0.0, 100.0);
         q.push(format!("query={}", encode(&format!(r#"{{"eo:cloud_cover":{{"lte":{c}}}}}"#))));
     }
-    if let Some(by) = s.sortby.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
-        let (sign, field) = by.strip_prefix('-').map(|f| ("-", f)).unwrap_or(("+", by.trim_start_matches('+')));
-        if field.is_empty() || field.len() > 100 || !field.chars().all(|c| c.is_ascii_alphanumeric() || "_:.-".contains(c)) {
-            return Err(format!("{by}: sortby is a property's name, - first for descending"));
-        }
-        let field = if field.starts_with("properties.") || matches!(field, "id" | "collection") {
-            field.to_string()
-        } else {
-            format!("properties.{field}")
-        };
+    if let Some((sign, field)) = sort_parts(s.sortby.as_deref())? {
         q.push(format!("sortby={}", encode(&format!("{sign}{field}"))));
     }
-    Ok(format!("{api}/search?{}", q.join("&")))
+    Ok(crate::template::join(api, &format!("{}/search?{}", crate::logins::inner(api), q.join("&"))))
+}
+
+/// The longest shape (as JSON) a GET request carries.
+const MAX_GET_SHAPE: usize = 4000;
+
+/// A search shape as the JSON `intersects` takes, refused when it isn't on the globe or has more
+/// positions than a request should.
+fn intersects_json(shape: &rustgis_data::Geometry) -> Result<String, String> {
+    if !area::on_globe(shape) {
+        return Err("the search area has a position that isn't a longitude (-180 to 180) and latitude (-90 to 90)".into());
+    }
+    if area::positions(shape) > area::MAX_POSITIONS {
+        return Err(format!("the search area has more than {} positions: simplify it", area::MAX_POSITIONS));
+    }
+    Ok(area::to_geojson(shape).to_string())
+}
+
+/// A sort as a sign (`+` or `-`) and a property's full name, or none.
+fn sort_parts(sortby: Option<&str>) -> Result<Option<(&'static str, String)>, String> {
+    let Some(by) = sortby.map(str::trim).filter(|b| !b.is_empty()) else { return Ok(None) };
+    let (sign, field) = by.strip_prefix('-').map(|f| ("-", f)).unwrap_or(("+", by.trim_start_matches('+')));
+    if field.is_empty() || field.len() > 100 || !field.chars().all(|c| c.is_ascii_alphanumeric() || "_:.-".contains(c)) {
+        return Err(format!("{by}: sortby is a property's name, - first for descending"));
+    }
+    let field = if field.starts_with("properties.") || matches!(field, "id" | "collection") {
+        field.to_string()
+    } else {
+        format!("properties.{field}")
+    };
+    Ok(Some((sign, field)))
+}
+
+/// Whether `v` is in order, ascending or descending (equal neighbours are fine).
+fn ordered<T: PartialOrd>(v: &[T], descending: bool) -> bool {
+    v.windows(2).all(|w| if descending { w[0] >= w[1] } else { w[0] <= w[1] })
+}
+
+/// Whether `items`, as an API answered a search sorted by `sortby`, are visibly not in that
+/// order: `Some(false)` when two neighbours are the wrong way round, `Some(true)` when they are
+/// all in order, `None` when it can't be told: no sort, a sort on anything but date or cloud
+/// cover, dates that are not comparable as text, or fewer than two values. An API without the
+/// sort extension may ignore a sort rather than refuse it, and this is how that shows.
+pub fn sort_followed(items: &[Item], sortby: Option<&str>) -> Option<bool> {
+    let (sign, field) = sort_parts(sortby).ok().flatten()?;
+    let descending = sign == "-";
+    match field.as_str() {
+        "properties.eo:cloud_cover" => {
+            let v: Vec<f64> = items.iter().filter_map(|i| i.cloud).collect();
+            (v.len() >= 2).then(|| ordered(&v, descending))
+        }
+        // Dates compare as written, which orders them only when they are UTC (`Z`) and of one
+        // length (the same fraction of a second); any other offset or form is not compared.
+        "properties.datetime" => {
+            let len = items.first()?.datetime.len();
+            // An item whose own `datetime` is null carries its `start_datetime` here, which the
+            // API did not sort by: it can't be compared.
+            if len == 0
+                || items.len() < 2
+                || items.iter().any(|i| {
+                    !i.own_datetime || i.datetime.len() != len || !i.datetime.ends_with('Z') || i.datetime.get(10..11) != Some("T")
+                })
+            {
+                return None;
+            }
+            let v: Vec<&str> = items.iter().map(|i| i.datetime.as_str()).collect();
+            Some(ordered(&v, descending))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a sort was asked for and `items` can't show if the API followed it: two or more items
+/// (one is in order whatever the sort) that [`sort_followed`] can't tell, because the sort is on
+/// something it doesn't compare or the dates are not comparable. The caller says so rather than
+/// leave the user to assume the sort was applied.
+pub fn sort_unchecked(items: &[Item], sortby: Option<&str>) -> bool {
+    items.len() >= 2 && sort_parts(sortby).ok().flatten().is_some() && sort_followed(items, sortby).is_none()
+}
+
+/// The address a POST search goes to.
+pub fn search_post_url(api: &str) -> String {
+    crate::template::join(api, &format!("{}/search", crate::logins::inner(api)))
+}
+
+/// The body of a POST search (STAC API's `POST /search`), which carries a shape of any size.
+pub fn search_body(s: &Search) -> Result<Value, String> {
+    let mut b = serde_json::json!({"limit": s.limit.clamp(1, MAX_ITEMS)});
+    let ids: Vec<&str> = s.collections.iter().map(|c| c.trim()).filter(|c| !c.is_empty()).take(50).collect();
+    if !ids.is_empty() {
+        b["collections"] = serde_json::json!(ids);
+    }
+    if let Some(shape) = &s.intersects {
+        intersects_json(shape)?;
+        b["intersects"] = area::to_geojson(shape);
+    } else if let Some([w, south, e, n]) = s.bbox {
+        let ok = |x: f64, lim: f64| x.is_finite() && (-lim..=lim).contains(&x);
+        if !(ok(w, 180.0) && ok(e, 180.0) && ok(south, 90.0) && ok(n, 90.0) && south < n) {
+            return Err("bbox is [west, south, east, north] in longitude/latitude".into());
+        }
+        b["bbox"] = serde_json::json!([w, south, e, n]);
+    }
+    if let Some(d) = s.datetime.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        b["datetime"] = Value::String(datetime(d)?);
+    }
+    if let Some(c) = s.max_cloud.filter(|c| c.is_finite()) {
+        b["query"] = serde_json::json!({"eo:cloud_cover": {"lte": c.clamp(0.0, 100.0)}});
+    }
+    if let Some((sign, field)) = sort_parts(s.sortby.as_deref())? {
+        b["sortby"] = serde_json::json!([{"field": field, "direction": if sign == "-" { "desc" } else { "asc" }}]);
+    }
+    Ok(b)
 }
 
 /// Whether an address is a web address.
 fn is_web(u: &str) -> bool {
+    let u = crate::logins::inner(u);
     let l = u.get(..8).unwrap_or(u).to_ascii_lowercase();
     l.starts_with("https://") || l.starts_with("http://")
 }
@@ -238,11 +557,85 @@ pub fn parse_collections(bytes: &[u8]) -> Result<Vec<Collection>, String> {
 /// The items of a search's answer (an ItemCollection), and the address of its next page. `from`
 /// is the address the answer came from, which relative addresses are resolved against.
 pub fn parse_items(bytes: &[u8], from: &str) -> Result<(Vec<Item>, Option<String>), String> {
+    parse_items_from_origin(bytes, &crate::address::Origin::named(from))
+}
+
+/// Like [`parse_items`], carrying the observed post-redirect [`crate::address::Origin`] and reach.
+pub fn parse_items_from_origin(bytes: &[u8], origin: &crate::address::Origin) -> Result<(Vec<Item>, Option<String>), String> {
+    parse_items_noted(bytes, origin).map(|listing| (listing.items.into_iter().map(|parsed| parsed.item).collect(), listing.next))
+}
+
+/// Counts bounded-parser omissions separately from invalid input entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParseLosses {
+    pub skipped_items: usize,
+    pub omitted_items: usize,
+    pub skipped_assets: usize,
+    pub omitted_assets: usize,
+}
+
+impl ParseLosses {
+    /// Whether every item and asset entry was retained.
+    pub fn is_empty(&self) -> bool {
+        self.skipped_items == 0 && self.omitted_items == 0 && self.skipped_assets == 0 && self.omitted_assets == 0
+    }
+}
+
+/// An item and the asset entries its bounded parser could not retain.
+#[derive(Debug)]
+pub struct ParsedItem {
+    pub item: Item,
+    pub losses: ParseLosses,
+}
+
+/// Search results with both aggregate and per-item losses, preserving observed provenance.
+#[derive(Debug)]
+pub struct ItemListing {
+    pub items: Vec<ParsedItem>,
+    pub next: Option<String>,
+    pub next_refused: bool,
+    pub matched: Option<u64>,
+    pub losses: ParseLosses,
+}
+
+/// Like [`parse_items_from_origin`], retaining counts of invalid and capped items and assets.
+pub fn parse_items_noted(bytes: &[u8], origin: &crate::address::Origin) -> Result<ItemListing, String> {
     let v = json(bytes)?;
     let features = v.get("features").and_then(Value::as_array).ok_or("the answer isn't a list of STAC items")?;
-    let items = features.iter().take(MAX_ITEMS).filter_map(|f| item(f, Some(from))).collect();
-    let next = link(&v, "next", from);
-    Ok((items, next))
+    let mut losses = ParseLosses { omitted_items: features.len().saturating_sub(MAX_ITEMS), ..Default::default() };
+    let mut items = Vec::new();
+    for feature in features.iter().take(MAX_ITEMS) {
+        if let Some(parsed) = item_noted(feature, origin) {
+            losses.skipped_assets += parsed.losses.skipped_assets;
+            losses.omitted_assets += parsed.losses.omitted_assets;
+            items.push(parsed);
+        } else {
+            losses.skipped_items += 1;
+        }
+    }
+    let next = link(&v, "next", origin.url());
+    let next_refused = next.as_ref().is_some_and(|url| origin.check(url).is_err());
+    let next = next.filter(|_| !next_refused);
+    let matched = v.get("numberMatched").or_else(|| v.get("context").and_then(|c| c.get("matched"))).and_then(Value::as_u64);
+    Ok(ItemListing { items, next, next_refused, matched, losses })
+}
+
+/// Whether an answer's `next` link is one `origin`'s reach refuses. [`parse_items_from_origin`]
+/// drops such a link without saying so, so a caller that must say it asks here.
+pub fn next_refused(bytes: &[u8], origin: &crate::address::Origin) -> bool {
+    json(bytes).ok().and_then(|v| link(&v, "next", origin.url())).is_some_and(|u| origin.check(&u).is_err())
+}
+
+/// Whether a search's answer has a `next` link of any method. [`parse_items`] gives none for a
+/// POST link (it needs its body, which isn't an address), so this tells a POST search that more
+/// items match than the page holds.
+pub fn has_next(bytes: &[u8]) -> bool {
+    json(bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("links")?.as_array().map(|ls| ls.iter().take(100).any(|l| l.get("rel").and_then(Value::as_str) == Some("next")))
+        })
+        .unwrap_or(false)
 }
 
 /// How many items a search's answer says match in all (`numberMatched`, or the context
@@ -256,22 +649,44 @@ pub fn parse_matched(bytes: &[u8]) -> Option<u64> {
 /// `/collections/`, else its `root` link's (a static catalog's `….json` root is no API), else the
 /// collection its `parent` link names. `None` when nothing says.
 pub fn api_of(bytes: &[u8], from: &str) -> Option<String> {
-    let before = |u: &str| u.split_once("/collections/").map(|(a, _)| a.to_string());
+    let before = |u: &str| crate::logins::inner(u).split_once("/collections/").map(|(a, _)| crate::logins::inherit(u, a));
     if let Some(a) = before(from) {
         return Some(a);
     }
     let v = json(bytes).ok()?;
     if let Some(root) = link(&v, "root", from) {
-        let r = root.split(['?', '#']).next().unwrap_or(&root).trim_end_matches('/').to_string();
-        if !r.to_ascii_lowercase().ends_with(".json") && is_web(&r) {
-            return Some(r);
+        let inner = crate::logins::inner(&root);
+        let r = inner.split(['?', '#']).next().unwrap_or(inner).trim_end_matches('/');
+        if !r.to_ascii_lowercase().ends_with(".json") && is_web(r) {
+            return Some(crate::logins::inherit(&root, r));
         }
     }
     link(&v, "parent", from).and_then(|p| before(&p))
 }
 
 pub fn parse_item(bytes: &[u8], from: &str) -> Result<Item, String> {
-    item(&json(bytes)?, Some(from)).ok_or_else(|| "the answer isn't a STAC item".to_string())
+    parse_item_from_origin(bytes, &crate::address::Origin::named(from))
+}
+
+/// Like [`parse_item`], carrying the observed post-redirect [`crate::address::Origin`] and reach.
+pub fn parse_item_from_origin(bytes: &[u8], origin: &crate::address::Origin) -> Result<Item, String> {
+    parse_item_noted(bytes, origin).map(|parsed| parsed.item)
+}
+
+/// Like [`parse_item_from_origin`], retaining counts of invalid and capped asset entries.
+pub fn parse_item_noted(bytes: &[u8], origin: &crate::address::Origin) -> Result<ParsedItem, String> {
+    item_noted(&json(bytes)?, origin).ok_or_else(|| "the answer isn't a STAC item".to_string())
+}
+
+fn item_noted(value: &Value, origin: &crate::address::Origin) -> Option<ParsedItem> {
+    let item = item_with_reach(value, Some(origin.url()), Some(origin.reach()))?;
+    let assets = value.get("assets").and_then(Value::as_object).map_or(0, serde_json::Map::len);
+    let losses = ParseLosses {
+        skipped_assets: assets.min(MAX_ASSETS).saturating_sub(item.assets.len()),
+        omitted_assets: assets.saturating_sub(MAX_ASSETS),
+        ..Default::default()
+    };
+    Some(ParsedItem { item, losses })
 }
 
 /// An item from its JSON (as STAC gives it, or as [`item_json`] wrote it).
@@ -291,6 +706,10 @@ fn link(v: &Value, rel: &str, from: &str) -> Option<String> {
 }
 
 fn item(f: &Value, from: Option<&str>) -> Option<Item> {
+    item_with_reach(f, from, None)
+}
+
+pub(crate) fn item_with_reach(f: &Value, from: Option<&str>, reach: Option<crate::address::Reach>) -> Option<Item> {
     if f.get("type").and_then(Value::as_str) != Some("Feature") {
         return None;
     }
@@ -318,6 +737,7 @@ fn item(f: &Value, from: Option<&str>) -> Option<Item> {
     });
     let geometry = f.get("geometry").filter(|g| g.is_object() && footprint_size(g) <= MAX_FOOTPRINT).cloned();
     let cloud = props.and_then(|p| p.get("eo:cloud_cover")).and_then(Value::as_f64).filter(|c| c.is_finite());
+    let own_datetime = props.and_then(|p| p.get("datetime")).is_some_and(Value::is_string);
     let datetime = props
         .and_then(|p| p.get("datetime").filter(|d| d.is_string()).or_else(|| p.get("start_datetime")))
         .and_then(Value::as_str)
@@ -332,6 +752,16 @@ fn item(f: &Value, from: Option<&str>) -> Option<Item> {
         .flatten()
         .take(MAX_ASSETS)
         .filter_map(|(k, a)| {
+            // Codes for a failed retrieval are stored values that aren't values: read whole, or
+            // `None` when one isn't a number or there are more than are kept, so that none is read
+            // as a value (a data cube leaves such an asset's item out, and says so).
+            let invalid = match a.get("je:rasters").and_then(|r| r.get("dn")?.get("error")) {
+                None => Some(Vec::new()),
+                Some(codes) => codes
+                    .as_array()
+                    .filter(|c| c.len() <= MAX_INVALID)
+                    .and_then(|c| c.iter().map(|c| c.as_f64().filter(|v| v.is_finite())).collect::<Option<Vec<f64>>>()),
+            };
             Some(Asset {
                 key: k.chars().take(200).collect(),
                 href: {
@@ -356,6 +786,14 @@ fn item(f: &Value, from: Option<&str>) -> Option<Item> {
                 scale: band_number(a, "scale"),
                 offset: band_number(a, "offset"),
                 nodata: band_number(a, "nodata"),
+                invalid: invalid.clone().unwrap_or_default(),
+                codes_unread: invalid.is_none() || a.get("rg:codes_unread").and_then(Value::as_bool) == Some(true),
+                bands: asset_bands(a),
+                bands_cut: declared_bands(a) > MAX_BANDS || long_name(a) || a.get("rg:bands_cut").and_then(Value::as_bool) == Some(true),
+                je_unread: (describes_no_bands(a) && je_odd(a)) || lone_odd(a) || a.get("rg:unread").and_then(Value::as_bool) == Some(true),
+                lists_unread: bands_odd(a) || a.get("rg:lists_unread").and_then(Value::as_bool) == Some(true),
+                declared_bands: declared_bands(a)
+                    .max(a.get("rg:band_count").and_then(Value::as_u64).map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))),
             })
         })
         .collect();
@@ -376,16 +814,20 @@ fn item(f: &Value, from: Option<&str>) -> Option<Item> {
             .collect();
         Value::Object(kept)
     });
+    let origin_reach =
+        reach.unwrap_or_else(|| from.map_or(crate::address::Reach::Public, |u| crate::address::reach(crate::logins::inner(u))));
     Some(Item {
         id,
         collection: text(f.get("collection")),
         datetime,
+        own_datetime,
         bbox,
         geometry,
         cloud,
         assets,
         url,
         origin: from.map(str::to_string),
+        origin_reach,
         properties,
         tile: props.and_then(tile_of),
     })
@@ -414,9 +856,28 @@ fn tile_of(p: &Value) -> Option<String> {
 }
 
 /// An asset's first band's number `key` (`scale`, `offset`, `nodata`): from `raster:bands`, else from
-/// `eo:bands`, where some catalogs (Brazil Data Cube's) put it.
+/// `eo:bands`, where some catalogs (Brazil Data Cube's) put it, else from STAC 1.1's unified `bands`
+/// (where it may be `raster:scale`, as [`item_json`] writes it), else from JAXA Earth's `je:rasters`.
 fn band_number(asset: &Value, key: &str) -> Option<f64> {
-    ["raster:bands", "eo:bands"].iter().find_map(|b| asset.get(*b)?.as_array()?.first()?.get(key)?.as_f64()).filter(|v| v.is_finite())
+    let je = || {
+        let (group, name) = match key {
+            "scale" => ("dn2value", "slope"),
+            "offset" => ("dn2value", "offset"),
+            "nodata" => ("dn", "nodata"),
+            _ => return None,
+        };
+        asset.get("je:rasters")?.get(group)?.get(name)?.as_f64()
+    };
+    ["raster:bands", "eo:bands", "bands"]
+        .iter()
+        .find_map(|b| {
+            let first = asset.get(*b)?.as_array()?.first()?;
+            first.get(key).or_else(|| first.get(format!("raster:{key}")))?.as_f64()
+        })
+        // Or the asset's own (STAC 1.1 lets bands share numbers on the asset, bare or `raster:`).
+        .or_else(|| asset.get(key).or_else(|| asset.get(format!("raster:{key}")))?.as_f64())
+        .or_else(je)
+        .filter(|v| v.is_finite())
 }
 
 /// How many numbers a GeoJSON geometry holds (bounded by how deep it goes).
@@ -437,6 +898,14 @@ fn footprint_size(g: &Value) -> usize {
 /// An address relative to another, as a browser would resolve it (`s3://` and others are kept
 /// as they are, so they can be refused by name).
 pub fn resolve(base: &str, href: &str) -> Option<String> {
+    // A login binding rides along only to an address on the base's own origin (`inherit`).
+    let plain_base = rustgis_data::login_address::parse(base).ok()?.map_or(base, |b| b.url);
+    rustgis_data::login_address::parse(href).ok()?;
+    let resolved = resolve_plain(plain_base, crate::logins::inner(href))?;
+    Some(crate::logins::inherit(base, &resolved))
+}
+
+fn resolve_plain(base: &str, href: &str) -> Option<String> {
     let href = href.trim();
     if href.is_empty() || href.len() > MAX_TEXT || href.chars().any(char::is_control) {
         return None;
@@ -475,14 +944,14 @@ impl Asset {
     /// Whether it is a GeoTIFF (cloud-optimised or not).
     pub fn is_geotiff(&self) -> bool {
         let t = self.media_type.to_ascii_lowercase();
-        let path = self.href.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+        let path = crate::logins::inner(&self.href).split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
         t.contains("geotiff") || t.starts_with("image/tiff") || path.ends_with(".tif") || path.ends_with(".tiff")
     }
 
     /// Whether it is a LiDAR point cloud (LAS, LAZ or COPC).
     pub fn is_point_cloud(&self) -> bool {
         let t = self.media_type.to_ascii_lowercase();
-        let path = self.href.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+        let path = crate::logins::inner(&self.href).split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
         t.contains("vnd.las") || t.contains("laszip") || path.ends_with(".laz") || path.ends_with(".las")
     }
 }
@@ -498,7 +967,7 @@ impl Item {
             });
         }
         // Among those on the web first (others are refused by name when nothing else is there).
-        let web = |a: &&Asset| a.href.to_ascii_lowercase().starts_with("http");
+        let web = |a: &&Asset| is_web(&a.href);
         let choose = |only_web: bool| {
             let ok = |a: &&Asset| !only_web || web(a);
             self.assets
@@ -517,7 +986,7 @@ impl Item {
     pub fn thumbnail(&self) -> Option<&Asset> {
         let picture = |a: &&Asset| {
             let t = a.media_type.to_ascii_lowercase();
-            let path = a.href.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+            let path = crate::logins::inner(&a.href).split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
             is_web(&a.href)
                 && (t.starts_with("image/png")
                     || t.starts_with("image/jpeg")
@@ -531,11 +1000,17 @@ impl Item {
             .or_else(|| self.assets.iter().filter(picture).find(|a| a.roles.iter().any(|r| r == "overview")))
     }
 
+    /// Checks `href` against the document origin and observed reach this item was read from.
+    pub fn check_href(&self, href: &str) -> Result<(), String> {
+        let origin = crate::address::Origin { url: self.origin.clone().unwrap_or_else(|| UNTRUSTED.to_string()), reach: self.origin_reach };
+        origin.check(href)
+    }
+
     /// The address of the asset to add (see [`Item::pick`]), checked: a plain web address the item
     /// may point to, not one that needs signing or a cloud store's own protocol.
     pub fn asset_href(&self, key: Option<&str>) -> Result<(String, String), String> {
         let a = self.pick(key)?;
-        let lower = a.href.to_ascii_lowercase();
+        let lower = crate::logins::inner(&a.href).to_ascii_lowercase();
         if !(lower.starts_with("https://") || lower.starts_with("http://") || crate::s3::is_s3(&lower)) {
             let scheme = lower.split("://").next().unwrap_or("");
             return Err(format!(
@@ -546,13 +1021,14 @@ impl Item {
         // Judged by where the item came from; an item given whole may only point at public
         // addresses (as a document on the web may). A Planetary Computer asset is signed by the
         // caller ([`needs_signing`]).
-        crate::address::check(&a.href, Some(self.origin.as_deref().unwrap_or(UNTRUSTED)))?;
+        self.check_href(&a.href)?;
         Ok((a.key.clone(), a.href.clone()))
     }
 }
 
 /// The host of a web address, lower-cased.
 fn host_of(url: &str) -> String {
+    let url = crate::logins::inner(url);
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let host = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
@@ -562,7 +1038,7 @@ fn host_of(url: &str) -> String {
 /// Whether an asset's address is in Azure Blob Storage without a signature: a Microsoft
 /// Planetary Computer asset, read with a token from its token service ([`sas_token_url`]).
 pub fn needs_signing(href: &str) -> bool {
-    let lower = href.to_ascii_lowercase();
+    let lower = crate::logins::inner(href).to_ascii_lowercase();
     if !lower.starts_with("https://") || !host_of(&lower).ends_with(".blob.core.windows.net") {
         return false;
     }
@@ -573,7 +1049,7 @@ pub fn needs_signing(href: &str) -> bool {
 /// The request for a token that reads `href`'s storage container (the Planetary Computer's
 /// `token/{account}/{container}`).
 pub fn sas_token_url(href: &str) -> Result<String, String> {
-    let lower = href.to_ascii_lowercase();
+    let lower = crate::logins::inner(href).to_ascii_lowercase();
     let host = host_of(&lower);
     let account = host.strip_suffix(".blob.core.windows.net").unwrap_or("");
     let path = lower.split_once("://").map(|(_, r)| r).unwrap_or("");
@@ -581,7 +1057,10 @@ pub fn sas_token_url(href: &str) -> Result<String, String> {
     let ok =
         |s: &str, max: usize| (3..=max).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     if !ok(account, 24) || !ok(container, 63) {
-        return Err(format!("{href}: not an Azure Blob Storage address the Planetary Computer signs"));
+        return Err(rustgis_data::diagnostics::message_with_address(
+            href,
+            "not an Azure Blob Storage address the Planetary Computer signs",
+        ));
     }
     Ok(format!("{SAS_API}/{account}/{container}"))
 }
@@ -603,12 +1082,14 @@ pub fn parse_sas(bytes: &[u8]) -> Result<String, String> {
 
 /// An address with a token's query added.
 pub fn sign(href: &str, token: &str) -> String {
-    let (base, frag) = href.split_once('#').map(|(b, f)| (b, Some(f))).unwrap_or((href, None));
+    let inner = crate::logins::inner(href);
+    let (base, frag) = inner.split_once('#').map(|(b, f)| (b, Some(f))).unwrap_or((inner, None));
     let sep = if base.contains('?') { "&" } else { "?" };
-    match frag {
+    let signed = match frag {
         Some(f) => format!("{base}{sep}{token}#{f}"),
         None => format!("{base}{sep}{token}"),
-    }
+    };
+    crate::logins::inherit(href, &signed)
 }
 
 fn tokens() -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, web_time::Instant)>> {
@@ -651,8 +1132,12 @@ pub fn sign_blocking(href: &str) -> Result<String, String> {
     Ok(sign(href, &token))
 }
 
-/// An item as the commands return it (and read back in `stac.addAsset`), with its date and
-/// cloud cover as its properties: small, for the command line and the AI Assistant.
+/// An item as the commands return it (and read back in `stac.addAsset`, `stac.addBands` and
+/// `stac.addIndex`), with its date and cloud cover as its properties: small, for the command line
+/// and the AI Assistant, except that it keeps each band's description (name, scale, offset,
+/// no-data) that the last two need to find and scale the bands: without the catalog's scale and
+/// offset a Sentinel-2 band's values would come out wrong. That is about 1.5 KB more for a Sentinel-2
+/// scene (about 15 KB for `stac.search`'s default 10 items, 290 KB for its most, 200).
 pub fn item_json(i: &Item) -> Value {
     item_json_with(i, false)
 }
@@ -675,9 +1160,67 @@ pub fn item_json_with(i: &Item, all: bool) -> Value {
         "bbox": i.bbox,
         "geometry": i.geometry,
         "properties": props,
-        "assets": i.assets.iter().map(|a| (a.key.clone(), serde_json::json!({"href": a.href, "type": a.media_type, "roles": a.roles, "title": a.title}))).collect::<serde_json::Map<_, _>>(),
+        "assets": i.assets.iter().map(|a| (a.key.clone(), asset_json(a))).collect::<serde_json::Map<_, _>>(),
         "links": i.url.as_ref().map(|u| vec![serde_json::json!({"rel": "self", "href": u})]).unwrap_or_default(),
     })
+}
+
+/// An asset as [`item_json_with`] writes it. Its bands are written as STAC 1.1's `bands` (name,
+/// scale, offset and no-data), which [`item_from_json`] reads back, so an item passed on to a
+/// command (`stac.addBands`) keeps what it needs to find and scale them. An asset that names no
+/// band but has a first band's scale, offset or no-data keeps them as one unnamed band.
+fn asset_json(a: &Asset) -> Value {
+    let number = |v: Option<f64>| v.filter(|v| v.is_finite());
+    let band = |b: &BandInfo| {
+        let mut o = serde_json::Map::new();
+        if !b.common.is_empty() {
+            o.insert("eo:common_name".into(), Value::String(b.common.clone()));
+        }
+        for (key, v) in [("raster:scale", b.scale), ("raster:offset", b.offset), ("nodata", b.nodata)] {
+            if let Some(v) = number(v) {
+                o.insert(key.into(), serde_json::json!(v));
+            }
+        }
+        // That a number was there and not read goes with the band, for the command that gets it.
+        if b.unread {
+            o.insert("rg:unread".into(), Value::Bool(true));
+        }
+        Value::Object(o)
+    };
+    let bands: Vec<Value> = if a.bands.is_empty() {
+        let first = BandInfo { common: String::new(), scale: a.scale, offset: a.offset, nodata: a.nodata, unread: false };
+        if first == BandInfo::default() { Vec::new() } else { vec![band(&first)] }
+    } else {
+        a.bands.iter().map(band).collect()
+    };
+    let mut out = serde_json::json!({"href": a.href, "type": a.media_type, "roles": a.roles, "title": a.title});
+    if let (false, Some(o)) = (bands.is_empty(), out.as_object_mut()) {
+        o.insert("bands".into(), Value::Array(bands));
+    }
+    // That JAXA numbers were there and not read goes with the asset, for the command that gets it.
+    if let (true, Some(o)) = (a.je_unread, out.as_object_mut()) {
+        o.insert("rg:unread".into(), Value::Bool(true));
+    }
+    // That a band list was not a list (so no band of the asset was read) goes with it too, and how
+    // many bands the file has when the catalog describes more than are kept.
+    if let (true, Some(o)) = (a.lists_unread, out.as_object_mut()) {
+        o.insert("rg:lists_unread".into(), Value::Bool(true));
+    }
+    if let (true, Some(o)) = (a.declared_bands > a.bands.len(), out.as_object_mut()) {
+        o.insert("rg:band_count".into(), serde_json::json!(a.declared_bands));
+    }
+    // The failed-retrieval codes, and that they could not be read whole, go with the asset.
+    if let (false, Some(o)) = (a.invalid.is_empty(), out.as_object_mut()) {
+        o.insert("je:rasters".into(), serde_json::json!({"dn": {"error": a.invalid}}));
+    }
+    if let (true, Some(o)) = (a.codes_unread, out.as_object_mut()) {
+        o.insert("rg:codes_unread".into(), Value::Bool(true));
+    }
+    // The cut is kept, so the command that gets this item can say that bands were left out.
+    if let (true, Some(o)) = (a.bands_cut, out.as_object_mut()) {
+        o.insert("rg:bands_cut".into(), Value::Bool(true));
+    }
+    out
 }
 
 /// A GeoJSON FeatureCollection of items' footprints (their geometry, or their bbox), with the
@@ -707,7 +1250,83 @@ pub fn footprints_geojson(items: &[Item]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn noted_parsing_counts_capped_and_invalid_items_and_assets() {
+        use super::*;
+        let origin = crate::address::Origin::named("https://public.example/search");
+        let item = |id: usize| serde_json::json!({"type":"Feature","id":id.to_string(),"properties":{},"assets":{}});
+        let features: Vec<_> = (0..MAX_ITEMS + 1).map(item).collect();
+        let body = serde_json::json!({"features":features}).to_string();
+        let parsed = parse_items_noted(body.as_bytes(), &origin).unwrap();
+        assert_eq!(parsed.items.len(), MAX_ITEMS);
+        assert_eq!(parsed.losses, ParseLosses { omitted_items: 1, ..Default::default() });
+        let body = serde_json::json!({"features":[item(0),{"type":"Feature"},item(2)]}).to_string();
+        let parsed = parse_items_noted(body.as_bytes(), &origin).unwrap();
+        assert_eq!(parsed.items.len(), 2);
+        assert_eq!(parsed.losses, ParseLosses { skipped_items: 1, ..Default::default() });
+        let body = serde_json::json!({"features":[item(0),item(1),item(2)]}).to_string();
+        assert!(parse_items_noted(body.as_bytes(), &origin).unwrap().losses.is_empty());
+
+        let mut assets = serde_json::Map::new();
+        assets.insert("000_bad".into(), serde_json::json!({"href":42}));
+        for i in 0..MAX_ASSETS + 1 {
+            assets.insert(format!("a{i:03}"), serde_json::json!({"href":format!("https://public.example/{i}.tif")}));
+        }
+        let mut feature = item(0);
+        feature["assets"] = serde_json::Value::Object(assets);
+        let parsed = parse_item_noted(feature.to_string().as_bytes(), &origin).unwrap();
+        assert_eq!(parsed.item.assets.len(), MAX_ASSETS - 1);
+        assert_eq!(parsed.losses, ParseLosses { skipped_assets: 1, omitted_assets: 2, ..Default::default() });
+        let body = serde_json::json!({"features":[feature]}).to_string();
+        let listed = parse_items_noted(body.as_bytes(), &origin).unwrap();
+        assert_eq!(listed.losses, parsed.losses);
+        assert_eq!(listed.items[0].losses, parsed.losses);
+    }
+
     use super::*;
+
+    #[test]
+    fn bound_stac_api_catalog_and_assets_follow_only_same_origin_links() {
+        let _turn = crate::cache::turn();
+        let origin = "https://stac-bound.test";
+        // A binding is authority only while its runtime owns it, so install a live one.
+        let token = crate::logins::activate(origin, "test-owner", crate::logins::Method::Header("X-Key".into()), "secret", false).unwrap();
+        let base = rustgis_data::login_address::bind(&token, origin, "https://stac-bound.test/catalog.json").unwrap();
+        let document = br#"{"type":"Catalog","links":[
+            {"rel":"child","href":"collection.json"},
+            {"rel":"child","href":"https://other.test/collection.json"}]}"#;
+        let children = catalog::parse_children(document, &base).unwrap();
+        assert!(children.iter().any(|c| rustgis_data::login_address::parse(&c.url).unwrap().is_some()));
+        assert!(children.iter().any(|c| c.url == "https://other.test/collection.json"));
+        let item = br#"{"type":"Feature","id":"x","properties":{},"geometry":null,
+            "assets":{"data":{"href":"data.tif","type":"image/tiff"}},
+            "links":[{"rel":"self","href":"items/x.json"}]}"#;
+        let item = parse_item(item, &base).unwrap();
+        assert_eq!(rustgis_data::login_address::parse(&item.assets[0].href).unwrap().unwrap().binding, token);
+        let api = api(Some(&rustgis_data::login_address::bind(&token, origin, "https://stac-bound.test/v1/search").unwrap())).unwrap();
+        for url in [collections_url(&api), search_url(&api, &Search::default()).unwrap()] {
+            assert_eq!(rustgis_data::login_address::parse(&url).unwrap().unwrap().binding, token);
+        }
+        for foreign in ["http://stac-bound.test/tile", "https://stac-bound.test:444/tile", "https://other.test/tile"] {
+            assert_eq!(resolve(&base, foreign).as_deref(), Some(foreign));
+        }
+        crate::logins::deactivate(&token);
+    }
+
+    #[test]
+    fn a_next_link_the_reach_refuses_is_reported_as_refused() {
+        let page = br#"{"type":"FeatureCollection","features":[],"links":[{"rel":"next","href":"http://10.0.0.5/v1/search?page=2"}]}"#;
+        // A public document's next page on the local network is refused: dropped, and said so.
+        let public = crate::address::Origin::named("https://x.org/v1/search");
+        assert!(next_refused(page, &public));
+        assert_eq!(parse_items_from_origin(page, &public).unwrap().1, None);
+        // The same link from a local API is followed, and nothing is refused.
+        let local = crate::address::Origin::named("http://10.0.0.5/v1/search");
+        assert!(!next_refused(page, &local));
+        assert!(parse_items_from_origin(page, &local).unwrap().1.is_some());
+        // No next link, nothing refused.
+        assert!(!next_refused(b"{\"features\":[]}", &public));
+    }
 
     #[test]
     fn api_of_a_linked_document() {
@@ -720,6 +1339,103 @@ mod tests {
             {"rel": "parent", "href": "https://api.example.org/v1/collections/s2"}]}"#;
         assert_eq!(api_of(static_root, "https://cdn.example.org/s2/a.json").as_deref(), Some("https://api.example.org/v1"));
         assert_eq!(api_of(br#"{"links": [{"rel": "root", "href": "catalog.json"}]}"#, "https://cdn.example.org/a.json"), None);
+    }
+
+    /// Items with these dates and cloud covers, as an API answers them.
+    fn answered(rows: &[(&str, Option<f64>)]) -> Vec<Item> {
+        let features: Vec<Value> = rows
+            .iter()
+            .enumerate()
+            .map(|(n, (d, c))| {
+                let mut props = serde_json::json!({"datetime": d});
+                if let Some(c) = c {
+                    props["eo:cloud_cover"] = serde_json::json!(c);
+                }
+                serde_json::json!({"type": "Feature", "id": format!("i{n}"), "bbox": [0, 0, 1, 1], "properties": props})
+            })
+            .collect();
+        let body = serde_json::json!({"type": "FeatureCollection", "features": features}).to_string();
+        parse_items(body.as_bytes(), "https://x.org/v1/search").unwrap().0
+    }
+
+    #[test]
+    fn a_sort_the_api_ignored_shows_in_the_order_of_its_items() {
+        let newest =
+            answered(&[("2024-06-03T00:00:00Z", Some(9.0)), ("2024-06-02T00:00:00Z", Some(1.0)), ("2024-06-01T00:00:00Z", Some(5.0))]);
+        assert_eq!(sort_followed(&newest, Some("-datetime")), Some(true));
+        assert_eq!(sort_followed(&newest, Some("datetime")), Some(false));
+        // Cloud cover goes the other way: 9, 1, 5 is in neither order.
+        assert_eq!(sort_followed(&newest, Some("eo:cloud_cover")), Some(false));
+        assert_eq!(sort_followed(&newest, Some("-eo:cloud_cover")), Some(false));
+        let least =
+            answered(&[("2024-06-03T00:00:00Z", Some(1.0)), ("2024-06-01T00:00:00Z", Some(1.0)), ("2024-06-02T00:00:00Z", Some(5.0))]);
+        assert_eq!(sort_followed(&least, Some("eo:cloud_cover")), Some(true));
+        // Nothing to tell by: no sort, another field, one item, no cloud covers, dates of other lengths.
+        assert_eq!(sort_followed(&newest, None), None);
+        assert_eq!(sort_followed(&newest, Some("")), None);
+        assert_eq!(sort_followed(&newest, Some("platform")), None);
+        assert_eq!(sort_followed(&newest, Some("bad sort!")), None);
+        assert_eq!(sort_followed(&newest[..1], Some("-datetime")), None);
+        assert_eq!(
+            sort_followed(&answered(&[("2024-06-03T00:00:00Z", None), ("2024-06-01T00:00:00Z", None)]), Some("eo:cloud_cover")),
+            None
+        );
+        assert_eq!(sort_followed(&answered(&[("2024-06-03", None), ("2024-06-01T00:00:00Z", None)]), Some("datetime")), None);
+        assert_eq!(sort_followed(&[], Some("datetime")), None);
+        // Dates that are not UTC are not compared as text: the same length is no proof of the same zone.
+        let zones = answered(&[("2024-06-03T10:00:00+02:00", None), ("2024-06-03T06:00:00-05:00", None)]);
+        assert_eq!(sort_followed(&zones, Some("-datetime")), None);
+        assert_eq!(sort_followed(&zones, Some("datetime")), None);
+        // The same instant written two ways is not out of order.
+        let same = answered(&[("2024-06-01T00:00:00.0000Z", None), ("2024-06-01T00:00:00+00:00", None)]);
+        assert_eq!(sort_followed(&same, Some("datetime")), None);
+        // A lowercase `t` or a space for the separator sorts differently as text: not compared.
+        let sep = answered(&[("2024-06-01t00:00:00Z", None), ("2024-06-01T01:00:00Z", None)]);
+        assert_eq!(sort_followed(&sep, Some("datetime")), None);
+        let space = answered(&[("2024-06-01 00:00:00Z", None), ("2024-06-01T01:00:00Z", None)]);
+        assert_eq!(sort_followed(&space, Some("datetime")), None);
+    }
+
+    /// A sort whose order can't be checked is said so, and only when there is something to check:
+    /// a sort asked for, two or more items, and the answer can't tell.
+    #[test]
+    fn a_sort_that_cannot_be_checked_is_told_apart_from_one_that_can() {
+        let newest = answered(&[("2024-06-03T00:00:00Z", Some(9.0)), ("2024-06-02T00:00:00Z", Some(1.0))]);
+        // In order, or visibly out of it: checked either way.
+        assert!(!sort_unchecked(&newest, Some("-datetime")));
+        assert!(!sort_unchecked(&newest, Some("datetime")));
+        // No sort asked, or one that isn't a sort: nothing to say.
+        assert!(!sort_unchecked(&newest, None));
+        assert!(!sort_unchecked(&newest, Some(" ")));
+        assert!(!sort_unchecked(&newest, Some("bad sort!")));
+        // A field that isn't compared, dates in other zones, no cloud covers: asked, not known.
+        assert!(sort_unchecked(&newest, Some("platform")));
+        let zones = answered(&[("2024-06-03T10:00:00+02:00", None), ("2024-06-03T06:00:00-05:00", None)]);
+        assert!(sort_unchecked(&zones, Some("-datetime")));
+        let bare = answered(&[("2024-06-03T00:00:00Z", None), ("2024-06-01T00:00:00Z", None)]);
+        assert!(sort_unchecked(&bare, Some("eo:cloud_cover")));
+        // One item is in order whatever the sort, and no items have no order.
+        assert!(!sort_unchecked(&zones[..1], Some("-datetime")));
+        assert!(!sort_unchecked(&[], Some("-datetime")));
+    }
+
+    /// An item with a null `datetime` carries its `start_datetime` as its date, which the API did
+    /// not sort by: a correctly sorted answer with one is not called out of order.
+    #[test]
+    fn a_range_item_with_no_datetime_is_not_compared_by_its_start() {
+        let features = serde_json::json!([
+            {"type": "Feature", "id": "a", "bbox": [0, 0, 1, 1], "properties": {"datetime": "2024-06-03T00:00:00Z"}},
+            {"type": "Feature", "id": "b", "bbox": [0, 0, 1, 1], "properties": {"datetime": null, "start_datetime": "2024-06-05T00:00:00Z"}},
+        ]);
+        let body = serde_json::json!({"type": "FeatureCollection", "features": features}).to_string();
+        let items = parse_items(body.as_bytes(), "https://x.org/v1/search").unwrap().0;
+        assert_eq!(items[1].datetime, "2024-06-05T00:00:00Z");
+        assert!(items[0].own_datetime && !items[1].own_datetime);
+        // Newest first by `datetime`: the API may have put the null one last. Can't be told.
+        assert_eq!(sort_followed(&items, Some("-datetime")), None);
+        // Items that all have their own date are still checked.
+        let own = answered(&[("2024-06-03T00:00:00Z", None), ("2024-06-05T00:00:00Z", None)]);
+        assert_eq!(sort_followed(&own, Some("-datetime")), Some(false));
     }
 
     #[test]
@@ -743,12 +1459,34 @@ mod tests {
             limit: 999,
             max_cloud: Some(20.0),
             sortby: None,
+            intersects: None,
         };
         let u = search_url("https://x.org/v1", &s).unwrap();
         assert_eq!(
             u,
             "https://x.org/v1/search?limit=200&collections=sentinel-2-l2a&bbox=7,46,7.1,46.1&datetime=2024-06-01T00%3A00%3A00Z%2F2024-06-30T23%3A59%3A59Z&query=%7B%22eo%3Acloud_cover%22%3A%7B%22lte%22%3A20%7D%7D"
         );
+        // A shape replaces the box, in the query and in the body.
+        let shape = rustgis_data::Geometry::Point(rustgis_geom::Coord::new(7.5, 46.5));
+        let with_shape = Search { intersects: Some(shape.clone()), sortby: Some("-datetime".into()), max_cloud: Some(10.0), ..s.clone() };
+        let u = search_url("https://x.org/v1", &with_shape).unwrap();
+        assert!(u.contains("intersects=%7B%22coordinates%22%3A%5B7.5%2C46.5%5D%2C%22type%22%3A%22Point%22%7D"), "{u}");
+        assert!(!u.contains("bbox="), "{u}");
+        let body = search_body(&with_shape).unwrap();
+        assert_eq!(body["intersects"], serde_json::json!({"type": "Point", "coordinates": [7.5, 46.5]}));
+        assert!(body.get("bbox").is_none());
+        assert_eq!(body["sortby"], serde_json::json!([{"field": "properties.datetime", "direction": "desc"}]));
+        assert_eq!(body["query"], serde_json::json!({"eo:cloud_cover": {"lte": 10.0}}));
+        assert_eq!(body["limit"], 200);
+        assert_eq!(search_body(&s).unwrap()["bbox"], serde_json::json!([7.0, 46.0, 7.1, 46.1]));
+        assert_eq!(search_post_url("https://x.org/v1"), "https://x.org/v1/search");
+        // A long shape goes in a body, not in a web address; one off the globe goes nowhere.
+        let long = rustgis_data::Geometry::MultiPoint((0..2000).map(|i| rustgis_geom::Coord::new(f64::from(i) / 100.0, 1.0)).collect());
+        let long = Search { intersects: Some(long), ..Default::default() };
+        assert!(search_url("https://x.org/v1", &long).is_err());
+        assert!(search_body(&long).is_ok());
+        let off = Search { intersects: Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(500.0, 0.0))), ..Default::default() };
+        assert!(search_url("https://x.org/v1", &off).is_err() && search_body(&off).is_err());
         let sorted = |by: &str| search_url("https://x.org/v1", &Search { sortby: Some(by.into()), ..Default::default() });
         assert!(sorted("eo:cloud_cover").unwrap().ends_with("&sortby=%2Bproperties.eo%3Acloud_cover"));
         assert!(sorted("-datetime").unwrap().ends_with("&sortby=-properties.datetime"));
@@ -782,6 +1520,12 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(next.as_deref(), Some("https://x.org/v1/search?token=abc"));
         assert_eq!(parse_matched(page), None);
+        // A POST link is no address (`parse_items` drops it) but still says there is more.
+        let post = br#"{"features": [], "links": [{"rel": "next", "method": "POST", "href": "https://x.org/v1/search", "body": {}}]}"#;
+        assert_eq!(parse_items(post, "https://x.org/v1/search").unwrap().1, None);
+        assert!(has_next(post) && has_next(page));
+        assert!(!has_next(br#"{"features": [], "links": [{"rel": "self", "href": "https://x.org/"}]}"#));
+        assert!(!has_next(br#"{"features": []}"#) && !has_next(b"nope"));
         assert_eq!(parse_matched(br#"{"numberMatched": 1234}"#), Some(1234));
         assert_eq!(parse_matched(br#"{"context": {"matched": 7}}"#), Some(7));
         assert_eq!(parse_matched(br#"{"numberMatched": -1}"#), None);
@@ -812,6 +1556,13 @@ mod tests {
             scale: None,
             offset: None,
             nodata: None,
+            invalid: Vec::new(),
+            codes_unread: false,
+            bands: Vec::new(),
+            bands_cut: false,
+            je_unread: false,
+            lists_unread: false,
+            declared_bands: 0,
         }];
         // A Planetary Computer asset is added after signing it with its container's token.
         let (_, href) = pc.asset_href(None).unwrap();
@@ -831,7 +1582,9 @@ mod tests {
             assert!(parse_sas(bad).is_err());
         }
         assert!(sas_token_url("https://evil.org/x.blob.core.windows.net/c/x.tif").is_err());
-        assert!(sas_token_url("https://a.blob.core.windows.net/").is_err());
+        let error = sas_token_url("https://a.blob.core.windows.net/?token=hidden unescaped hidden").unwrap_err();
+        let error = rustgis_data::diagnostics::redact(&error);
+        assert!(error.contains("not an Azure Blob Storage address") && !error.contains("hidden"), "{error}");
         remember_token("k", "sig=1");
         assert_eq!(cached_token("k").as_deref(), Some("sig=1"));
         // A web item can't point into the local network.
@@ -895,6 +1648,24 @@ mod tests {
         assert_eq!(resolve("https://x.org/a", ""), None);
     }
 
+    /// JAXA Earth's codes for a failed retrieval: read whole, or the asset says they weren't.
+    #[test]
+    fn retrieval_error_codes_are_read_whole_or_said_unread() {
+        let with = |codes: serde_json::Value| {
+            let v = serde_json::json!({"type": "Feature", "id": "t", "properties": {"datetime": "2024-01-01T00:00:00Z"},
+                "assets": {"V": {"href": "https://x.org/v.tiff", "je:rasters": {"dn": {"error": codes}}}}});
+            item_from_json(&v, None).unwrap().assets
+        };
+        let read = |codes: serde_json::Value| with(codes).pop().map(|a| (a.invalid, a.codes_unread)).unwrap();
+        assert_eq!(read(serde_json::json!([5, 6.5])), (vec![5.0, 6.5], false));
+        assert_eq!(read(serde_json::json!(null)), (vec![], true), "named but not a list");
+        // A code that isn't a number, or more than are kept, would be read as a value: the asset
+        // stays (a search shows it) but says its codes weren't read.
+        assert_eq!(read(serde_json::json!([5, "x"])), (vec![], true));
+        assert!(read(serde_json::json!((0..=MAX_INVALID).collect::<Vec<_>>())).1);
+        assert_eq!(read(serde_json::json!((0..MAX_INVALID).collect::<Vec<_>>())).0.len(), MAX_INVALID);
+    }
+
     /// A data cube's tile and a band's scale (#559): the grid codes catalogs use, and
     /// `raster:bands` before `eo:bands`.
     #[test]
@@ -916,6 +1687,13 @@ mod tests {
         assert_eq!((band_number(&a, "scale"), band_number(&a, "offset")), (Some(0.0001), Some(-0.1)));
         assert_eq!(band_number(&serde_json::json!({"eo:bands": [{"scale": 0.0001}]}), "scale"), Some(0.0001));
         assert_eq!(band_number(&serde_json::json!({"type": "image/tiff"}), "scale"), None);
+        // STAC 1.1's unified `bands`, with the raster terms bare or prefixed (as `item_json` writes them).
+        assert_eq!(band_number(&serde_json::json!({"bands": [{"raster:scale": 0.5, "raster:offset": 2.0}]}), "scale"), Some(0.5));
+        assert_eq!(band_number(&serde_json::json!({"bands": [{"raster:scale": 0.5, "raster:offset": 2.0}]}), "offset"), Some(2.0));
+        assert_eq!(band_number(&serde_json::json!({"bands": [{"scale": 0.25}]}), "scale"), Some(0.25));
+        // Numbers shared on the asset (STAC 1.1), for a band list that gives none: what `stac.addAsset` scales by.
+        let shared = serde_json::json!({"raster:scale": 0.0001, "raster:offset": -0.1, "bands": [{"eo:common_name": "red"}]});
+        assert_eq!((band_number(&shared, "scale"), band_number(&shared, "offset")), (Some(0.0001), Some(-0.1)));
         assert_eq!(band_number(&serde_json::json!({"raster:bands": [{"nodata": -3000.0}]}), "nodata"), Some(-3000.0));
     }
 }

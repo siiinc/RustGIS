@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use rustgis_data::value::PastClasses;
 use rustgis_data::{Dataset, FieldType, GeometryType};
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +20,13 @@ pub enum Marker {
     Star,
     /// A character of a font, as QGIS's font markers draw one: the size is the font's em.
     Char(Glyph),
+    /// A PNG or JPEG image, as QGIS's raster image markers draw one: the size is its width, its
+    /// height as the image's proportions make it. Its fill and outline don't change it.
+    Picture(Picture),
 }
 
 impl Marker {
-    /// The shapes (every marker but [`Marker::Char`]).
+    /// The shapes (every marker but [`Marker::Char`] and [`Marker::Picture`]).
     pub const ALL: [Marker; 5] = [Marker::Circle, Marker::Square, Marker::Triangle, Marker::Diamond, Marker::Star];
     pub fn label(self) -> &'static str {
         match self {
@@ -32,6 +36,7 @@ impl Marker {
             Marker::Diamond => "Diamond",
             Marker::Star => "Star",
             Marker::Char(_) => "Character",
+            Marker::Picture(_) => "Image",
         }
     }
 }
@@ -101,6 +106,169 @@ impl<'de> Deserialize<'de> for FontName {
     }
 }
 
+/// The most different pictures kept (each is kept for the rest of the run), and the most bytes
+/// of base64 they take together; past either, a new one is [`Picture::default`].
+pub const MAX_PICTURES: usize = 1024;
+pub const MAX_PICTURES_BYTES: usize = 64 << 20;
+/// The longest picture kept, in bytes of base64 (2 MiB): a marker's image is an icon.
+pub const MAX_PICTURE_BYTES: usize = 2 << 20;
+
+/// A picture marker's image: a PNG or JPEG as base64, kept once for the rest of the run so a
+/// symbol showing one stays `Copy`. The same image is the same `Picture`, so two are compared
+/// (and hashed, for the sprites a point layer is stamped from) by where it's kept, not by its
+/// bytes. Empty (the default) for an image that wasn't kept: one longer than
+/// [`MAX_PICTURE_BYTES`], or past [`MAX_PICTURES`] or [`MAX_PICTURES_BYTES`] (from a crafted
+/// file); that one, like one that doesn't decode, is drawn as a circle.
+#[derive(Clone, Copy, Default)]
+pub struct Picture(&'static str);
+
+/// Where [`Picture::is_dropped`] points: an image a file gave that wasn't kept.
+static DROPPED: &str = "(dropped)";
+
+/// Whether `more` pictures taking `more_bytes` of base64 fit beside `count` kept ones taking
+/// `bytes` ([`MAX_PICTURES`], [`MAX_PICTURES_BYTES`]).
+fn fits((count, bytes): (usize, usize), (more, more_bytes): (usize, usize)) -> bool {
+    count + more <= MAX_PICTURES && bytes + more_bytes <= MAX_PICTURES_BYTES
+}
+
+/// Pictures kept, and the bytes of base64 they take.
+type Store = (std::collections::HashSet<&'static str>, usize);
+
+/// The pictures kept this run.
+fn kept_pictures() -> std::sync::MutexGuard<'static, Store> {
+    use std::sync::{Mutex, OnceLock};
+    static KEPT: OnceLock<Mutex<Store>> = OnceLock::new();
+    KEPT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Keeps trimmed, non-empty `images` in `store`, all or none ([`Picture::new_all`]): where each
+/// is kept, in the order given, or `None` with nothing kept when the new ones don't fit together.
+fn keep_all(store: &mut Store, images: &[&str]) -> Option<Vec<&'static str>> {
+    let (pictures, bytes) = store;
+    let mut more: Vec<&str> = images.iter().copied().filter(|b64| !pictures.contains(*b64)).collect();
+    more.sort_unstable();
+    more.dedup();
+    if !fits((pictures.len(), *bytes), (more.len(), more.iter().map(|b64| b64.len()).sum())) {
+        return None;
+    }
+    for b64 in more {
+        let p: &'static str = Box::leak(b64.to_owned().into_boxed_str());
+        pictures.insert(p);
+        *bytes += p.len();
+    }
+    images.iter().map(|b64| pictures.get(*b64).copied()).collect()
+}
+
+impl Picture {
+    pub fn new(base64: &str) -> Picture {
+        let base64 = base64.trim();
+        if base64.is_empty() || base64.len() > MAX_PICTURE_BYTES {
+            return Picture::default();
+        }
+        let mut kept = kept_pictures();
+        let (pictures, bytes) = &mut *kept;
+        if let Some(p) = pictures.get(base64) {
+            return Picture(p);
+        }
+        if !fits((pictures.len(), *bytes), (1, base64.len())) {
+            return Picture::default();
+        }
+        let p: &'static str = Box::leak(base64.to_owned().into_boxed_str());
+        pictures.insert(p);
+        *bytes += p.len();
+        Picture(p)
+    }
+
+    /// [`Picture::new`] for several images at once, all or none: `None`, keeping nothing, when one
+    /// is empty or too long, or when together they don't fit beside those already kept. Each
+    /// image's picture, in the order given (the same image twice is the same picture).
+    pub fn new_all(images: &[&str]) -> Option<Vec<Picture>> {
+        let images: Vec<&str> = images.iter().map(|b64| b64.trim()).collect();
+        if images.iter().any(|b64| b64.is_empty() || b64.len() > MAX_PICTURE_BYTES) {
+            return None;
+        }
+        keep_all(&mut kept_pictures(), &images).map(|kept| kept.into_iter().map(Picture).collect())
+    }
+
+    /// The picture already kept for `base64`, keeping nothing new: a command given an image again
+    /// (a slider dragged in the editor sends it every frame) finds it without decoding it again.
+    pub fn kept(base64: &str) -> Option<Picture> {
+        kept_pictures().0.get(base64.trim()).copied().map(Picture)
+    }
+
+    /// [`Picture::new`] for an image a file gives: one that isn't kept is [`Picture::is_dropped`],
+    /// so the reader can say so.
+    pub fn read(base64: &str) -> Picture {
+        let p = Picture::new(base64);
+        if p.is_default() && !base64.trim().is_empty() { Picture(DROPPED) } else { p }
+    }
+
+    /// The image as base64 (empty: none kept).
+    pub fn base64(self) -> &'static str {
+        if self.is_dropped() { "" } else { self.0 }
+    }
+
+    /// No image: none given, or one not kept.
+    pub fn is_default(&self) -> bool {
+        self.0.is_empty() || self.is_dropped()
+    }
+
+    /// An image a file gave that wasn't kept (too long, past what a run keeps, or not text): drawn
+    /// as a circle, and lost when the file is saved again.
+    pub fn is_dropped(self) -> bool {
+        std::ptr::eq(self.0, DROPPED)
+    }
+}
+
+impl PartialEq for Picture {
+    fn eq(&self, other: &Picture) -> bool {
+        // Empty ones are equal wherever their `""` is.
+        std::ptr::eq(self.0, other.0) || (self.0.is_empty() && other.0.is_empty())
+    }
+}
+
+impl Eq for Picture {}
+
+impl std::hash::Hash for Picture {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        if self.0.is_empty() { 0usize.hash(h) } else { (self.0.as_ptr() as usize, self.0.len()).hash(h) }
+    }
+}
+
+impl std::fmt::Debug for Picture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Picture({} bytes)", self.0.len())
+    }
+}
+
+impl Serialize for Picture {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.base64())
+    }
+}
+
+impl<'de> Deserialize<'de> for Picture {
+    /// One not kept, or not text (a crafted file): no image, drawn as a circle and
+    /// [`Picture::is_dropped`] for the reader to say so, and the rest still reads.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Image {
+            Text(String),
+            Other(serde::de::IgnoredAny),
+        }
+        Ok(match Image::deserialize(d)? {
+            Image::Text(b64) => Picture::read(&b64),
+            Image::Other(_) => Picture(DROPPED),
+        })
+    }
+}
+
+/// Whether any of `strokes` draws an image as its markers that `f` holds true for.
+pub fn strokes_have_pictures(strokes: &[LineStroke], f: impl Fn(Picture) -> bool) -> bool {
+    strokes.iter().any(|s| s.markers.is_some_and(|m| matches!(m.mark, LineMark::Marker(Marker::Picture(p)) if f(p))))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Symbol {
     pub fill: Rgba,
@@ -126,11 +294,14 @@ const LAYER_COLORS: [[u8; 3]; 8] = [
 
 impl Symbol {
     /// Whether anything is drawn with this symbol for a `g` feature: a line its stroke, an area
-    /// or point its fill or an outline with a width (a point of size 0 nothing).
+    /// or point its fill or an outline with a width, a point its image (a point of size 0
+    /// nothing).
     pub fn draws(&self, g: GeometryType) -> bool {
         match g {
             GeometryType::Polyline => self.stroke.a() > 0,
             GeometryType::Point if self.size <= 0.0 => false,
+            // An image shows whatever its fill and outline.
+            GeometryType::Point if matches!(self.marker, Marker::Picture(p) if !p.is_default()) => true,
             _ => self.fill.a() > 0 || (self.stroke.a() > 0 && self.stroke_width > 0.0),
         }
     }
@@ -147,6 +318,12 @@ impl Symbol {
         }
     }
 
+    /// The seed whose `g` default this symbol is, untouched: a layer keeps its default when it is
+    /// copied or added from a layer file under another id, so any seed's default counts.
+    pub fn default_seed(&self, g: GeometryType) -> Option<u32> {
+        (0..LAYER_COLORS.len() as u32).find(|&seed| *self == Symbol::default_for(g, seed))
+    }
+
     pub fn with_fill(mut self, c: Rgba, g: GeometryType) -> Symbol {
         match g {
             GeometryType::Polyline => {
@@ -158,6 +335,26 @@ impl Symbol {
                 self.stroke = c.shade(0.6);
             }
             _ => self.fill = c,
+        }
+        self
+    }
+
+    /// The colours a ramp gives a class, taken from `src`: the fill and the outline (a point's too,
+    /// which a ramp never sets, so it is one picked by hand). A polygon keeps its own fill opacity.
+    fn with_colors_of(mut self, src: &Symbol, g: GeometryType) -> Symbol {
+        match g {
+            GeometryType::Polyline => {
+                self.fill = src.fill;
+                self.stroke = src.stroke;
+            }
+            GeometryType::Polygon => {
+                self.fill = src.fill.with_alpha(self.fill.a());
+                self.stroke = src.stroke;
+            }
+            _ => {
+                self.fill = src.fill;
+                self.stroke = src.stroke;
+            }
         }
         self
     }
@@ -291,7 +488,7 @@ impl Dash {
 /// Reads a stroke's pattern from a project, brought into range: at most [`MAX_DASH_STEPS`] steps,
 /// each clamped to 0 to [`MAX_DASH_STEP`] (one too large for a number, infinite, the longest);
 /// one left without length is `None`, solid (a project file is hostile input).
-fn de_dash<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Dash>, D::Error> {
+pub(crate) fn de_dash<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Dash>, D::Error> {
     let Some(v) = Option::<Vec<f32>>::deserialize(d)? else { return Ok(None) };
     let steps: Vec<f32> = v.iter().take(MAX_DASH_STEPS).map(|x| if x.is_nan() { 0.0 } else { x.clamp(0.0, MAX_DASH_STEP) }).collect();
     Ok(Dash::new(&steps))
@@ -336,6 +533,30 @@ pub struct LineStroke {
     /// and dash don't apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub markers: Option<LineMarkers>,
+}
+
+/// Whether a stack of fills (a polygon's) or strokes (a line's or a point's) hides the colors a
+/// color scheme sets on a symbol (#1355): the stack is drawn for the geometry (a polygon's stacked
+/// strokes and a line's stacked fills are not) and every layer of it sets a color of its own. A layer
+/// without one takes the symbol's (`FillLayer::color`, `LineStroke::color`), so the class still shows
+/// its color through it: a road's black casing over a core that follows the class. An empty stack is
+/// no stack. Used for a class's own stack and for the layer's.
+pub fn stack_hides_symbol(g: GeometryType, fills: &[FillLayer], strokes: &[LineStroke]) -> bool {
+    match g {
+        GeometryType::Polygon => !fills.is_empty() && fills.iter().all(|f| f.color.is_some()),
+        _ => !strokes.is_empty() && strokes.iter().all(|s| s.color.is_some()),
+    }
+}
+
+/// What [`Renderer::reverse_ramp`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RampReversal {
+    /// How many classes changed colors with another: 0 when fewer than two classes show the scheme.
+    pub reversed: usize,
+    /// How many classes were left as they were, their own stack hiding their symbol.
+    pub kept: usize,
+    /// How many of the `reversed` classes have no stack of their own, so they are drawn from the layer's.
+    pub on_layer_stack: usize,
 }
 
 impl Default for LineStroke {
@@ -718,6 +939,8 @@ pub enum Renderer {
         symbols: Vec<Symbol>,
         ramp: Ramp,
         method: ClassMethod,
+        /// The lowest value the first class takes, for the legend; [`OPEN_BELOW`] when it takes
+        /// every value up to its bound.
         min: f64,
         /// The classes asked for: there can be fewer breaks, as Standard Deviation, Head/Tail
         /// Breaks and repeated bounds give fewer. 0 (a project from before it was kept) is as many
@@ -749,6 +972,16 @@ pub enum Renderer {
 /// The legend label of a Unique Values renderer's fallback class.
 pub const OTHER_VALUES: &str = "<all other values>";
 
+/// A Graduated Colors `min` for a first class that takes every value up to its bound, when the
+/// field's range is unknown (see [`Renderer::graduated_manual_open`]). It is an ordinary number,
+/// so saved files keep their form. An older RustGIS draws the classes the same, but its legend
+/// shows the number in full.
+pub const OPEN_BELOW: f64 = f64::MIN;
+
+/// A Graduated Colors last bound for a class that takes every value past the bound before it:
+/// every number is at most it, so classing needs nothing more.
+pub const OPEN_ABOVE: f64 = f64::MAX;
+
 /// The most features × classes a legend of Unique Values by expression classes its features for
 /// (it is worked out as the Layers pane is drawn): past it, every class is listed.
 pub const MAX_LEGEND_STEPS: usize = 2_000_000;
@@ -758,13 +991,38 @@ pub const MAX_LEGEND_STEPS: usize = 2_000_000;
 pub struct LegendEntry {
     pub label: String,
     pub symbol: Symbol,
+    /// The stacked strokes its class has of its own; empty, it takes the layer's `line_strokes`.
+    pub strokes: Vec<LineStroke>,
+    /// The stacked fills its class has of its own; empty, it takes the layer's `fill_layers`.
+    pub fills: Vec<FillLayer>,
     /// The Unique Values fallback row (`<all other values>`), told apart from a class whatever
     /// its label: a legend can leave it out without touching a class that bears the same name.
     pub fallback: bool,
 }
 
+impl LegendEntry {
+    /// A class's row, with the stacked strokes and fills it has of its own, if any.
+    fn class(label: String, symbol: Symbol, strokes: Option<&Vec<LineStroke>>, fills: Option<&Vec<FillLayer>>) -> Self {
+        LegendEntry {
+            label,
+            symbol,
+            strokes: strokes.cloned().unwrap_or_default(),
+            fills: fills.cloned().unwrap_or_default(),
+            fallback: false,
+        }
+    }
+
+    /// A row with no stacked strokes or fills of its own.
+    pub fn plain(label: String, symbol: Symbol) -> Self {
+        LegendEntry { label, symbol, strokes: Vec::new(), fills: Vec::new(), fallback: false }
+    }
+}
+
 /// Most unique-value classes created automatically.
 pub const MAX_UNIQUE: usize = 64;
+/// The most classes by an expression: a QGIS rule-based style's rules (one class each), kept when
+/// its classes are made again from the expression.
+pub const MAX_EXPRESSION_CLASSES: usize = 200;
 
 /// The colour of a new Unique Values renderer's `<all other values>` class.
 pub const OTHER_FILL: Rgba = Rgba::rgb(0xB0, 0xB0, 0xB0);
@@ -773,7 +1031,7 @@ pub const OTHER_FILL: Rgba = Rgba::rgb(0xB0, 0xB0, 0xB0);
 pub const MAX_LABEL: usize = 200;
 
 /// One class of a Unique Values or Graduated Colors renderer, as a command names it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClassRef {
     /// A Unique Values class, by its value.
     Value(String),
@@ -863,11 +1121,13 @@ impl Renderer {
     /// Its class expression ([`Renderer::expression`]) compiled against `ds` for drawing at the
     /// map scale 1:`map_scale` (none: no map, as in an export of the features).
     pub fn classer(&self, ds: &Dataset, map_scale: Option<f64>) -> Classer {
+        self.classer_with(ds, rustgis_data::query::Env::default().at_scale(map_scale))
+    }
+
+    /// Compiles class expressions for the scale and page being drawn.
+    pub fn classer_with(&self, ds: &Dataset, env: rustgis_data::query::Env) -> Classer {
         let Some(text) = self.expression() else { return Classer::default() };
-        Classer {
-            expr: rustgis_data::query::parse(text, ds).ok(),
-            env: rustgis_data::query::Env { map_scale: map_scale.filter(|s| s.is_finite() && *s > 0.0) },
-        }
+        Classer { expr: rustgis_data::query::parse_fields(text, ds).ok(), env }
     }
 
     /// The first symbol (the single symbol, or a representative).
@@ -883,12 +1143,19 @@ impl Renderer {
     /// Builds a unique-values renderer on `field`, from the rows `rows` keeps (a row past its end
     /// counts, so `&[]` keeps them all).
     pub fn unique(ds: &Dataset, rows: &[bool], field: &str, ramp: Ramp, base: Symbol) -> Result<Renderer, String> {
+        Self::unique_counted(ds, rows, field, ramp, base).map(|(r, _)| r)
+    }
+
+    /// [`Renderer::unique`], and how many kept features with a geometry have a value past the
+    /// first [`MAX_UNIQUE`] (by number when every value reads as one, else by text), drawn as
+    /// `<all other values>`.
+    pub fn unique_counted(ds: &Dataset, rows: &[bool], field: &str, ramp: Ramp, base: Symbol) -> Result<(Renderer, PastClasses), String> {
         let fi = ds.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
-        let vals = ds.unique_values(fi, rows, MAX_UNIQUE);
+        let (vals, rest) = ds.unique_values_counted(fi, rows, MAX_UNIQUE);
         let n = vals.len();
         let classes = vals.into_iter().enumerate().map(|(k, v)| (v, base.with_ramp_fill(ramp.pick(k, n), ds.geometry_type))).collect();
         let other = base.with_ramp_fill(OTHER_FILL, ds.geometry_type);
-        Ok(Renderer::Unique {
+        let renderer = Renderer::Unique {
             field: ds.fields.get(fi).map(|f| f.name.clone()).unwrap_or_default(),
             classes,
             other,
@@ -900,7 +1167,8 @@ impl Renderer {
             class_fills: Default::default(),
             other_fills: Vec::new(),
             expression: None,
-        })
+        };
+        Ok((renderer, rest))
     }
 
     /// Builds a Unique Values renderer classing by an expression's values over the rows `rows`
@@ -913,19 +1181,51 @@ impl Renderer {
     }
 
     /// [`Renderer::unique_by`], and how many kept features with a geometry have a value past the
-    /// first [`MAX_UNIQUE`] (in text order), drawn as `<all other values>`.
-    pub fn unique_by_counted(ds: &Dataset, rows: &[bool], expression: &str, ramp: Ramp, base: Symbol) -> Result<(Renderer, usize), String> {
+    /// first [`MAX_UNIQUE`] (by number when every value reads as one, else by text), drawn as
+    /// `<all other values>`.
+    pub fn unique_by_counted(
+        ds: &Dataset,
+        rows: &[bool],
+        expression: &str,
+        ramp: Ramp,
+        base: Symbol,
+    ) -> Result<(Renderer, PastClasses), String> {
+        Self::unique_by_up_to(ds, rows, expression, ramp, base, MAX_UNIQUE)
+    }
+
+    /// [`Renderer::unique_by_counted`] keeping up to `max` values (at most
+    /// [`MAX_EXPRESSION_CLASSES`]), and how many features have a value past them.
+    pub fn unique_by_up_to(
+        ds: &Dataset,
+        rows: &[bool],
+        expression: &str,
+        ramp: Ramp,
+        base: Symbol,
+        max: usize,
+    ) -> Result<(Renderer, PastClasses), String> {
+        let max = max.clamp(1, MAX_EXPRESSION_CLASSES);
         let text = expression.trim();
         if text.chars().count() > rustgis_data::query::MAX_LEN {
             return Err(format!("the expression is longer than {} characters", rustgis_data::query::MAX_LEN));
         }
-        let e = rustgis_data::query::parse(text, ds)?;
+        let e = rustgis_data::query::parse_fields(text, ds)?;
+        if rustgis_data::query::uses_area(&e)
+            && let Some(message) = ds.ambiguous_area_message(
+                ds.features
+                    .iter()
+                    .enumerate()
+                    .filter(|(row, _)| rows.get(*row).copied().unwrap_or(true))
+                    .filter_map(|(_, feature)| feature.geometry.as_ref()),
+            )
+        {
+            return Err(message);
+        }
         let env = rustgis_data::query::Env::default();
-        // The first values in order, never more than MAX_UNIQUE kept, each with its features: one
-        // put out of the first can't come back (any later one is past the last kept), so its
-        // features and every later one past the last kept are counted as the rest.
-        let mut kept: BTreeMap<String, usize> = BTreeMap::new();
-        let mut rest = 0usize;
+        // The first values by text, and while every value reads as a number, by number too: the
+        // order is known only once every feature is classed (`rustgis_data::value::numeric_classes`).
+        let mut by_text: FirstValues<String> = FirstValues::new(max);
+        let mut by_number: FirstValues<rustgis_data::value::ClassText> = FirstValues::new(max);
+        let mut text_seen = false;
         for r in (0..ds.features.len()).filter(|r| rows.get(*r).copied().unwrap_or(true)) {
             let v = match rustgis_data::query::value(&e, ds, r, &env) {
                 rustgis_data::Value::Null => continue,
@@ -934,16 +1234,22 @@ impl Renderer {
             };
             // (A feature without a geometry draws nothing, so it isn't counted.)
             let drawn = usize::from(ds.features.get(r).is_some_and(|f| f.geometry.is_some()));
-            if kept.len() >= MAX_UNIQUE && kept.last_key_value().is_some_and(|(last, _)| v > *last) {
-                rest += drawn;
-                continue;
+            // Read as a number once.
+            let read = rustgis_data::value::ClassText::new(v);
+            text_seen = text_seen || read.orders_as_text();
+            if !text_seen {
+                by_number.add(read.clone(), drawn);
             }
-            *kept.entry(v).or_insert(0) += drawn;
-            if kept.len() > MAX_UNIQUE {
-                rest += kept.pop_last().map_or(0, |(_, n)| n);
-            }
+            by_text.add(read.into_text(), drawn);
         }
-        let vals: Vec<String> = kept.into_keys().collect();
+        // (Numbers come before the empty text and `<Null>`, so with any number, one is kept.)
+        let numeric = !text_seen && rustgis_data::value::ClassText::numeric(by_number.kept.keys());
+        let (vals, features): (Vec<String>, usize) = if numeric {
+            (by_number.kept.into_keys().map(rustgis_data::value::ClassText::into_text).collect(), by_number.rest)
+        } else {
+            (by_text.kept.into_keys().collect(), by_text.rest)
+        };
+        let rest = PastClasses { features, by_number: numeric };
         let n = vals.len();
         let classes = vals.into_iter().enumerate().map(|(k, v)| (v, base.with_ramp_fill(ramp.pick(k, n), ds.geometry_type))).collect();
         Ok((
@@ -996,22 +1302,46 @@ impl Renderer {
         base: Symbol,
     ) -> Result<Renderer, String> {
         Self::graduated_by(ds, rows, field, ClassMethod::Manual, ramp, base, |vals| {
-            let mut b: Vec<f64> = breaks.iter().copied().filter(|v| v.is_finite()).collect();
-            if b.is_empty() {
-                return Err("manual breaks need at least one number".into());
-            }
-            b.sort_by(|a, b| a.total_cmp(b));
-            b.dedup();
-            if let Some(&hi) = vals.last()
-                && b.last().is_some_and(|&l| l < hi)
-            {
-                b.push(hi);
-            }
-            if b.len() > 12 {
-                return Err(format!("{} classes; Graduated Colors takes at most 12", b.len()));
-            }
-            Ok(b)
+            manual_bounds(breaks, f64::is_finite, vals.last().copied())
         })
+    }
+
+    /// [`Renderer::graduated_manual`] for a layer whose values are not at hand, such as one read in
+    /// place. Its range is unknown, so the first class takes every value up to the first bound and
+    /// one more class takes every value past the last. The features at hand never set a bound:
+    /// they depend on where the map was when they were read.
+    pub fn graduated_manual_open(ds: &Dataset, field: &str, breaks: &[f64], ramp: Ramp, base: Symbol) -> Result<Renderer, String> {
+        let fi = numeric_field(ds, field)?;
+        // The lowest number is how the first class says it is open, so it can't be a bound too.
+        if breaks.contains(&OPEN_BELOW) {
+            return Err(format!("manual breaks must be above {OPEN_BELOW:e}"));
+        }
+        // The layer's current bounds come with their open class: it is taken out and added back once.
+        // The open class alone is one class of every value.
+        let breaks = if !breaks.is_empty() && breaks.iter().all(|v| *v >= OPEN_ABOVE) {
+            vec![OPEN_ABOVE]
+        } else {
+            manual_bounds(breaks, |v| v.is_finite() && v < OPEN_ABOVE, Some(OPEN_ABOVE))?
+        };
+        Ok(Self::graduated_on(ds, fi, ClassMethod::Manual, ramp, base, breaks, OPEN_BELOW))
+    }
+
+    /// Closed Graduated Colors classes made open, as [`Renderer::graduated_manual_open`] makes
+    /// them: the open class takes the place of the bound that closed them, so every feature keeps
+    /// its class. `None` for other renderers and for classes already open.
+    pub fn opened(&self) -> Option<Renderer> {
+        let Renderer::Graduated { breaks, min, .. } = self else { return None };
+        if *min <= OPEN_BELOW && breaks.last().is_none_or(|v| *v >= OPEN_ABOVE) {
+            return None;
+        }
+        let mut open = self.clone();
+        if let Renderer::Graduated { breaks, min, .. } = &mut open {
+            if let Some(last) = breaks.last_mut() {
+                *last = OPEN_ABOVE;
+            }
+            *min = OPEN_BELOW;
+        }
+        Some(open)
     }
 
     /// A graduated renderer on `field`, with the bounds `breaks` works out from the field's sorted
@@ -1025,20 +1355,22 @@ impl Renderer {
         base: Symbol,
         breaks: impl FnOnce(&[f64]) -> Result<Vec<f64>, String>,
     ) -> Result<Renderer, String> {
-        let fi = ds.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
-        if !ds.fields.get(fi).is_some_and(|f| f.ty.is_numeric()) {
-            return Err(format!("'{field}' is not a numeric field"));
-        }
+        let fi = numeric_field(ds, field)?;
         let mut vals: Vec<f64> = ds.kept_features(rows).filter_map(|f| f.attrs.get(fi).and_then(|v| v.as_f64())).collect();
         if vals.is_empty() {
             return Err(format!("'{field}' has no numeric values"));
         }
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let breaks = breaks(&vals)?;
+        let min = vals.first().copied().unwrap_or(0.0);
+        Ok(Self::graduated_on(ds, fi, method, ramp, base, breaks, min))
+    }
+
+    /// A graduated renderer on the field at `fi`, a symbol per class from `ramp`.
+    fn graduated_on(ds: &Dataset, fi: usize, method: ClassMethod, ramp: Ramp, base: Symbol, breaks: Vec<f64>, min: f64) -> Renderer {
         let n = breaks.len();
         let symbols = (0..n).map(|i| base.with_ramp_fill(ramp.pick(i, n), ds.geometry_type)).collect();
-        let min = vals.first().copied().unwrap_or(0.0);
-        Ok(Renderer::Graduated {
+        Renderer::Graduated {
             field: ds.fields.get(fi).map(|f| f.name.clone()).unwrap_or_default(),
             breaks,
             symbols,
@@ -1049,7 +1381,7 @@ impl Renderer {
             class_labels: BTreeMap::new(),
             class_strokes: BTreeMap::new(),
             class_fills: Default::default(),
-        })
+        }
     }
 
     /// A Graduated Colors renderer's classes as asked, which can be more than it has (see
@@ -1349,9 +1681,9 @@ impl Renderer {
             }
             Renderer::Proportional { field, base, min_size, max_size, min, max } => {
                 let Some(v) = ds.field_index(field).and_then(|fi| ds.value(row, fi).as_f64()) else { return *base };
-                let t = if max > min { ((v - min) / (max - min)).clamp(0.0, 1.0) } else { 0.5 };
                 // Area-proportional (Flannery-free square root scaling).
-                Symbol { size: min_size + (max_size - min_size) * t.sqrt() as f32, ..*base }
+                let size = crate::symbol_by::scaled_size(v, *min, *max, *min_size, *max_size, crate::symbol_by::SizeScaling::Area);
+                Symbol { size, ..*base }
             }
         }
     }
@@ -1369,7 +1701,25 @@ impl Renderer {
     /// Values by an expression reading `@map_scale` class by. One whose expression would take
     /// more than [`MAX_LEGEND_STEPS`] to class every kept feature lists all its classes.
     pub fn legend_at(&self, ds: &Dataset, rows: &[bool], map_scale: Option<f64>) -> Vec<LegendEntry> {
-        let Renderer::Unique { field, classes, other, class_labels, other_label, expression, other_fills, other_strokes, .. } = self else {
+        self.legend_with(ds, rows, rustgis_data::query::Env::default().at_scale(map_scale))
+    }
+
+    /// Classes present among the kept rows at the drawing scale and page.
+    pub fn legend_with(&self, ds: &Dataset, rows: &[bool], env: rustgis_data::query::Env) -> Vec<LegendEntry> {
+        let Renderer::Unique {
+            field,
+            classes,
+            other,
+            class_labels,
+            other_label,
+            expression,
+            other_fills,
+            other_strokes,
+            class_strokes,
+            class_fills,
+            ..
+        } = self
+        else {
             return self.legend();
         };
         // A fallback that draws nothing has nothing to stand for in a legend: its own symbol as
@@ -1393,7 +1743,7 @@ impl Renderer {
         }
         let fi = ds.field_index(field);
         // By expression: each feature classed as it is drawn.
-        let classer = expression.as_ref().map(|_| self.classer(ds, map_scale));
+        let classer = expression.as_ref().map(|_| self.classer_with(ds, env));
         let mut used = vec![false; classes.len()];
         let mut other_used = false;
         // Distinct classes still unseen: once every class and "other" are in, the rest can't add any.
@@ -1425,44 +1775,87 @@ impl Renderer {
                 }
             }
         }
-        let mut v: Vec<LegendEntry> = classes
-            .iter()
-            .zip(&used)
-            .filter(|(_, u)| **u)
-            .map(|((k, s), _)| LegendEntry { label: unique_label(class_labels, k), symbol: *s, fallback: false })
+        let mut v: Vec<LegendEntry> = self
+            .class_order()
+            .into_iter()
+            .filter(|i| used.get(*i).copied().unwrap_or(false))
+            .filter_map(|i| classes.get(i))
+            .map(|(k, s)| LegendEntry::class(unique_label(class_labels, k), *s, class_strokes.get(k), class_fills.get(k)))
             .collect();
-        v.sort_by_cached_key(|e| e.label.to_lowercase());
         if other_used && visible {
-            v.push(LegendEntry { label: other_label.clone().unwrap_or_else(|| OTHER_VALUES.into()), symbol: *other, fallback: true });
+            v.push(LegendEntry {
+                label: other_label.clone().unwrap_or_else(|| OTHER_VALUES.into()),
+                symbol: *other,
+                strokes: other_strokes.clone(),
+                fills: other_fills.clone(),
+                fallback: true,
+            });
         }
         v
     }
 
-    /// The order `legend()` lists the Unique Values classes in: their indices in `classes`,
-    /// sorted by label without regard to case (a stable sort, so a repeated value keeps its first
-    /// class first). Empty for the other renderers, whose legend follows their classes.
+    /// The order `legend()` lists the Unique Values classes in: their indices in `classes`, by
+    /// value when [`Renderer::classes_by_number`] (9 before 10, a class renamed by hand in its
+    /// value's place), else by label without regard to case. The sort is stable, so a repeated
+    /// value keeps its first class first. Empty for the other renderers, whose legend follows
+    /// their classes.
     pub fn class_order(&self) -> Vec<usize> {
         let Renderer::Unique { classes, class_labels, .. } = self else { return Vec::new() };
         let mut order: Vec<usize> = (0..classes.len()).collect();
-        order.sort_by_cached_key(|i| classes.get(*i).map(|(k, _)| unique_label(class_labels, k).to_lowercase()));
+        if self.classes_by_number() {
+            // (Each value read as a number once; the sort is stable.)
+            order.sort_by_cached_key(|i| rustgis_data::value::ClassText::new(classes.get(*i).map(|(k, _)| k.clone()).unwrap_or_default()));
+        } else {
+            order.sort_by_cached_key(|i| classes.get(*i).map(|(k, _)| unique_label(class_labels, k).to_lowercase()));
+        }
         order
     }
 
+    /// Whether Unique Values' classes are ordered by number: when their values read as numbers
+    /// ([`rustgis_data::value::numeric_classes`]), as a numeric field's do. False for the other
+    /// renderers.
+    pub fn classes_by_number(&self) -> bool {
+        let Renderer::Unique { classes, .. } = self else { return false };
+        rustgis_data::value::numeric_classes(classes.iter().map(|(k, _)| k.as_str()))
+    }
+
+    /// The existing Graduated Colors fallback, for an optional layout legend row. With `rows`,
+    /// include it only when a kept feature lacks a numeric value; `None` lists it unconditionally
+    /// for an all-classes legend. Other renderer kinds keep their own legend semantics.
+    pub fn no_data_legend(&self, ds: &Dataset, rows: Option<&[bool]>) -> Option<LegendEntry> {
+        let Renderer::Graduated { field, .. } = self else { return None };
+        let fi = ds.field_index(field);
+        let used = rows.is_none_or(|rows| {
+            (0..ds.features.len()).any(|r| rows.get(r).copied().unwrap_or(true) && fi.and_then(|fi| ds.value(r, fi).as_f64()).is_none())
+        });
+        used.then(|| LegendEntry::plain("No data".into(), self.symbol_in(ds, 0, None)))
+    }
+
+    /// Every row of its legend, whatever the features: the classes, then a Unique Values'
+    /// `<all other values>`; none for a single symbol.
     pub fn legend(&self) -> Vec<LegendEntry> {
         match self {
             Renderer::Single(_) => Vec::new(),
-            Renderer::Unique { classes, other, class_labels, other_label, .. } => {
-                // Keep symbols attached to their sorted labels and the fallback at the end.
+            Renderer::Unique {
+                classes, other, class_labels, other_label, class_strokes, other_strokes, class_fills, other_fills, ..
+            } => {
+                // Keep symbols attached to their classes in `class_order` and the fallback at the end.
                 let mut v: Vec<LegendEntry> = self
                     .class_order()
                     .into_iter()
                     .filter_map(|i| classes.get(i))
-                    .map(|(k, s)| LegendEntry { label: unique_label(class_labels, k), symbol: *s, fallback: false })
+                    .map(|(k, s)| LegendEntry::class(unique_label(class_labels, k), *s, class_strokes.get(k), class_fills.get(k)))
                     .collect();
-                v.push(LegendEntry { label: other_label.clone().unwrap_or_else(|| OTHER_VALUES.into()), symbol: *other, fallback: true });
+                v.push(LegendEntry {
+                    label: other_label.clone().unwrap_or_else(|| OTHER_VALUES.into()),
+                    symbol: *other,
+                    strokes: other_strokes.clone(),
+                    fills: other_fills.clone(),
+                    fallback: true,
+                });
                 v
             }
-            Renderer::Graduated { breaks, symbols, min, class_labels, .. } => {
+            Renderer::Graduated { breaks, symbols, min, class_labels, class_strokes, class_fills, .. } => {
                 let mut lo = *min;
                 breaks
                     .iter()
@@ -1471,20 +1864,99 @@ impl Renderer {
                     .map(|(i, (b, s))| {
                         let label = class_labels.get(&i).cloned().unwrap_or_else(|| range_label(lo, *b));
                         lo = *b;
-                        LegendEntry { label, symbol: *s, fallback: false }
+                        LegendEntry::class(label, *s, class_strokes.get(&i), class_fills.get(&i))
                     })
                     .collect()
             }
             Renderer::Proportional { base, min_size, max_size, min, max, .. } => vec![
-                LegendEntry { label: fmt_num(*min), symbol: Symbol { size: *min_size, ..*base }, fallback: false },
-                LegendEntry {
-                    label: fmt_num((min + max) / 2.0),
-                    symbol: Symbol { size: min_size + (max_size - min_size) * 0.707, ..*base },
-                    fallback: false,
-                },
-                LegendEntry { label: fmt_num(*max), symbol: Symbol { size: *max_size, ..*base }, fallback: false },
+                LegendEntry::plain(fmt_num(*min), Symbol { size: *min_size, ..*base }),
+                LegendEntry::plain(fmt_num((min + max) / 2.0), Symbol { size: min_size + (max_size - min_size) * 0.707, ..*base }),
+                LegendEntry::plain(fmt_num(*max), Symbol { size: *max_size, ..*base }),
             ],
         }
+    }
+
+    /// The classes whose colors a ramp gives, in the order the legend lists them, and how many
+    /// more the ramp can't recolor: a class whose own stack hides its symbol's colors. The stack
+    /// that is drawn depends on the geometry (a polygon's fills; a line's strokes or a point's
+    /// marks; see the drawing in `rustgis-render`, which doesn't draw a polygon's stacked strokes
+    /// or a line's stacked fills), an empty stack is no stack, and a layer of a stack without a
+    /// color of its own takes the symbol's (`FillLayer::color`, `LineStroke::color`), so the
+    /// class still shows its ramp color through it: a road's black casing over a core that follows
+    /// the class. Only a stack whose every layer sets its own color hides the symbol. Only the
+    /// first entry of a Unique Values value is drawn, so a repeated value counts once. They are
+    /// indices into `classes` (Unique Values) or `symbols` (Graduated Colors). `None` for the
+    /// other renderers.
+    fn ramp_slots(&self, g: GeometryType) -> Option<(Vec<usize>, usize, usize)> {
+        // Whether a class's own stacks hide its symbol's colors, for the geometry the layer draws.
+        let replaced = |fills: Option<&Vec<FillLayer>>, strokes: Option<&Vec<LineStroke>>| {
+            stack_hides_symbol(g, fills.map_or(&[][..], Vec::as_slice), strokes.map_or(&[][..], Vec::as_slice))
+        };
+        // A class's own stack, of the kind the layer draws, replaces the layer's whenever it isn't empty.
+        let bare = |fills: Option<&Vec<FillLayer>>, strokes: Option<&Vec<LineStroke>>| {
+            if g == GeometryType::Polygon { fills.is_none_or(|f| f.is_empty()) } else { strokes.is_none_or(|s| s.is_empty()) }
+        };
+        let (mut slots, mut kept, mut on_layer) = (Vec::new(), 0, 0);
+        match self {
+            Renderer::Unique { classes, class_fills, class_strokes, .. } => {
+                let mut seen = std::collections::HashSet::new();
+                for i in self.class_order() {
+                    let Some((value, _)) = classes.get(i) else { continue };
+                    if !seen.insert(value.as_str()) {
+                        continue;
+                    }
+                    if replaced(class_fills.get(value), class_strokes.get(value)) {
+                        kept += 1;
+                    } else {
+                        slots.push(i);
+                        on_layer += usize::from(bare(class_fills.get(value), class_strokes.get(value)));
+                    }
+                }
+            }
+            Renderer::Graduated { symbols, class_fills, class_strokes, .. } => {
+                for i in 0..symbols.len() {
+                    if replaced(class_fills.get(&i), class_strokes.get(&i)) {
+                        kept += 1;
+                    } else {
+                        slots.push(i);
+                        on_layer += usize::from(bare(class_fills.get(&i), class_strokes.get(&i)));
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some((slots, kept, on_layer))
+    }
+
+    fn class_symbol_mut(&mut self, i: usize) -> Option<&mut Symbol> {
+        match self {
+            Renderer::Unique { classes, .. } => classes.get_mut(i).map(|c| &mut c.1),
+            Renderer::Graduated { symbols, .. } => symbols.get_mut(i),
+            _ => None,
+        }
+    }
+
+    /// Reverses the colours of the classes (#1355), in the order the legend lists them: the first
+    /// class takes the last one's colour, and so on. Colours edited by hand travel with their
+    /// class's old position, and a polygon fill keeps its own opacity. Applied twice it gives the
+    /// original back. A class whose own stack hides its symbol (every layer of its fills, for a
+    /// polygon, or strokes, for a line or a point, sets a color of its own), and a repeat of a Unique
+    /// Values value (which no feature draws), keep theirs and take no part in the reversal. The
+    /// `<all other values>` symbol is no ramp color and stays. Says how many classes changed places
+    /// and how many were kept for their own stacks, or `None` for a renderer without classes
+    /// coloured from a ramp.
+    pub fn reverse_ramp(&mut self, g: GeometryType) -> Option<RampReversal> {
+        let (slots, kept, on_layer_stack) = self.ramp_slots(g)?;
+        let old: Vec<Symbol> = slots.iter().filter_map(|&i| self.class_symbol_mut(i).map(|s| *s)).collect();
+        for (pos, &i) in slots.iter().enumerate() {
+            let from = old.len().checked_sub(1 + pos).and_then(|k| old.get(k));
+            if let (Some(sym), Some(from)) = (self.class_symbol_mut(i), from) {
+                *sym = sym.with_colors_of(from, g);
+            }
+        }
+        // One class, or none, has no other to change places with.
+        let moved = slots.len() > 1;
+        Some(RampReversal { reversed: if moved { slots.len() } else { 0 }, kept, on_layer_stack: if moved { on_layer_stack } else { 0 } })
     }
 
     /// Recolours every class from a ramp, preserving each polygon fill's opacity.
@@ -1528,7 +2000,7 @@ impl Renderer {
         // The class's row in `legend()`, which lists the classes and then `other`. Unique Values
         // rows are sorted by label, so that class's row is built here rather than looked up.
         let row = match (&mut *self, class) {
-            (Renderer::Unique { classes, class_labels, .. }, ClassRef::Value(v)) => {
+            (Renderer::Unique { classes, class_labels, class_strokes, class_fills, .. }, ClassRef::Value(v)) => {
                 let i = classes.iter().position(|(k, _)| k == v).ok_or_else(|| format!("no class with the value '{v}'"))?;
                 if let Some((k, s)) = classes.get_mut(i) {
                     restyle(s);
@@ -1545,7 +2017,7 @@ impl Renderer {
                 }
                 return classes
                     .get(i)
-                    .map(|(k, s)| LegendEntry { label: unique_label(class_labels, k), symbol: *s, fallback: false })
+                    .map(|(k, s)| LegendEntry::class(unique_label(class_labels, k), *s, class_strokes.get(k), class_fills.get(k)))
                     .ok_or_else(|| "the class has no legend row".into());
             }
             (Renderer::Unique { classes, other, other_label, .. }, ClassRef::Other) => {
@@ -1681,7 +2153,7 @@ impl Renderer {
     }
 
     /// Applies `f` to every symbol.
-    pub fn map_symbols(&mut self, f: impl Fn(&mut Symbol)) {
+    pub fn map_symbols(&mut self, mut f: impl FnMut(&mut Symbol)) {
         match self {
             Renderer::Single(s) => f(s),
             Renderer::Unique { classes, other, .. } => {
@@ -1693,9 +2165,36 @@ impl Renderer {
         }
     }
 
-    /// Whether any symbol is a character of a font ([`Marker::Char`]).
-    pub fn has_char_markers(&self) -> bool {
-        let char = |s: &Symbol| matches!(s.marker, Marker::Char(_));
+    /// Whether any marker it draws is an image ([`Marker::Picture`]): a symbol's, or one in a
+    /// class's stacked strokes or dot fills.
+    pub fn has_picture_markers(&self) -> bool {
+        self.any_picture(|_| true)
+    }
+
+    /// Whether any image it draws as a marker (as [`Renderer::has_picture_markers`] finds them)
+    /// is one `f` holds true for.
+    pub fn any_picture(&self, f: impl Fn(Picture) -> bool + Copy) -> bool {
+        let symbol = |s: &Symbol| matches!(s.marker, Marker::Picture(p) if f(p));
+        match self {
+            Renderer::Single(s) | Renderer::Proportional { base: s, .. } => symbol(s),
+            Renderer::Unique { classes, other, class_strokes, other_strokes, class_fills, other_fills, .. } => {
+                symbol(other)
+                    || classes.iter().any(|c| symbol(&c.1))
+                    || class_strokes.values().chain([other_strokes]).any(|s| strokes_have_pictures(s, f))
+                    || class_fills.values().chain([other_fills]).any(|fl| crate::fills::fills_have_pictures(fl, f))
+            }
+            Renderer::Graduated { symbols, class_strokes, class_fills, .. } => {
+                symbols.iter().any(symbol)
+                    || class_strokes.values().any(|s| strokes_have_pictures(s, f))
+                    || class_fills.values().any(|fl| crate::fills::fills_have_pictures(fl, f))
+            }
+        }
+    }
+
+    /// Whether any symbol is a character of a font ([`Marker::Char`]) or an image
+    /// ([`Marker::Picture`]): markers the GPU has no template for.
+    pub fn has_char_or_picture_markers(&self) -> bool {
+        let char = |s: &Symbol| matches!(s.marker, Marker::Char(_) | Marker::Picture(_));
         match self {
             Renderer::Single(s) | Renderer::Proportional { base: s, .. } => char(s),
             Renderer::Unique { classes, other, .. } => char(other) || classes.iter().any(|c| char(&c.1)),
@@ -1740,14 +2239,77 @@ pub fn normalize_label(t: &str) -> String {
     t.trim().chars().take(MAX_LABEL).collect::<String>().trim_end().to_string()
 }
 
+/// The first values in a map's order, never more than `max` kept, each with how many features
+/// with a geometry have it, and how many have a value past them. A value put out of the first
+/// can't come back (any later one is past the last kept), so its features and every later one
+/// past the last kept are counted as the rest.
+struct FirstValues<K: Ord> {
+    kept: BTreeMap<K, usize>,
+    rest: usize,
+    max: usize,
+}
+
+impl<K: Ord> FirstValues<K> {
+    fn new(max: usize) -> Self {
+        FirstValues { kept: BTreeMap::new(), rest: 0, max }
+    }
+
+    fn add(&mut self, v: K, drawn: usize) {
+        if self.kept.len() >= self.max && self.kept.last_key_value().is_some_and(|(last, _)| v > *last) {
+            self.rest += drawn;
+            return;
+        }
+        *self.kept.entry(v).or_insert(0) += drawn;
+        if self.kept.len() > self.max {
+            self.rest += self.kept.pop_last().map_or(0, |(_, n)| n);
+        }
+    }
+}
+
 /// A Unique Values class's legend label: the one set by hand, or its value.
 fn unique_label(class_labels: &BTreeMap<String, String>, value: &str) -> String {
     class_labels.get(value).cloned().unwrap_or_else(|| value.to_string())
 }
 
-/// A Graduated Colors class's legend label when it has none of its own: its range.
-fn range_label(lo: f64, hi: f64) -> String {
-    format!("{} – {}", fmt_num(lo), fmt_num(hi))
+/// A Graduated Colors class's legend label when it has none of its own: its range, said in words
+/// at an open end. The words are English, as layouts and exports show them; the app's panes say
+/// them in the interface language.
+pub fn range_label(lo: f64, hi: f64) -> String {
+    match (lo <= OPEN_BELOW, hi >= OPEN_ABOVE) {
+        (true, true) => "every value".into(),
+        (true, false) => format!("up to {}", fmt_num(hi)),
+        (false, true) => format!("more than {}", fmt_num(lo)),
+        (false, false) => format!("{} – {}", fmt_num(lo), fmt_num(hi)),
+    }
+}
+
+/// The index of `field`, refused unless the dataset has it as a numeric field.
+fn numeric_field(ds: &Dataset, field: &str) -> Result<usize, String> {
+    let fi = ds.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
+    if !ds.fields.get(fi).is_some_and(|f| f.ty.is_numeric()) {
+        return Err(format!("'{field}' is not a numeric field"));
+    }
+    Ok(fi)
+}
+
+/// Class bounds typed by hand: the numbers `keep` lets through, sorted and each once, closed by
+/// `top` when they stop short of it. At most 12 classes, `top` included.
+fn manual_bounds(typed: &[f64], keep: impl Fn(f64) -> bool, top: Option<f64>) -> Result<Vec<f64>, String> {
+    let mut b: Vec<f64> = typed.iter().copied().filter(|v| keep(*v)).collect();
+    if b.is_empty() {
+        return Err("manual breaks need at least one number".into());
+    }
+    b.sort_by(|a, b| a.total_cmp(b));
+    b.dedup();
+    if let Some(hi) = top
+        && b.last().is_some_and(|&l| l < hi)
+    {
+        b.push(hi);
+    }
+    if b.len() > 12 {
+        return Err(format!("{} classes; Graduated Colors takes at most 12", b.len()));
+    }
+    Ok(b)
 }
 
 /// Compact number formatting for legends: 1.2M, 35K, 0.42.
@@ -2027,8 +2589,9 @@ pub struct LabelClass {
     /// Where a label sits relative to its feature.
     #[serde(default)]
     pub placement: LabelPlacement,
-    /// A point's label taken by another tries the other places round the point
-    /// ([`LabelPlacement::alternatives`]) before it is left out (#1011). Off by default: placed
+    /// A label taken by another tries nearby positions before it is left out (#1011):
+    /// round a point ([`LabelPlacement::alternatives`]), or along a non-repeated line.
+    /// Off by default: placed
     /// elsewhere, a label may take the place another has today.
     #[serde(default, deserialize_with = "de_flag", skip_serializing_if = "std::ops::Not::not")]
     pub other_positions: bool,
@@ -2074,10 +2637,170 @@ pub struct LabelClass {
     /// the one at its middle, as QGIS's repeat distance; none is the one at its middle.
     #[serde(default, deserialize_with = "de_repeat", skip_serializing_if = "Option::is_none")]
     pub repeat: Option<f32>,
+    /// Along a line, how far the label sits from it (points, within [`LABEL_OFFSET`], to the
+    /// text's nearest edge), as QGIS's distance from a line: above it as the text reads when
+    /// positive, below when negative, on it at 0.
+    #[serde(default, deserialize_with = "de_line_offset", skip_serializing_if = "is_zero")]
+    pub line_offset: f32,
+    /// Every label drawn, over the others where they crowd, rather than some left out.
+    #[serde(default, deserialize_with = "de_flag", skip_serializing_if = "std::ops::Not::not")]
+    pub show_all: bool,
+    /// Callouts: a label crowded off its spot moves to a free one nearby, a line drawn from its
+    /// feature to it at most this long (points, within [`CALLOUT_REACH`]), as QGIS's callouts;
+    /// none keeps every label in its spot. Labels along lines aren't moved.
+    #[serde(default, deserialize_with = "de_callout", skip_serializing_if = "Option::is_none")]
+    pub callout: Option<f32>,
+    /// The line layer a point's label is turned square to when placed
+    /// [`Perpendicular`](LabelPlacement::Perpendicular) (#2263); none labels it as `Auto`.
+    #[serde(default, deserialize_with = "de_square_to", skip_serializing_if = "Option::is_none")]
+    pub square_to: Option<SquareTo>,
+    /// Along a line placed curved, how the label fits the room its line gives (#2265): off places
+    /// it as before; [`LabelFit::Auto`] abbreviates a name that doesn't fit, sets one that takes
+    /// more than a third of the line on its straightest stretch, and spreads one over
+    /// [`stretch`](LabelClass::stretch) of a line with room to spare.
+    #[serde(default, deserialize_with = "de_fit", skip_serializing_if = "LabelFit::is_off")]
+    pub fit: LabelFit,
+    /// The words a fitted label abbreviates when it doesn't fit, each to its abbreviation (#2265):
+    /// whole words, matched ignoring case, taking the place of the built-in list's for the same
+    /// word. At most [`MAX_ABBREVIATIONS`], each word and abbreviation at most
+    /// [`MAX_ABBREVIATION_CHARS`] characters.
+    #[serde(default, deserialize_with = "de_abbreviations", skip_serializing_if = "BTreeMap::is_empty")]
+    pub abbreviations: BTreeMap<String, String>,
+    /// How much of its line's room a fitted label's letters are spread over when the line has
+    /// room to spare (#2265), a share within [`LABEL_STRETCH`]; none is
+    /// [`DEFAULT_LABEL_STRETCH`].
+    #[serde(default, deserialize_with = "de_stretch", skip_serializing_if = "Option::is_none")]
+    pub stretch: Option<f32>,
+    /// Labels moved by hand (the Move Label tool, as QGIS's): each feature's, by its id, drawn
+    /// where it was put, a callout's line back to the feature when the class has callouts. At
+    /// most [`MAX_MOVED_LABELS`], kept in order of id (so a label's is found without a scan).
+    #[serde(default, deserialize_with = "de_moved", skip_serializing_if = "Vec::is_empty")]
+    pub moved: Vec<MovedLabel>,
     /// Its text, size, colour and angle per feature, each by an expression (none set: the field,
     /// size and colour above alone).
     #[serde(default, skip_serializing_if = "crate::label_by::LabelBy::is_empty", deserialize_with = "crate::label_by::de_label_by")]
     pub by: crate::label_by::LabelBy,
+}
+
+/// A label moved by hand: its feature's id, and where its text is centred, in the layer's
+/// coordinates (longitude and latitude), so it stays put on the map as the view moves.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MovedLabel {
+    pub id: u64,
+    pub at: [f64; 2],
+}
+
+/// Most labels a class keeps moved by hand.
+pub const MAX_MOVED_LABELS: usize = 10_000;
+
+/// Whether `at` is a place a label can be moved to: a longitude within ±540° (a view's worth
+/// past the antimeridian either way) and a latitude within ±90°.
+pub fn is_label_place(at: [f64; 2]) -> bool {
+    let [x, y] = at;
+    x.is_finite() && y.is_finite() && x.abs() <= 540.0 && y.abs() <= 90.0
+}
+
+/// A project file's moved labels: those with a place ([`is_label_place`]), one a feature (the
+/// last wins), at most [`MAX_MOVED_LABELS`], in order of id.
+fn de_moved<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<MovedLabel>, D::Error> {
+    /// Reads one entry at a time, retaining only the capped map of valid label positions.
+    struct Moves;
+    impl<'de> serde::de::Visitor<'de> for Moves {
+        type Value = Vec<MovedLabel>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an array of moved labels")
+        }
+
+        /// Buffers only one entry and the capped, deduplicated set of valid positions.
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut by_id = std::collections::BTreeMap::new();
+            while let Some(value) = seq.next_element::<serde_json::Value>()? {
+                if let Ok(m) = serde_json::from_value::<MovedLabel>(value)
+                    && is_label_place(m.at)
+                    && (by_id.len() < MAX_MOVED_LABELS || by_id.contains_key(&m.id))
+                {
+                    by_id.insert(m.id, m.at);
+                }
+            }
+            Ok(by_id.into_iter().map(|(id, at)| MovedLabel { id, at }).collect())
+        }
+
+        /// Skips a damaged object without allocating it or rejecting the surrounding class.
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            while map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+            Ok(Vec::new())
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+    }
+    d.deserialize_any(Moves)
+}
+
+impl LabelClass {
+    /// Where feature `id`'s label was moved to by hand, if it was.
+    pub fn moved_to(&self, id: u64) -> Option<[f64; 2]> {
+        self.moved.binary_search_by_key(&id, |m| m.id).ok().and_then(|i| self.moved.get(i)).map(|m| m.at)
+    }
+
+    /// Keeps feature `id`'s label at `at` (longitude, latitude), or where its class puts it
+    /// again with none. False when `at` isn't a place ([`is_label_place`]), or the class already
+    /// keeps the most.
+    pub fn move_label(&mut self, id: u64, at: Option<[f64; 2]>) -> bool {
+        let found = self.moved.binary_search_by_key(&id, |m| m.id);
+        match (at, found) {
+            (None, Ok(i)) => {
+                self.moved.remove(i);
+                true
+            }
+            (None, Err(_)) => true,
+            (Some(at), _) if !is_label_place(at) => false,
+            (Some(at), Ok(i)) => {
+                if let Some(m) = self.moved.get_mut(i) {
+                    m.at = at;
+                }
+                true
+            }
+            (Some(at), Err(i)) if self.moved.len() < MAX_MOVED_LABELS => {
+                self.moved.insert(i, MovedLabel { id, at });
+                true
+            }
+            (Some(_), Err(_)) => false,
+        }
+    }
+}
+
+/// How long a callout's line may be (points): from about a letter to a few centimetres of paper.
+pub const CALLOUT_REACH: std::ops::RangeInclusive<f64> = 5.0..=500.0;
+/// A callout's longest line when none is given (points).
+pub const DEFAULT_CALLOUT: f32 = 40.0;
+
+/// A callout's longest line as a class keeps it, within [`CALLOUT_REACH`]; none for no number.
+pub fn callout_reach(v: f64) -> Option<f32> {
+    v.is_finite().then(|| v.clamp(*CALLOUT_REACH.start(), *CALLOUT_REACH.end()) as f32)
+}
+
+/// Reads positive finite lengths within the supported range; damaged and disabled values stay off.
+fn de_callout<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    // (0 turns callouts off, as the command has it; a negative isn't a length either.)
+    Ok(lenient::<D, f64>(d)?.filter(|v| *v > 0.0).and_then(callout_reach))
 }
 
 /// The longest wrap character kept (characters).
@@ -2235,6 +2958,15 @@ fn de_label_offset<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[f32; 2], D
     Ok(lenient::<D, [f64; 2]>(d)?.map_or([0.0; 2], |o| o.map(within)))
 }
 
+/// A label's distance from its line, within [`LABEL_OFFSET`]; one that isn't a number is none.
+pub fn label_line_offset(v: f64) -> f32 {
+    if v.is_finite() { v.clamp(*LABEL_OFFSET.start(), *LABEL_OFFSET.end()) as f32 } else { 0.0 }
+}
+
+fn de_line_offset<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    Ok(lenient::<D, f64>(d)?.map_or(0.0, label_line_offset))
+}
+
 fn is_no_offset(o: &[f32; 2]) -> bool {
     *o == [0.0; 2]
 }
@@ -2353,6 +3085,113 @@ fn is_yes(b: &bool) -> bool {
     *b
 }
 
+/// The line layer a [`Perpendicular`](LabelPlacement::Perpendicular) label is turned square to
+/// (#2263): its nearest line within `within` points on the screen, and which way the text runs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SquareTo {
+    /// A line or polygon layer, by name (as the terrain's walls layer).
+    pub layer: String,
+    /// How near its line must be (points, within [`SQUARE_WITHIN`]).
+    #[serde(default = "default_square_within")]
+    pub within: f32,
+    #[serde(default)]
+    pub side: SquareSide,
+}
+
+/// Which way a [`Perpendicular`](LabelPlacement::Perpendicular) label runs from its point.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SquareSide {
+    /// To the side of the line the point isn't on (left where it is on the line).
+    #[default]
+    Away,
+    /// Left of the line, as it runs.
+    Left,
+    /// Right of the line, as it runs.
+    Right,
+}
+
+/// How near a [`SquareTo`] line may be asked to be (points).
+pub const SQUARE_WITHIN: std::ops::RangeInclusive<f64> = 1.0..=500.0;
+
+/// A [`SquareTo`]'s `within` brought into [`SQUARE_WITHIN`] (not a number: the default).
+pub fn square_within(v: f64) -> f32 {
+    if v.is_finite() { v.clamp(*SQUARE_WITHIN.start(), *SQUARE_WITHIN.end()) as f32 } else { default_square_within() }
+}
+
+fn default_square_within() -> f32 {
+    20.0
+}
+
+/// How a label along a line fits the room the line gives ([`LabelClass::fit`], #2265).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LabelFit {
+    /// Placed as its placement says, whatever room there is.
+    #[default]
+    Off,
+    /// Abbreviated when it doesn't fit, set on the line's straightest stretch when it takes more
+    /// than a third of it, and spread when the line has room to spare.
+    Auto,
+}
+
+impl LabelFit {
+    pub fn is_off(&self) -> bool {
+        *self == LabelFit::Off
+    }
+}
+
+/// Most words a class abbreviates ([`LabelClass::abbreviations`]).
+pub const MAX_ABBREVIATIONS: usize = 256;
+
+/// Most characters in an abbreviated word, or in its abbreviation.
+pub const MAX_ABBREVIATION_CHARS: usize = 64;
+
+/// Whether `word` → `short` can be kept in [`LabelClass::abbreviations`]: one word (no spaces),
+/// each side not blank and at most [`MAX_ABBREVIATION_CHARS`] characters.
+pub fn is_abbreviation(word: &str, short: &str) -> bool {
+    let fine = |s: &str| !s.trim().is_empty() && s.chars().nth(MAX_ABBREVIATION_CHARS).is_none();
+    fine(word) && fine(short) && !word.chars().any(char::is_whitespace)
+}
+
+/// The shares of a line's room a fitted label may be spread over ([`LabelClass::stretch`]).
+pub const LABEL_STRETCH: std::ops::RangeInclusive<f32> = 0.1..=1.0;
+
+/// The share of a line's room a fitted label is spread over when its class gives none.
+pub const DEFAULT_LABEL_STRETCH: f32 = 0.6;
+
+/// A project file's `stretch`, brought into [`LABEL_STRETCH`]; one that isn't a number is none.
+fn de_stretch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(lenient::<D, f64>(d)?.filter(|s| s.is_finite()).map(|s| (s as f32).clamp(*LABEL_STRETCH.start(), *LABEL_STRETCH.end())))
+}
+
+/// A project file's `fit`: one that doesn't read is off.
+fn de_fit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<LabelFit, D::Error> {
+    Ok(lenient::<D, LabelFit>(d)?.unwrap_or_default())
+}
+
+/// A project file's `abbreviations`: those [`is_abbreviation`] keeps, at most
+/// [`MAX_ABBREVIATIONS`]; one that isn't an object of texts is none.
+fn de_abbreviations<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, String>, D::Error> {
+    let all = lenient::<D, BTreeMap<String, serde_json::Value>>(d)?.unwrap_or_default();
+    Ok(all
+        .into_iter()
+        .filter_map(|(w, s)| Some((w, s.as_str()?.to_owned())))
+        .filter(|(w, s)| is_abbreviation(w, s))
+        .take(MAX_ABBREVIATIONS)
+        .collect())
+}
+
+/// A project file's `square_to`: one that doesn't read, or names no layer, is none; its
+/// `within` brought into range.
+fn de_square_to<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<SquareTo>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value::<SquareTo>(v)
+        .ok()
+        .filter(|t| !t.layer.trim().is_empty())
+        .map(|t| SquareTo { within: square_within(f64::from(t.within)), ..t }))
+}
+
 /// Where labels sit relative to their feature's label point.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LabelPlacement {
@@ -2371,9 +3210,13 @@ pub enum LabelPlacement {
     /// Along a line, straight, turned to its direction across the text, at its middle; points
     /// and polygons are labelled as `Auto`.
     Parallel,
-    /// Along a line, each character turned with it where it bends, at its middle; points and
-    /// polygons are labelled as `Auto`.
+    /// Along a line, each character turned with it where it bends, at its middle; a polygon's
+    /// along its centre line (#2262), as `Auto` where it doesn't fit; points as `Auto`.
     Curved,
+    /// A point's label turned square to the nearest line of [`LabelClass::square_to`], starting
+    /// at the point (#2263); a point with no line that near, lines and polygons as `Auto`. (Not
+    /// in [`ALL`](Self::ALL), the positions a menu offers: it needs its line layer.)
+    Perpendicular,
 }
 
 impl LabelPlacement {
@@ -2411,6 +3254,7 @@ impl LabelPlacement {
             LabelPlacement::BelowLeft => "belowLeft",
             LabelPlacement::Parallel => "parallel",
             LabelPlacement::Curved => "curved",
+            LabelPlacement::Perpendicular => "perpendicular",
         }
     }
     pub fn label(self) -> &'static str {
@@ -2427,10 +3271,11 @@ impl LabelPlacement {
             LabelPlacement::BelowLeft => "Below Left",
             LabelPlacement::Parallel => "Parallel",
             LabelPlacement::Curved => "Curved",
+            LabelPlacement::Perpendicular => "Perpendicular",
         }
     }
     pub fn from_code(s: &str) -> Option<LabelPlacement> {
-        LabelPlacement::ALL.into_iter().find(|p| p.code().eq_ignore_ascii_case(s.trim()))
+        LabelPlacement::ALL.into_iter().chain([LabelPlacement::Perpendicular]).find(|p| p.code().eq_ignore_ascii_case(s.trim()))
     }
     /// The label centre's offset from the label point, in points, for a label `w` wide and `h`
     /// tall next to a marker of size `marker` (0 for lines and polygons).
@@ -2438,8 +3283,14 @@ impl LabelPlacement {
         let gap = marker / 2.0 + 2.0;
         let (dx, dy) = (w / 2.0 + gap, h / 2.0 + gap);
         match self {
-            LabelPlacement::Auto | LabelPlacement::Parallel | LabelPlacement::Curved if is_point => (0.0, -(marker / 2.0 + h * 0.6)),
-            LabelPlacement::Auto | LabelPlacement::Center | LabelPlacement::Parallel | LabelPlacement::Curved => (0.0, 0.0),
+            LabelPlacement::Auto | LabelPlacement::Parallel | LabelPlacement::Curved | LabelPlacement::Perpendicular if is_point => {
+                (0.0, -(marker / 2.0 + h * 0.6))
+            }
+            LabelPlacement::Auto
+            | LabelPlacement::Center
+            | LabelPlacement::Parallel
+            | LabelPlacement::Curved
+            | LabelPlacement::Perpendicular => (0.0, 0.0),
             LabelPlacement::Above => (0.0, -dy),
             LabelPlacement::Below => (0.0, dy),
             LabelPlacement::Left => (-dx, 0.0),
@@ -2453,7 +3304,7 @@ impl LabelPlacement {
 
     /// The places round a point a label tries after this one, when [`LabelClass::other_positions`]
     /// is on: in QGIS's cartographic order (its `DEFAULT_PLACEMENT_ORDER`), corners first, this
-    /// one left out.
+    /// one left out. Line alternatives are generated along their geometry by the renderer.
     pub fn alternatives(self) -> impl Iterator<Item = LabelPlacement> {
         [
             LabelPlacement::AboveRight,
@@ -2507,6 +3358,14 @@ impl LabelClass {
             wrap_length: 0,
             line_align: crate::layout::TextAlign::Left,
             repeat: None,
+            line_offset: 0.0,
+            show_all: false,
+            callout: None,
+            square_to: None,
+            fit: LabelFit::Off,
+            abbreviations: BTreeMap::new(),
+            stretch: None,
+            moved: Vec::new(),
             by: Default::default(),
         }
     }
@@ -2534,7 +3393,7 @@ impl LabelClass {
     pub fn query(&self, ds: &Dataset) -> Option<Option<rustgis_data::query::Expr>> {
         match self.where_.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
             None => Some(None),
-            Some(w) => rustgis_data::query::parse(w, ds).ok().map(Some),
+            Some(w) => rustgis_data::query::parse_fields(w, ds).ok().map(Some),
         }
     }
 }
@@ -2557,7 +3416,11 @@ impl<'a> LabelMatcher<'a> {
     /// `map_scale`: the scale (1:N) the labels are drawn at, which a clause may read
     /// (`@map_scale`); none: no map.
     pub fn new(labels: &'a Labeling, ds: &Dataset, map_scale: Option<f64>) -> Self {
-        let env = rustgis_data::query::Env { map_scale: map_scale.filter(|s| s.is_finite() && *s > 0.0) };
+        Self::with_env(labels, ds, rustgis_data::query::Env::default().at_scale(map_scale))
+    }
+
+    /// Compiles the label class filters with the drawing scale and page available.
+    pub fn with_env(labels: &'a Labeling, ds: &Dataset, env: rustgis_data::query::Env) -> Self {
         LabelMatcher { classes: labels.in_order().map(|c| (c, c.query(ds))).collect(), env }
     }
 
@@ -2594,12 +3457,13 @@ impl Labeling {
     }
 
     /// Turns the labels off and starts the Default class again on `ds`'s first name-like field
-    /// (`LabelClass::default_for`), keeping its name, clause and visibility: its field was
-    /// deleted. (A service refresh keeps Default's text symbol instead, and clears its field.)
+    /// (`LabelClass::default_for`), keeping its name, clause, visibility and expressions by
+    /// feature (#2147; those reading the deleted field are removed before): its field was deleted.
+    /// (A service refresh keeps Default's text symbol instead, and clears its field.)
     pub fn restart_default(&mut self, ds: &Dataset) {
         self.enabled = false;
         let old = std::mem::replace(&mut self.default, LabelClass::default_for(ds));
-        (self.default.name, self.default.visible, self.default.where_) = (old.name, old.visible, old.where_);
+        (self.default.name, self.default.visible, self.default.where_, self.default.by) = (old.name, old.visible, old.where_, old.by);
     }
 
     /// Points every class on a field `ds` doesn't have at the Default class's field, or the first
@@ -2614,7 +3478,7 @@ impl Labeling {
         };
         // (A class whose text is an expression that still reads keeps its own, which it doesn't
         // label from.)
-        let by_text = |c: &LabelClass| c.by.text.as_deref().is_some_and(|t| rustgis_data::query::parse(t, ds).is_ok());
+        let by_text = |c: &LabelClass| c.by.text.as_deref().is_some_and(|t| rustgis_data::query::parse_fields(t, ds).is_ok());
         for c in self.classes.iter_mut().filter(|c| ds.field_index(&c.field).is_none() && !by_text(c)) {
             c.field.clone_from(&fallback);
         }
@@ -2838,6 +3702,31 @@ mod tests {
         assert_eq!(junk.default.field, "name");
     }
 
+    /// A label saved before the distance from a line sits on it and saves as before; a distance
+    /// is kept either way, held to its range, and one that isn't a number is none (#1187).
+    #[test]
+    fn a_line_offset_is_kept_and_old_labels_save_as_before() {
+        let base = serde_json::json!({"enabled": true, "field": "name", "size": 9.0, "color": [0, 0, 0, 255], "halo": true, "bold": false});
+        let read = |extra: serde_json::Value| {
+            let mut v = base.clone();
+            if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            serde_json::from_value::<Labeling>(v).unwrap()
+        };
+        let old = read(serde_json::json!({}));
+        assert_eq!(old.default.line_offset, 0.0);
+        assert!(serde_json::to_value(&old).unwrap().get("line_offset").is_none());
+        for (given, kept) in [(4.5, 4.5), (-3.0, -3.0), (900.0, 200.0), (-900.0, -200.0)] {
+            let l = read(serde_json::json!({"line_offset": given}));
+            assert_eq!(l.default.line_offset, kept, "{given}");
+            assert_eq!(serde_json::from_value::<Labeling>(serde_json::to_value(&l).unwrap()).unwrap(), l);
+        }
+        let junk = read(serde_json::json!({"line_offset": "above"}));
+        assert_eq!(junk.default.line_offset, 0.0);
+        assert_eq!(junk.default.field, "name");
+    }
+
     /// The places a label tries after its own: QGIS's cartographic order, its own left out.
     #[test]
     fn label_alternatives_go_round_the_point() {
@@ -2880,6 +3769,118 @@ mod tests {
         assert_eq!(g.font.as_str().chars().count(), MAX_FONT_NAME);
         // Names are kept once each: the same name is the same one.
         assert!(std::ptr::eq(FontName::new("Some Family").as_str(), FontName::new("Some Family ").as_str()));
+    }
+
+    /// `Picture::kept` finds an image kept before, and keeps none it doesn't know.
+    #[test]
+    fn kept_finds_a_kept_picture_and_keeps_nothing_new() {
+        let unseen = "a picture never kept, for this test alone";
+        assert_eq!(Picture::kept(unseen), None);
+        assert_eq!(Picture::kept(unseen), None, "the lookup kept nothing");
+        let p = Picture::new("kept, for this test alone");
+        assert_eq!(Picture::kept(" kept, for this test alone "), Some(p), "trimmed, as new trims");
+    }
+
+    /// Several images are kept together or not at all: the store's limits are weighed for the
+    /// lot, images already kept and repeated ones counted once.
+    #[test]
+    fn pictures_are_kept_all_or_none() {
+        assert!(fits((MAX_PICTURES - 2, 0), (2, 10)) && !fits((MAX_PICTURES - 1, 0), (2, 10)));
+        assert!(fits((0, MAX_PICTURES_BYTES - 10), (1, 10)) && !fits((0, MAX_PICTURES_BYTES - 10), (2, 11)));
+        let old = Picture::new("YWxsLW9yLW5vbmUtb2xk");
+        let all = Picture::new_all(&["YWxsLW9yLW5vbmUtYQ==", " YWxsLW9yLW5vbmUtb2xk ", "YWxsLW9yLW5vbmUtYQ=="]).unwrap();
+        assert_eq!((all[1], all[0]), (old, all[2]));
+        assert_eq!(Picture::kept("YWxsLW9yLW5vbmUtYQ=="), Some(all[0]));
+        // One that can't be kept refuses the lot.
+        assert_eq!(Picture::new_all(&["YWxsLW9yLW5vbmUtYg==", " "]), None);
+        assert_eq!(Picture::kept("YWxsLW9yLW5vbmUtYg=="), None);
+        // A store one picture short of full (a store of its own, not the run's): two new images
+        // don't fit, and neither is kept; one does, beside one kept already.
+        let mut store: Store = Default::default();
+        for i in 1..MAX_PICTURES {
+            let p: &'static str = Box::leak(format!("p{i}").into_boxed_str());
+            store.0.insert(p);
+            store.1 += p.len();
+        }
+        let before = (store.0.len(), store.1);
+        assert_eq!(keep_all(&mut store, &["bmV3LW9uZQ==", "bmV3LXR3bw==", "p1"]), None);
+        assert_eq!((store.0.len(), store.1), before, "nothing kept");
+        let kept = keep_all(&mut store, &["bmV3LW9uZQ==", "p1", "bmV3LW9uZQ=="]).unwrap();
+        assert_eq!((kept[0], kept[1]), ("bmV3LW9uZQ==", "p1"));
+        assert!(std::ptr::eq(kept[0], kept[2]) && store.0.len() == MAX_PICTURES);
+    }
+
+    /// A picture marker is written with its image, and read back as the same kept image; one a
+    /// crafted file makes too long, or not text, is no image (drawn as a circle), and the rest
+    /// still reads.
+    #[test]
+    fn picture_markers_keep_their_image_once_and_bound_what_a_file_gives() {
+        let m = Marker::Picture(Picture::new(" iVBORw0KGgo= "));
+        let v = serde_json::to_value(m).unwrap();
+        assert_eq!(v, serde_json::json!({"Picture": "iVBORw0KGgo="}));
+        let back: Marker = serde_json::from_value(v).unwrap();
+        assert_eq!(back, m);
+        let Marker::Picture(p) = back else { panic!() };
+        assert!(std::ptr::eq(p.base64(), Picture::new("iVBORw0KGgo=").base64()), "kept once");
+        assert_ne!(p, Picture::new("iVBORw0KGgp="));
+        assert_eq!(format!("{p:?}"), "Picture(12 bytes)");
+        for junk in
+            [serde_json::json!(7), serde_json::json!(["a"]), serde_json::Value::Null, serde_json::json!("x".repeat(MAX_PICTURE_BYTES + 1))]
+        {
+            let read: Marker = serde_json::from_value(serde_json::json!({"Picture": junk})).unwrap();
+            let Marker::Picture(p) = read else { panic!() };
+            assert!(p.is_dropped() && p.is_default(), "not kept, and the reader can say so");
+            // Written again it's no image; read back, nothing more is dropped.
+            assert_eq!(serde_json::to_value(read).unwrap(), serde_json::json!({"Picture": ""}));
+        }
+        let empty: Marker = serde_json::from_value(serde_json::json!({"Picture": " "})).unwrap();
+        assert!(matches!(empty, Marker::Picture(p) if p.is_default() && !p.is_dropped()));
+        // No image is one, however it came.
+        let hash = |p: Picture| {
+            use std::hash::{BuildHasher, BuildHasherDefault};
+            BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(p)
+        };
+        assert_eq!(Picture::default(), Picture::new(" "));
+        assert_eq!(hash(Picture::default()), hash(Picture::new(" ")));
+        let s: Symbol = serde_json::from_value(
+            serde_json::json!({"fill": [1, 2, 3, 255], "stroke": [0, 0, 0, 255], "stroke_width": 1.0, "size": 7.0, "marker": {"Picture": 5}}),
+        )
+        .unwrap();
+        assert_eq!(s.size, 7.0);
+        assert_eq!(Marker::Picture(p).label(), "Image");
+        assert!(Renderer::Single(Symbol { marker: m, ..s }).has_char_or_picture_markers());
+        assert!(!Renderer::Single(Symbol { marker: Marker::Circle, ..s }).has_char_or_picture_markers());
+        // An image shows with no fill or outline, as long as it has a size; no image doesn't.
+        let none = Rgba::new(0, 0, 0, 0);
+        let hollow = Symbol { fill: none, stroke: none, marker: m, ..s };
+        assert!(hollow.draws(GeometryType::Point) && !Symbol { size: 0.0, ..hollow }.draws(GeometryType::Point));
+        assert!(!Symbol { marker: Marker::Picture(Picture::default()), ..hollow }.draws(GeometryType::Point));
+        // Stacked strokes and dot fills keep images too.
+        let mark = LineMarkers { mark: LineMark::Marker(m), ..LineMarkers::default() };
+        assert!(strokes_have_pictures(&[LineStroke::default(), LineStroke { markers: Some(mark), ..LineStroke::default() }], |_| true));
+        assert!(!strokes_have_pictures(&[LineStroke::default()], |_| true));
+        let dots = |marker| crate::fills::FillLayer {
+            color: None,
+            pattern: crate::fills::FillPattern::Dots {
+                marker,
+                size: 2.0,
+                outline: None,
+                outline_width: 0.0,
+                spacing: [6.0, 6.0],
+                displacement: [0.0, 0.0],
+                offset: [0.0, 0.0],
+            },
+        };
+        assert!(crate::fills::fills_have_pictures(&[dots(Marker::Circle), dots(m)], |_| true));
+        // Its dots show in a feature of no fill, as the point's image does.
+        assert!(dots(m).draws(none) && !dots(Marker::Circle).draws(none));
+        assert!(!dots(Marker::Picture(Picture::default())).draws(none));
+        let mut sizeless = dots(m);
+        if let crate::fills::FillPattern::Dots { size, .. } = &mut sizeless.pattern {
+            *size = 0.0;
+        }
+        assert!(!sizeless.draws(none), "an image of no size");
+        assert!(!crate::fills::fills_have_pictures(&[dots(Marker::Circle), crate::fills::FillLayer::default()], |_| true));
     }
 
     /// A project file is read with at most `MAX_LABEL_CLASSES` classes, and only that many count
@@ -2940,12 +3941,14 @@ mod tests {
         // Default on a field that's gone starts again on a name-like one, keeping its own settings.
         (l.enabled, l.default.name, l.default.visible, l.default.where_) = (true, "Rest".into(), false, Some("name = 'x'".into()));
         l.default.field = "gone".into();
+        l.default.by.size = Some("10".into());
         l.restart_default(&ds);
         assert!(!l.enabled);
         assert_eq!(
             (l.default.field.as_str(), l.default.name.as_str(), l.default.visible, l.default.where_.as_deref()),
             ("name", "Rest", false, Some("name = 'x'"))
         );
+        assert_eq!(l.default.by.size.as_deref(), Some("10"), "its expressions by feature are kept");
     }
 
     #[test]
@@ -3177,6 +4180,54 @@ mod tests {
         assert_eq!(r.legend().len(), 2);
     }
 
+    /// Each row keeps its class's strokes, its class stored in either order, in both renderers
+    /// with classes.
+    #[test]
+    fn a_legend_row_has_its_class_own_strokes() {
+        let mut d = Dataset::new("t", GeometryType::Point, vec![Field::new("g", FieldType::Text)]);
+        for g in ["a", "b", "z"] {
+            d.push(None, vec![Value::Text(g.into())]);
+        }
+        let s = |c| Symbol::default_for(GeometryType::Point, c);
+        let stroke = |width| LineStroke { width: Some(width), ..LineStroke::default() };
+        // Stored in either order, the rows come by label and each keeps its class's strokes.
+        let (a, b) = (("a".to_string(), s(0)), ("b".to_string(), s(1)));
+        for classes in [vec![a.clone(), b.clone()], vec![b, a]] {
+            let r = Renderer::Unique {
+                field: "g".into(),
+                classes,
+                other: s(2),
+                ramp: Ramp::Ember,
+                class_labels: Default::default(),
+                other_label: None,
+                class_strokes: [("a".to_string(), vec![stroke(1.0)])].into_iter().collect(),
+                other_strokes: vec![stroke(2.0)],
+                class_fills: Default::default(),
+                other_fills: Vec::new(),
+                expression: None,
+            };
+            // The whole list and the classes of the features kept.
+            for rows in [r.legend(), r.legend_for(&d, &[])] {
+                let strokes: Vec<_> = rows.iter().map(|e| e.strokes.clone()).collect();
+                assert_eq!(strokes, [vec![stroke(1.0)], vec![], vec![stroke(2.0)]]);
+            }
+        }
+        let g = Renderer::Graduated {
+            field: "v".into(),
+            breaks: vec![1.0, 2.0],
+            symbols: vec![s(0), s(1)],
+            ramp: Ramp::Ember,
+            method: ClassMethod::Quantile,
+            min: 0.0,
+            classes: 2,
+            class_labels: Default::default(),
+            class_strokes: [(1, vec![stroke(1.0)])].into_iter().collect(),
+            class_fills: Default::default(),
+        };
+        let strokes: Vec<_> = g.legend().into_iter().map(|e| e.strokes).collect();
+        assert_eq!(strokes, [vec![], vec![stroke(1.0)]]);
+    }
+
     #[test]
     fn categorical_children_sort_case_insensitively_without_changing_symbols() {
         let names = ["Zulu", "alpha", "Bravo", "ALPHA", "éclair", "École"];
@@ -3397,26 +4448,254 @@ mod tests {
         );
     }
 
+    /// A field of numbers, one feature for each (`None`: no value).
+    fn heights(values: &[Option<f64>]) -> Dataset {
+        let mut d =
+            Dataset::new("t", GeometryType::Polygon, vec![Field::new("height", FieldType::Double), Field::new("name", FieldType::Text)]);
+        for v in values {
+            d.push(None, vec![v.map_or(Value::Null, Value::Float), Value::Text("x".into())]);
+        }
+        d
+    }
+
+    #[test]
+    fn manual_classes_with_an_unknown_range_are_open_at_both_ends() {
+        let base = Symbol::default_for(GeometryType::Polygon, 0);
+        // Values far outside the bounds, as a view could hold: they set no bound.
+        for d in [heights(&[]), heights(&[Some(-500.0), Some(9000.0)])] {
+            let r = Renderer::graduated_manual_open(&d, "height", &[4.0, 7.0, 10.0, 15.0, 25.0], Ramp::Ember, base).unwrap();
+            let Renderer::Graduated { breaks, min, symbols, method, .. } = &r else { panic!("graduated renderer expected") };
+            assert_eq!(breaks.as_slice(), [4.0, 7.0, 10.0, 15.0, 25.0, OPEN_ABOVE]);
+            assert_eq!((*min, symbols.len(), *method, r.classes_asked()), (OPEN_BELOW, 6, ClassMethod::Manual, 6));
+            assert_eq!(labels_of(&r), ["up to 4", "4 – 7", "7 – 10", "10 – 15", "15 – 25", "more than 25"]);
+        }
+        // Below the first bound, on a bound, between bounds and past the last.
+        let values = [-1e300, -3.0, 0.0, 4.0, 4.5, 7.0, 25.0, 25.000001, 1e300];
+        let d = heights(&values.map(Some));
+        let r = Renderer::graduated_manual_open(&d, "height", &[4.0, 7.0, 10.0, 15.0, 25.0], Ramp::Ember, base).unwrap();
+        let classes: Vec<_> = (0..values.len()).map(|row| r.class_of(&d, row)).collect();
+        let want: Vec<_> = [0, 0, 0, 0, 1, 1, 4, 5, 5].map(|i| Some(Slot::Class(i))).to_vec();
+        assert_eq!(classes, want);
+        // Each class draws in its own colour.
+        assert_ne!(r.symbol_for(&d, 0).fill, r.symbol_for(&d, 8).fill);
+        // Saved and read back, the open ends stay open.
+        let back: Renderer = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn open_manual_classes_take_hostile_bounds_apart() {
+        let base = Symbol::default_for(GeometryType::Polygon, 0);
+        let d = heights(&[]);
+        let open = |b: &[f64]| Renderer::graduated_manual_open(&d, "height", b, Ramp::Ember, base);
+        let breaks = |r: Renderer| match r {
+            Renderer::Graduated { breaks, .. } => breaks,
+            r => panic!("{r:?}"),
+        };
+        // Not numbers, out of order and repeated: the numbers sorted, once, then the open class.
+        let b = breaks(open(&[f64::NAN, 25.0, f64::INFINITY, 4.0, 25.0, f64::NEG_INFINITY, 4.0]).unwrap());
+        assert_eq!(b, [4.0, 25.0, OPEN_ABOVE]);
+        // The layer's current bounds given back make the same classes, not a second open one.
+        assert_eq!(breaks(open(&b).unwrap()), b);
+        // The lowest number marks the open first class, so as a bound it is refused, not dropped.
+        assert_eq!(open(&[0.0, f64::MIN]).unwrap_err(), "manual breaks must be above -1.7976931348623157e308");
+        // The open class alone stays one class of every value.
+        let one = open(&[OPEN_ABOVE]).unwrap();
+        assert_eq!(labels_of(&one), ["every value"]);
+        assert_eq!(breaks(open(&[f64::INFINITY, OPEN_ABOVE]).unwrap()), [OPEN_ABOVE]);
+        // None that bounds a class is refused.
+        for none in [&[][..], &[f64::NAN], &[f64::NAN, OPEN_ABOVE], &[f64::INFINITY, f64::NEG_INFINITY]] {
+            assert_eq!(open(none).unwrap_err(), "manual breaks need at least one number", "{none:?}");
+        }
+        // The open class counts towards the 12.
+        let eleven: Vec<f64> = (1..=11).map(f64::from).collect();
+        assert_eq!(breaks(open(&eleven).unwrap()).len(), 12);
+        let twelve: Vec<f64> = (1..=12).map(f64::from).collect();
+        assert_eq!(open(&twelve).unwrap_err(), "13 classes; Graduated Colors takes at most 12");
+        // The field must be there and numeric.
+        assert!(Renderer::graduated_manual_open(&d, "nope", &[1.0], Ramp::Ember, base).is_err());
+        assert!(Renderer::graduated_manual_open(&d, "name", &[1.0], Ramp::Ember, base).is_err());
+    }
+
+    #[test]
+    fn manual_classes_with_the_values_at_hand_close_at_the_largest() {
+        let base = Symbol::default_for(GeometryType::Polygon, 0);
+        let d = heights(&[Some(1.0), None, Some(30.0), Some(2.0)]);
+        let manual = |d: &Dataset, b: &[f64]| Renderer::graduated_manual(d, &[], "height", b, Ramp::Ember, base);
+        let r = manual(&d, &[4.0, 7.0, 10.0, 15.0, 25.0]).unwrap();
+        assert!(matches!(&r, Renderer::Graduated { breaks, min, .. } if breaks == &[4.0, 7.0, 10.0, 15.0, 25.0, 30.0] && *min == 1.0));
+        assert_eq!(labels_of(&r), ["1 – 4", "4 – 7", "7 – 10", "10 – 15", "15 – 25", "25 – 30"]);
+        // A last bound past the largest value closes the classes itself.
+        assert!(matches!(manual(&d, &[4.0, 40.0]).unwrap(), Renderer::Graduated { breaks, .. } if breaks == [4.0, 40.0]));
+        // The largest value counts towards the 12, as before.
+        let twelve: Vec<f64> = (1..=12).map(f64::from).collect();
+        assert_eq!(manual(&d, &twelve).unwrap_err(), "13 classes; Graduated Colors takes at most 12");
+        // No values is still refused.
+        assert_eq!(manual(&heights(&[None]), &[4.0]).unwrap_err(), "'height' has no numeric values");
+        assert_eq!(manual(&heights(&[]), &[4.0]).unwrap_err(), "'height' has no numeric values");
+    }
+
+    #[test]
+    fn classes_open_at_one_end_are_opened_at_both() {
+        let base = Symbol::default_for(GeometryType::Polygon, 0);
+        let d = heights(&[Some(1.0), Some(30.0)]);
+        let ends = |r: &Renderer| match r {
+            Renderer::Graduated { breaks, min, .. } => (breaks.clone(), *min),
+            r => panic!("{r:?}"),
+        };
+        // Closed at the largest value, or open only at the top: both come out open at both ends,
+        // the closing bound replaced, a bound past the largest kept.
+        let closed = Renderer::graduated_manual(&d, &[], "height", &[4.0], Ramp::Ember, base).unwrap();
+        assert_eq!(ends(&closed.opened().unwrap()), (vec![4.0, OPEN_ABOVE], OPEN_BELOW));
+        let top_only = Renderer::graduated_manual(&d, &[], "height", &[4.0, OPEN_ABOVE], Ramp::Ember, base).unwrap();
+        assert_eq!(ends(&top_only), (vec![4.0, OPEN_ABOVE], 1.0));
+        assert_eq!(ends(&top_only.opened().unwrap()), (vec![4.0, OPEN_ABOVE], OPEN_BELOW));
+        // Already open at both ends, or not Graduated Colors: nothing to open.
+        let open = Renderer::graduated_manual_open(&d, "height", &[4.0], Ramp::Ember, base).unwrap();
+        assert!(open.opened().is_none());
+        assert!(Renderer::Single(base).opened().is_none());
+    }
+
+    #[test]
+    fn an_open_class_label_set_to_its_range_is_no_label_of_its_own() {
+        let g = GeometryType::Polygon;
+        let mut r = Renderer::graduated_manual_open(&heights(&[]), "height", &[4.0, 25.0], Ramp::Ember, Symbol::default_for(g, 0)).unwrap();
+        let label = |t: &str| ClassStyle { label: Some(t.into()), ..Default::default() };
+        for (i, range) in [(0, "up to 4"), (2, "more than 25")] {
+            r.set_class_style(&ClassRef::Index(i), &label("Mine"), g).unwrap();
+            let e = r.set_class_style(&ClassRef::Index(i), &label(range), g).unwrap();
+            assert_eq!(e.label, range);
+            assert!(matches!(&r, Renderer::Graduated { class_labels, .. } if class_labels.is_empty()), "{range}");
+        }
+        // Both ends open, as only a hand-made file can have them, is every value.
+        let Renderer::Graduated { breaks, .. } = &mut r else { panic!("graduated renderer expected") };
+        *breaks = vec![OPEN_ABOVE];
+        assert_eq!(labels_of(&r), ["every value"]);
+    }
+
     #[test]
     fn unique_values_by_an_expression_count_what_is_past_their_classes() {
         let base = Symbol::default_for(GeometryType::Point, 0);
         let mut d = Dataset::new("p", GeometryType::Point, vec![rustgis_data::Field::new("n", rustgis_data::FieldType::Integer)]);
-        // 100 values, each on two features, in no order: the first 64 (as text) are kept.
+        // 100 values, each on two features, in no order: the first 64 (by number) are kept.
         for i in (0..100i64).rev().chain(0..100) {
             d.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![rustgis_data::Value::Int(i)]);
         }
         let (r, rest) = Renderer::unique_by_counted(&d, &[], "n", Ramp::Harbour, base).unwrap();
         let Renderer::Unique { classes, .. } = &r else { panic!() };
-        let mut all: Vec<String> = (0..100).map(|i: i64| i.to_string()).collect();
+        let all: Vec<String> = (0..100).map(|i: i64| i.to_string()).collect();
+        assert_eq!(classes.iter().map(|c| c.0.clone()).collect::<Vec<_>>(), all[..MAX_UNIQUE]);
+        assert_eq!(rest, PastClasses { features: 2 * (100 - MAX_UNIQUE), by_number: true });
+        // Text the expression makes of them is kept in text order.
+        let (r, rest) = Renderer::unique_by_counted(&d, &[], "'k' || n", Ramp::Harbour, base).unwrap();
+        let Renderer::Unique { classes, .. } = &r else { panic!() };
+        let mut all: Vec<String> = (0..100).map(|i: i64| format!("k{i}")).collect();
         all.sort();
         assert_eq!(classes.iter().map(|c| c.0.clone()).collect::<Vec<_>>(), all[..MAX_UNIQUE]);
-        assert_eq!(rest, 2 * (100 - MAX_UNIQUE));
+        assert_eq!(rest, PastClasses { features: 2 * (100 - MAX_UNIQUE), by_number: false });
+        // One text among the numbers, given last: the first are taken in text order, though every
+        // value before it read as a number, and though those kept are all numbers.
+        let (r, rest) = Renderer::unique_by_counted(&d, &[], "CASE WHEN n = 99 THEN 'x' ELSE n END", Ramp::Harbour, base).unwrap();
+        let Renderer::Unique { classes, .. } = &r else { panic!() };
+        let mut all: Vec<String> = (0..99).map(|i: i64| i.to_string()).chain(["x".to_string()]).collect();
+        all.sort();
+        assert_eq!(classes.iter().map(|c| c.0.clone()).collect::<Vec<_>>(), all[..MAX_UNIQUE]);
+        assert_eq!(rest, PastClasses { features: 2 * (100 - MAX_UNIQUE), by_number: false });
         let (_, rest) = Renderer::unique_by_counted(&d, &[], "n % 10", Ramp::Harbour, base).unwrap();
-        assert_eq!(rest, 0);
+        assert_eq!(rest, PastClasses { features: 0, by_number: true });
         // A feature without a geometry draws nothing, so it isn't counted.
         d.push(None, vec![rustgis_data::Value::Int(99)]);
         let (_, rest) = Renderer::unique_by_counted(&d, &[], "n", Ramp::Harbour, base).unwrap();
-        assert_eq!(rest, 2 * (100 - MAX_UNIQUE));
+        assert_eq!(rest.features, 2 * (100 - MAX_UNIQUE));
+    }
+
+    /// #1340: Unique Values on a numeric field, by the field or by an expression, class and list
+    /// their values in numeric order; on a text field, in text order and by label, as before.
+    #[test]
+    fn unique_values_of_numbers_are_in_numeric_order() {
+        let point = || Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0)));
+        let base = Symbol::default_for(GeometryType::Point, 0);
+        let fields = vec![Field::new("i", FieldType::Integer), Field::new("r", FieldType::Double), Field::new("t", FieldType::Text)];
+        let mut d = Dataset::new("t", GeometryType::Point, fields);
+        for (i, r, t) in [(10153, 10.0, "b"), (1741, 2.5, "A"), (9627, -1.0, "10"), (9, 10.0, "9")] {
+            d.push(point(), vec![Value::Int(i), Value::Float(r), Value::Text(t.into())]);
+        }
+        let values = |r: &Renderer| match r {
+            Renderer::Unique { classes, .. } => classes.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+            _ => panic!("{r:?}"),
+        };
+        let labels = |l: Vec<LegendEntry>| l.into_iter().map(|e| e.label).collect::<Vec<_>>();
+        for (by, expected) in [("i", ["9", "1741", "9627", "10153"]), ("r", ["-1", "2.5", "10", ""])] {
+            let expected: Vec<&str> = expected.into_iter().filter(|v| !v.is_empty()).collect();
+            let by_field = Renderer::unique(&d, &[], by, Ramp::Harbour, base).unwrap();
+            let by_expression = Renderer::unique_by(&d, &[], by, Ramp::Harbour, base).unwrap();
+            for r in [&by_field, &by_expression] {
+                assert_eq!(values(r), expected, "{by}");
+                assert!(r.classes_by_number());
+                let mut legend = expected.clone();
+                legend.push(OTHER_VALUES);
+                assert_eq!(labels(r.legend()), legend, "{by}");
+                assert_eq!(labels(r.legend_for(&d, &[])), expected, "{by}: what is drawn");
+            }
+        }
+        // A text field: text order, and the legend by label without regard to case.
+        let r = Renderer::unique(&d, &[], "t", Ramp::Harbour, base).unwrap();
+        assert_eq!(values(&r), ["10", "9", "A", "b"]);
+        assert!(!r.classes_by_number());
+        assert_eq!(labels(r.legend_for(&d, &[])), ["10", "9", "A", "b"]);
+        // Nulls are a class after the numbers.
+        d.push(point(), vec![Value::Null]);
+        let r = Renderer::unique(&d, &[], "i", Ramp::Harbour, base).unwrap();
+        assert_eq!(values(&r), ["9", "1741", "9627", "10153", "<Null>"]);
+        assert_eq!(labels(r.legend_for(&d, &[])), ["9", "1741", "9627", "10153", "<Null>"]);
+    }
+
+    /// A class of numbers renamed by hand keeps its value's place in the legend; classes saved in
+    /// text order (a project from before) are listed in numeric order too.
+    #[test]
+    fn a_renamed_number_class_keeps_its_place() {
+        let s = |c| Symbol::default_for(GeometryType::Polygon, c);
+        let mut r = unique(&[("10", s(0)), ("100", s(1)), ("9", s(2))], s(3), Ramp::Ember);
+        assert_eq!(r.class_order(), [2, 0, 1]);
+        let labels = |r: &Renderer| r.legend().into_iter().map(|e| e.label).collect::<Vec<_>>();
+        assert_eq!(labels(&r), ["9", "10", "100", OTHER_VALUES]);
+        let style = ClassStyle { label: Some("Arable".into()), ..Default::default() };
+        r.set_class_style(&ClassRef::Value("100".into()), &style, GeometryType::Polygon).unwrap();
+        assert_eq!(labels(&r), ["9", "10", "Arable", OTHER_VALUES]);
+        // Each row keeps its class's own symbol.
+        let fills: Vec<Rgba> = r.legend().iter().map(|e| e.symbol.fill).collect();
+        assert_eq!(fills, [s(2).fill, s(0).fill, s(1).fill, s(3).fill]);
+        // A repeated value keeps its first class first.
+        let r = unique(&[("10", s(0)), ("9", s(1)), ("10", s(2))], s(3), Ramp::Ember);
+        assert_eq!(r.class_order(), [1, 0, 2]);
+        // With text among them, by label as before.
+        let r = unique(&[("10", s(0)), ("b", s(1)), ("9", s(2)), ("A", s(4))], s(3), Ramp::Ember);
+        assert_eq!(labels(&r), ["10", "9", "A", "b", OTHER_VALUES]);
+    }
+
+    /// Past [`MAX_UNIQUE`] values, the classes are the smallest numbers and the features past
+    /// them are counted; with fewer, none are.
+    #[test]
+    fn unique_values_of_a_field_count_what_is_past_their_classes() {
+        let base = Symbol::default_for(GeometryType::Point, 0);
+        let mut d = Dataset::new("p", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+        for i in (0..100i64).rev().chain(0..100) {
+            d.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![Value::Int(i)]);
+        }
+        let (r, rest) = Renderer::unique_counted(&d, &[], "n", Ramp::Harbour, base).unwrap();
+        let Renderer::Unique { classes, .. } = &r else { panic!() };
+        let first: Vec<String> = (0..MAX_UNIQUE).map(|i| i.to_string()).collect();
+        assert_eq!(classes.iter().map(|c| c.0.clone()).collect::<Vec<_>>(), first);
+        assert_eq!(rest, PastClasses { features: 2 * (100 - MAX_UNIQUE), by_number: true });
+        // The same as by the expression of the field.
+        assert_eq!(Renderer::unique_by_counted(&d, &[], "n", Ramp::Harbour, base).unwrap().1, rest);
+        // A feature without a geometry draws nothing, so it isn't counted.
+        d.push(None, vec![Value::Int(99)]);
+        assert_eq!(Renderer::unique_counted(&d, &[], "n", Ramp::Harbour, base).unwrap().1, rest);
+        let rows: Vec<bool> = (0..d.features.len()).map(|r| r < 100).collect();
+        assert_eq!(Renderer::unique_counted(&d, &rows, "n", Ramp::Harbour, base).unwrap().1.features, 100 - MAX_UNIQUE);
+        let few: Vec<bool> = (0..d.features.len()).map(|r| r < MAX_UNIQUE).collect();
+        assert_eq!(Renderer::unique_counted(&d, &few, "n", Ramp::Harbour, base).unwrap().1.features, 0);
     }
 
     /// The rest is in the legend when its stacked fills or strokes draw, though its own symbol
@@ -3567,7 +4846,7 @@ mod tests {
             panic!("unique renderer expected")
         };
         let keys: Vec<&str> = classes.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["1000", "2"]);
+        assert_eq!(keys, vec!["2", "1000"]);
     }
 
     fn unique(classes: &[(&str, Symbol)], other: Symbol, ramp: Ramp) -> Renderer {
@@ -3668,6 +4947,47 @@ mod tests {
         let long = format!("{} {}", "x".repeat(MAX_LABEL - 1), "y".repeat(10));
         let e = gr.set_class_style(&ClassRef::Index(0), &style(None, None, Some(&long)), g).unwrap();
         assert_eq!(e.label, "x".repeat(MAX_LABEL - 1));
+    }
+
+    #[test]
+    fn labels_are_moved_by_hand_and_put_back() {
+        let ds = rustgis_data::Dataset::new(
+            "d",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("name", rustgis_data::FieldType::Text)],
+        );
+        let mut c = LabelClass::default_for(&ds);
+        assert!(c.move_label(7, Some([10.0, 20.0])) && c.move_label(8, Some([1.0, 2.0])));
+        assert!(c.move_label(7, Some([11.0, 21.0])), "moved again, the same feature's");
+        assert_eq!((c.moved_to(7), c.moved_to(8), c.moved.len()), (Some([11.0, 21.0]), Some([1.0, 2.0]), 2));
+        assert!(!c.move_label(9, Some([f64::NAN, 0.0])), "not a place");
+        assert!(!c.move_label(9, Some([1000.0, 0.0])) && !c.move_label(9, Some([0.0, 95.0])), "off the map");
+        assert!(c.move_label(2, Some([0.0, 0.0])) && c.moved.windows(2).all(|w| w[0].id < w[1].id), "kept in order of id");
+        assert!(c.move_label(2, None) && c.move_label(2, None), "putting back one not moved is fine");
+        assert!(c.move_label(8, None) && c.moved_to(8).is_none(), "put back");
+        // Read from a file: bad entries dropped, the rest kept, a feature's last place wins.
+        let mut v = serde_json::to_value(&c).unwrap();
+        v["moved"] = serde_json::json!([{"id": 1, "at": [1, 1]}, {"id": "x"}, 7, {"id": 1, "at": [2, 2]}, {"id": 3, "at": [3, 3]}, {"id": 0, "at": [1000, 95]}]);
+        let read: LabelClass = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(read.moved, vec![MovedLabel { id: 1, at: [2.0, 2.0] }, MovedLabel { id: 3, at: [3.0, 3.0] }]);
+        // Out of order in the file: put in order, so each is still found.
+        v["moved"] = serde_json::json!([{"id": 9, "at": [9, 9]}, {"id": 4, "at": [4, 4]}]);
+        let read: LabelClass = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!((read.moved_to(4), read.moved_to(9)), (Some([4.0, 4.0]), Some([9.0, 9.0])));
+        // A huge list reads quickly, and keeps the first the file lists, up to the most kept.
+        let many: Vec<_> = (0..50_000u64).rev().map(|i| serde_json::json!({"id": i, "at": [0, 0]})).collect();
+        v["moved"] = serde_json::Value::Array(many);
+        let read: LabelClass = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(read.moved.len(), MAX_MOVED_LABELS);
+        v["moved"] = serde_json::json!("nonsense");
+        assert!(serde_json::from_value::<LabelClass>(v.clone()).unwrap().moved.is_empty(), "the rest still reads");
+        v["show_all"] = serde_json::json!("yes");
+        v["moved"] = serde_json::json!({"damaged": [1, 2, 3]});
+        let read: LabelClass = serde_json::from_str(&v.to_string()).unwrap();
+        assert!(!read.show_all && read.moved.is_empty(), "damaged optional fields leave the class usable");
+        // None moved: none saved.
+        let none = serde_json::to_value(LabelClass::default_for(&ds)).unwrap();
+        assert!(none.get("moved").is_none());
     }
 
     #[test]
@@ -3773,5 +5093,157 @@ mod tests {
         let mut more = fresh.clone();
         more.carry_edits_from(&gold, g);
         assert_eq!(more, fresh, "another number of classes starts fresh");
+    }
+
+    fn unique_with(values: &[(&str, u8)]) -> Renderer {
+        let sym = |v: u8| Symbol { fill: Rgba::rgb(v, 0, 0), ..Symbol::default_for(GeometryType::Point, 0) };
+        Renderer::Unique {
+            field: "f".into(),
+            classes: values.iter().map(|(k, v)| (k.to_string(), sym(*v))).collect(),
+            other: sym(0),
+            ramp: Ramp::Greys,
+            class_labels: BTreeMap::new(),
+            other_label: None,
+            class_strokes: BTreeMap::new(),
+            other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
+            expression: None,
+        }
+    }
+
+    /// #1355: Invert Color Ramp reverses the colours along the legend's order, which is not the
+    /// order the classes are stored in; a value repeated in the classes isn't drawn, so it takes
+    /// no part; and a class with a stack of its own keeps its colours without shifting the rest.
+    #[test]
+    fn reverse_ramp_follows_the_legend_and_skips_what_is_not_drawn() {
+        let reds = |r: &Renderer| match r {
+            Renderer::Unique { classes, .. } => classes.iter().map(|c| (c.0.clone(), c.1.fill.r())).collect::<Vec<_>>(),
+            _ => vec![],
+        };
+        let g = GeometryType::Point;
+        // Stored 10, 100, 9: the legend lists 9, 10, 100 (numbers), so 9 and 100 swap colours.
+        let mut r = unique_with(&[("10", 1), ("100", 2), ("9", 3)]);
+        assert_eq!(r.reverse_ramp(g), Some(RampReversal { reversed: 3, kept: 0, on_layer_stack: 3 }));
+        assert_eq!(reds(&r), vec![("10".into(), 1), ("100".into(), 3), ("9".into(), 2)]);
+        assert!(matches!(&r, Renderer::Unique { other, .. } if other.fill.r() == 0), "<all other values> is no ramp color");
+        r.reverse_ramp(g);
+        assert_eq!(reds(&r), vec![("10".into(), 1), ("100".into(), 2), ("9".into(), 3)], "twice is the original");
+        // A repeat of a value is not drawn: it stays, and the drawn entries reverse among themselves.
+        let mut r = unique_with(&[("a", 1), ("b", 2), ("a", 9), ("c", 3)]);
+        r.reverse_ramp(g);
+        assert_eq!(reds(&r), vec![("a".into(), 3), ("b".into(), 2), ("a".into(), 9), ("c".into(), 1)]);
+        // A class with a stack of its own is kept, counted, and the others reverse among themselves.
+        let mut r = unique_with(&[("a", 1), ("b", 2), ("c", 3), ("d", 4)]);
+        if let Renderer::Unique { class_strokes, .. } = &mut r {
+            class_strokes.insert("a".into(), vec![LineStroke { color: Some(Rgba::rgb(9, 9, 9)), ..LineStroke::default() }]);
+        }
+        assert_eq!(r.reverse_ramp(g), Some(RampReversal { reversed: 3, kept: 1, on_layer_stack: 3 }));
+        assert_eq!(reds(&r), vec![("a".into(), 1), ("b".into(), 4), ("c".into(), 3), ("d".into(), 2)]);
+        // A point's hand-picked outline travels with its fill.
+        let mut r = unique_with(&[("a", 1), ("b", 2)]);
+        if let Renderer::Unique { classes, .. } = &mut r
+            && let Some(c) = classes.first_mut()
+        {
+            c.1.stroke = Rgba::rgb(200, 0, 0);
+        }
+        r.reverse_ramp(g);
+        let strokes = |r: &Renderer| match r {
+            Renderer::Unique { classes, .. } => classes.iter().map(|c| (c.1.fill.r(), c.1.stroke.r())).collect::<Vec<_>>(),
+            _ => vec![],
+        };
+        assert_eq!(strokes(&r), vec![(2, 255), (1, 200)]);
+        r.reverse_ramp(g);
+        assert_eq!(strokes(&r), vec![(1, 200), (2, 255)], "twice is the original");
+        // A lone class has no other to change places with.
+        assert_eq!(unique_with(&[("a", 1)]).reverse_ramp(g), Some(RampReversal { reversed: 0, kept: 0, on_layer_stack: 0 }));
+        // Nothing to reverse for a single symbol.
+        assert_eq!(Renderer::Single(Symbol::default_for(g, 0)).reverse_ramp(g), None);
+    }
+
+    /// #1355: which stack replaces a class's symbol depends on what the layer draws: a polygon's
+    /// own fills, a line's or a point's own strokes. The other kind is not drawn, and an empty
+    /// stack is no stack, so those classes take part in the reversal.
+    #[test]
+    fn reverse_ramp_keeps_only_the_classes_whose_stack_is_drawn() {
+        let reds = |r: &Renderer| match r {
+            Renderer::Unique { classes, .. } => classes.iter().map(|c| c.1.fill.r()).collect::<Vec<_>>(),
+            _ => vec![],
+        };
+        let with = |fills: bool, strokes: bool, empty: bool| {
+            let mut r = unique_with(&[("a", 1), ("b", 2), ("c", 3)]);
+            if let Renderer::Unique { class_fills, class_strokes, .. } = &mut r {
+                let own = Some(Rgba::rgb(9, 9, 9));
+                if fills {
+                    class_fills.insert("a".into(), if empty { vec![] } else { vec![FillLayer { color: own, ..FillLayer::default() }] });
+                }
+                if strokes {
+                    class_strokes.insert("a".into(), if empty { vec![] } else { vec![LineStroke { color: own, ..LineStroke::default() }] });
+                }
+            }
+            r
+        };
+        let (kept, reversed) = (vec![1, 3, 2], vec![3, 2, 1]);
+        // (stacks of class a, geometry) -> the classes that reverse, and how many are kept.
+        for (fills, strokes, empty, g, take_part) in [
+            (true, false, false, GeometryType::Polygon, false),
+            (false, true, false, GeometryType::Polygon, true),
+            (false, true, false, GeometryType::Polyline, false),
+            (true, false, false, GeometryType::Polyline, true),
+            (false, true, false, GeometryType::Point, false),
+            (true, false, false, GeometryType::Point, true),
+            (true, true, true, GeometryType::Polygon, true),
+            (true, true, true, GeometryType::Polyline, true),
+        ] {
+            let mut r = with(fills, strokes, empty);
+            let n = r.reverse_ramp(g).map(|x| x.kept);
+            let case = format!("fills {fills}, strokes {strokes}, empty {empty}, {g:?}");
+            if take_part {
+                assert_eq!(n, Some(0), "{case}");
+                assert_eq!(reds(&r), reversed, "{case}");
+            } else {
+                assert_eq!(n, Some(1), "{case}");
+                assert_eq!(reds(&r), kept, "{case}");
+            }
+        }
+    }
+
+    /// #1355: a stack layer without a color of its own takes the symbol's, so the class still shows
+    /// its ramp color through it and takes part in the reversal: a road's black casing over a core
+    /// that follows the class. Only a stack whose every layer has its own color hides the symbol.
+    #[test]
+    fn reverse_ramp_reverses_the_classes_a_stack_inherits_from() {
+        let reds = |r: &Renderer| match r {
+            Renderer::Unique { classes, .. } => classes.iter().map(|c| c.1.fill.r()).collect::<Vec<_>>(),
+            _ => vec![],
+        };
+        let own = Some(Rgba::rgb(9, 9, 9));
+        let casing = LineStroke { color: own, width: Some(6.0), ..LineStroke::default() };
+        let core = LineStroke::default();
+        let (solid_own, solid_inherit) = (FillLayer { color: own, ..FillLayer::default() }, FillLayer::default());
+        for (stack_of_strokes, g, hides) in [
+            (vec![casing], GeometryType::Polyline, true),
+            (vec![casing, core], GeometryType::Polyline, false),
+            (vec![core], GeometryType::Polyline, false),
+            (vec![casing], GeometryType::Point, true),
+            (vec![casing, core], GeometryType::Point, false),
+        ] {
+            let mut r = unique_with(&[("a", 1), ("b", 2), ("c", 3)]);
+            if let Renderer::Unique { class_strokes, .. } = &mut r {
+                class_strokes.insert("a".into(), stack_of_strokes.clone());
+            }
+            let n = r.reverse_ramp(g).map(|x| x.kept);
+            let case = format!("{} strokes, {g:?}", stack_of_strokes.len());
+            assert_eq!((n, reds(&r)), if hides { (Some(1), vec![1, 3, 2]) } else { (Some(0), vec![3, 2, 1]) }, "{case}");
+        }
+        for (fills, hides) in [(vec![solid_own], true), (vec![solid_own, solid_inherit], false), (vec![solid_inherit], false)] {
+            let mut r = unique_with(&[("a", 1), ("b", 2), ("c", 3)]);
+            if let Renderer::Unique { class_fills, .. } = &mut r {
+                class_fills.insert("a".into(), fills.clone());
+            }
+            let n = r.reverse_ramp(GeometryType::Polygon).map(|x| x.kept);
+            let case = format!("{} fills", fills.len());
+            assert_eq!((n, reds(&r)), if hides { (Some(1), vec![1, 3, 2]) } else { (Some(0), vec![3, 2, 1]) }, "{case}");
+        }
     }
 }

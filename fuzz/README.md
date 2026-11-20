@@ -12,7 +12,10 @@ allocations and hangs that hand-written hostile-input tests don't anticipate.
 | `wkt` | `raster::wkt::read_wkt` | `.prj` files, GeoPackage spatial reference rows |
 | `wkb` | `wkb::decode` | GeoPackage, GeoParquet and PostGIS geometry |
 | `mvt` | `rustgis_tiles::mvt::decode` | vector tiles |
+| `esripbf` | `esripbf::is_esripbf`, then `esripbf::read` | ArcGIS feature-service answers as protocol buffers (`f=pbf`) |
 | `project` | `Project::from_json` | `.rgis` projects |
+| `dates` | `Date::parse`, `DateTime::parse`, `Value::parse` and where clauses comparing date fields with the input, checking that a parsed value shows as text that reads back the same | date and date-time text in every reader, and the query language |
+| `sheets` | `sheets::sheet_names`, `sheets::columns`, `sheets::read` | Excel and OpenDocument workbooks, calamine, the `.xls` sector-table check |
 
 This crate is its own workspace, outside RustGIS's: `cargo build`, `cargo xtask ci`, the wasm
 build and the workspace's `cargo deny` never build it. It needs nightly Rust and
@@ -31,9 +34,16 @@ ${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-gnu/release/seeds   # writes co
 cargo +nightly fuzz run -O read_layers -- -max_total_time=600 -rss_limit_mb=2048 -timeout=10
 ```
 
+A target with a dictionary of tokens (`dictionaries/<target>.dict`) runs with it: add
+`-dict=dictionaries/<target>.dict` after `--`, as CI does.
+
 The seeds are well-formed files written by RustGIS's own writers from the sample project, so
 fuzzing starts from real files; the repository commits no data. `corpus/` and `artifacts/` are
 ignored. Put `CARGO_TARGET_DIR` somewhere roomy: a sanitizer build of the engine is several GB.
+
+A fuzzing build reads its memory limits at their floors (`memory::physical` is `None` under
+`cfg(fuzzing)`). Otherwise a header claiming a vast image may use a quarter of the computer's
+memory by design, which is over `-rss_limit_mb=2048` on any computer with more than 8 GiB.
 
 CI runs `.github/workflows/fuzz.yml`: every target for ten minutes a night, and for a minute on a
 pull request labelled `ci:fuzz`. It runs libFuzzer in fork mode with `-ignore_crashes`,

@@ -31,6 +31,7 @@ pub fn register() {
 /// Rebuilds the tool list the next time it's needed (a plugin was loaded, removed or toggled).
 pub(crate) fn reload() {
     rustgis_analysis::reload_external_of(SOURCE);
+    let _ = rustgis_analysis::external_tools_of(SOURCE);
 }
 
 /// A `'static` copy of `s`, shared, so reloading the list doesn't leak another copy of every
@@ -94,6 +95,29 @@ fn params_of(sha256: &str, t: &crate::manifest::ToolDecl) -> &'static [ParamSpec
         m.get_or_insert_with(Default::default).insert(key, made);
     }
     made
+}
+
+/// Verifies that a separately captured analysis specification belongs to this exact load's
+/// manifest. The interned parameter owner is shared with registry publication and preparation;
+/// no policy layer reconstructs defaults or accepts an id/hash as schema equality.
+pub fn matches_pinned(plugin: &Arc<crate::Plugin>, spec: &ToolSpec) -> Result<(), String> {
+    if !crate::is_current(plugin) {
+        return Err("the plugin was disabled, updated or removed before its schema was pinned".into());
+    }
+    let (owner, id) = crate::split_id(spec.id).ok_or("not a plugin tool id")?;
+    if owner != plugin.manifest.id {
+        return Err("the tool belongs to another plugin".into());
+    }
+    let decl = plugin.manifest.tools.iter().find(|t| t.id == id).ok_or("the pinned plugin has no such tool")?;
+    let toolbox = if decl.toolbox.trim().is_empty() { &plugin.manifest.name } else { &decl.toolbox };
+    if spec.name != decl.name
+        || spec.summary != decl.summary
+        || spec.toolbox != format!("Plugins › {toolbox}")
+        || !std::ptr::eq(spec.params, params_of(&plugin.sha256, decl))
+    {
+        return Err("the plugin tool's schema or display metadata changed before it was pinned".into());
+    }
+    Ok(())
 }
 
 fn specs() -> Vec<ToolSpec> {
@@ -162,7 +186,8 @@ impl Host for Messages<'_> {
         }
     }
     fn cancelled(&self) -> bool {
-        self.control.is_cancelled()
+        // An analysis caller carries its cancellation through the existing data progress probe.
+        self.control.is_cancelled() || rustgis_data::progress::check().is_err()
     }
 }
 
@@ -171,8 +196,9 @@ impl Host for Messages<'_> {
 fn layer_geojson(inputs: &dyn Inputs, name: &str) -> Result<Value, String> {
     let ds = inputs.dataset(name).ok_or_else(|| format!("no layer named '{name}'"))?;
     let sel = inputs.selection(name);
+    // GeoJSON is longitude/latitude, whatever system the layer holds its coordinates in.
     if sel.is_empty() {
-        return Ok(rustgis_data::io::to_geojson(ds));
+        return Ok(rustgis_data::io::to_geojson(&*ds.in_lonlat()?));
     }
     let sub = rustgis_data::Dataset {
         name: ds.name.clone(),
@@ -184,8 +210,9 @@ fn layer_geojson(inputs: &dyn Inputs, name: &str) -> Result<Value, String> {
         crs_incomplete: false,
         zm_dropped: false,
         windowed: false,
+        held_in: ds.held_in,
     };
-    Ok(rustgis_data::io::to_geojson(&sub))
+    Ok(rustgis_data::io::to_geojson(&*sub.in_lonlat()?))
 }
 
 fn run(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, String> {
@@ -203,6 +230,9 @@ pub struct Job {
 impl Job {
     /// Runs the tool (blocking until it ends), and reads what it returns.
     pub fn run(&self, control: &Control) -> Result<ToolResult, String> {
+        if !crate::is_current(&self.plugin) {
+            return Err(format!("{} changed or was disabled since this run was prepared", self.plugin.manifest.name));
+        }
         let mut log = Messages { lines: Vec::new(), control };
         let reply = crate::call(&self.plugin, &mut log, &self.request, true);
         // A WebAssembly tool isn't stopped by a cancel; what it returns then is dropped.
@@ -227,6 +257,19 @@ impl Job {
 pub fn prepare(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<Job, String> {
     let (pid, tid) = split_id(spec.id).ok_or("not a plugin tool")?;
     let plugin = crate::get(pid).filter(|p| p.enabled).ok_or_else(|| format!("the plugin '{pid}' isn't loaded"))?;
+    prepare_pinned(&plugin, tid, inputs, params)
+}
+
+/// Prepares the tool from this exact plugin load's manifest, without substituting a newly
+/// loaded plugin with the same id. Callers pass parameters resolved against the pinned
+/// schema. A stale load is refused before layers or file parameters are read.
+pub fn prepare_pinned(plugin: &Arc<Plugin>, tid: &str, inputs: &dyn Inputs, params: &Value) -> Result<Job, String> {
+    if !plugin.enabled {
+        return Err(format!("the plugin '{}' is disabled", plugin.manifest.id));
+    }
+    if !crate::is_current(plugin) {
+        return Err(format!("{} was updated or removed since this run was approved", plugin.manifest.name));
+    }
     let decl = plugin.manifest.tools.iter().find(|t| t.id == tid).ok_or_else(|| format!("{} has no tool '{tid}'", plugin.manifest.name))?;
     let mut layers = Map::new();
     for p in decl.params.iter().filter(|p| is_layer_kind(&p.kind)) {
@@ -237,16 +280,21 @@ pub fn prepare(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<J
         }
     }
     let request = request(decl, params, layers)?;
-    Ok(Job { name: decl.name.clone(), plugin, request })
+    Ok(Job { name: decl.name.clone(), plugin: plugin.clone(), request })
 }
 
 /// The request running the tool `decl`: its parameters and layers, and its files beside them
-/// (`files`, by parameter), the parameters keeping only the files' names.
+/// (`files`, by parameter), the parameters keeping only the files' names. A `file` parameter in
+/// `path` mode keeps its file's full path instead, and its file isn't read.
 pub(crate) fn request(decl: &crate::manifest::ToolDecl, params: &Value, layers: Map<String, Value>) -> Result<Value, String> {
     let mut params = params.clone();
     let mut files = Map::new();
     for p in decl.params.iter().filter(|p| p.kind == "file") {
         let Some(v) = params.get(&p.name).filter(|v| !v.is_null() && v.as_str() != Some("")) else { continue };
+        if p.mode == crate::manifest::FileMode::Path {
+            params[&p.name] = Value::String(file_path(v).map_err(|e| format!("{}: {e}", p.label))?);
+            continue;
+        }
         let file = file_input(v).map_err(|e| format!("{}: {e}", p.label))?;
         params[&p.name] = file["name"].clone();
         files.insert(p.name.clone(), file);
@@ -280,6 +328,24 @@ fn file_input(v: &Value) -> Result<Value, String> {
     let path = v.as_str().ok_or("give a file path")?;
     let bytes = read_file(path)?;
     Ok(json!({"name": base_name(path), "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+}
+
+/// The full path of the file a `path` mode parameter names, checked to be a file but not read.
+/// A relative path is made full here, as the plugin's program runs in its own folder.
+#[cfg(not(target_arch = "wasm32"))]
+fn file_path(v: &Value) -> Result<String, String> {
+    let path = v.as_str().ok_or("give a file path")?;
+    let full = std::path::absolute(path).map_err(|e| format!("{path}: {e}"))?;
+    if !std::fs::metadata(&full).map_err(|e| format!("{path}: {e}"))?.is_file() {
+        return Err(format!("{path} is not a file"));
+    }
+    full.into_os_string().into_string().map_err(|_| format!("{path}: the path isn't valid Unicode"))
+}
+
+/// Process plugins, the only ones with `path` mode parameters, don't run in the browser.
+#[cfg(target_arch = "wasm32")]
+fn file_path(_: &Value) -> Result<String, String> {
+    Err("the browser has no file paths to give a plugin".into())
 }
 
 /// Whether `s` is standard, padded base64 (checked without decoding it).
@@ -355,7 +421,7 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_u64).filter_map(|r| usize::try_from(r).ok()).collect())
             .unwrap_or_default();
-        return Ok(ToolResult { output: Output::Selection { layer, rows }, messages });
+        return Ok(ToolResult { losses: Vec::new(), output: Output::Selection { layer, rows }, messages });
     }
     let mut outs = Vec::new();
     for v in reply.get("layers").and_then(Value::as_array).into_iter().flatten().take(64) {
@@ -364,5 +430,5 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
     for v in reply.get("tables").and_then(Value::as_array).into_iter().flatten().take(64) {
         outs.push(OutputLayer::Table(dataset(v, tool)?));
     }
-    Ok(ToolResult { output: Output::Layers(outs), messages })
+    Ok(ToolResult { losses: Vec::new(), output: Output::Layers(outs), messages })
 }

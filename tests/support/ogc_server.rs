@@ -1,6 +1,6 @@
 //! Shared, test-only HTTP fixture server. Exact routes, recorded requests, bounded shutdown.
 #![cfg(test)]
-#![allow(dead_code)]
+#![allow(dead_code, reason = "each test crate that includes it uses a part")]
 
 use std::io::{Read, Write};
 use std::sync::{
@@ -22,7 +22,10 @@ pub struct Route {
     /// The path answered, or a path and query (`/query?resultOffset=2`) to answer that request
     /// alone (a page of a layer that comes in pages).
     pub path: String,
+    /// The answer, in which `{base}` is the server's address.
     pub body: String,
+    /// An answer of bytes, sent as they are instead (a protocol buffer page, say).
+    pub bytes: Option<Vec<u8>>,
     pub status: u16,
     pub delay: Duration,
     /// More headers to answer with (a firewall's, say).
@@ -31,7 +34,12 @@ pub struct Route {
 
 impl Route {
     pub fn new(path: &str, body: &str) -> Self {
-        Self { path: path.into(), body: body.into(), status: 200, delay: Duration::ZERO, headers: Vec::new() }
+        Self { path: path.into(), body: body.into(), bytes: None, status: 200, delay: Duration::ZERO, headers: Vec::new() }
+    }
+
+    /// A route answering `bytes` as they are (a protocol buffer page, say).
+    pub fn bytes(path: &str, bytes: Vec<u8>) -> Self {
+        Self { bytes: Some(bytes), ..Self::new(path, "") }
     }
 }
 
@@ -71,6 +79,7 @@ impl Server {
         let mut routes = self.routes.lock().unwrap();
         if let Some(route) = routes.iter_mut().find(|r| r.path == path) {
             route.body = body.into();
+            route.bytes = None;
         } else {
             routes.push(Route::new(path, body));
         }
@@ -90,7 +99,7 @@ impl Server {
                 let (mut stream, _) = match listener.accept() {
                     Ok(s) => s,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
+                        std::thread::sleep(Duration::from_millis(5)); // test-wait: pace nonblocking accepts so the fixture can stop
                         continue;
                     }
                     Err(e) => panic!("accept: {e}"),
@@ -131,18 +140,20 @@ impl Server {
                     Some(r) => {
                         let until = Instant::now() + r.delay;
                         while Instant::now() < until && !stopping.load(Ordering::SeqCst) {
-                            std::thread::sleep(Duration::from_millis(5));
+                            std::thread::sleep(Duration::from_millis(5)); // test-wait: simulate the route delay while still checking fixture shutdown
                         }
                         let extra: String = r.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
-                        (r.status, r.body.replace("{base}", &origin), extra)
+                        let body = r.bytes.unwrap_or_else(|| r.body.replace("{base}", &origin).into_bytes());
+                        (r.status, body, extra)
                     }
-                    None => (404, String::new(), String::new()),
+                    None => (404, Vec::new(), String::new()),
                 };
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
+                let _ = stream.write_all(&body);
             }
         });
         Self { base, requests, stop, worker: Some(worker), routes }

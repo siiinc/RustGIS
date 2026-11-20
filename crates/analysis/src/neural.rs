@@ -15,7 +15,8 @@ pub const MAX_EPOCHS: usize = 500;
 /// Most classes and input bands.
 pub const MAX_CLASSES: usize = 64;
 pub const MAX_INPUTS: usize = 64;
-/// Most multiply-adds one training may do (seconds, not minutes): epochs are reduced to fit.
+/// Most multiply-adds one training may do (seconds, not minutes): epochs are reduced to fit. A
+/// run that can be cancelled takes any amount ([`crate::control::uncapped`]).
 pub const MAX_WORK: f64 = 5e9;
 
 /// One dense layer: `out × inp` weights (row per output) and `out` biases.
@@ -124,16 +125,49 @@ fn softmax(a: &mut [f32]) {
     }
 }
 
+/// The samples of a model's classes under its training polygons, each polygon's outline given
+/// with its class and its share of the class's samples, and each class taking up to
+/// `max_per_class`: the samples, and how many each class got. The polygons are counted for the
+/// run's progress, and a cancelled run stops between rows of a polygon (see [`crate::control`]).
+pub fn training_samples(
+    r: &Raster,
+    bands: &[usize],
+    polygons: &[(Vec<Vec<Coord>>, usize, usize)],
+    classes: usize,
+    max_per_class: usize,
+) -> Result<(Vec<(Vec<f32>, usize)>, Vec<usize>), String> {
+    crate::control::begin(polygons.len());
+    let mut samples: Vec<(Vec<f32>, usize)> = Vec::new();
+    let mut per_class = vec![0usize; classes];
+    for (rings, ci, share) in polygons {
+        let room = max_per_class.saturating_sub(per_class.get(*ci).copied().unwrap_or(0)).min(*share);
+        let got = polygon_samples(r, bands, rings, room);
+        // Stopped part of the way through the polygon: what it got isn't its share.
+        crate::control::check()?;
+        if let Some(n) = per_class.get_mut(*ci) {
+            *n += got.len();
+        }
+        samples.extend(got.into_iter().map(|x| (x, *ci)));
+        crate::control::advance(1);
+    }
+    Ok((samples, per_class))
+}
+
 /// Band values of the pixels inside a polygon (`rings`, longitude/latitude), up to `max`. Only
 /// the pixels under the polygon's outline are visited, every `step`-th one in each direction when
-/// there are many more than `max`, so the samples spread across the polygon.
+/// there are many more than `max`, so the samples spread across the polygon. A cancelled run
+/// stops between rows, with the pixels found so far. If an outline vertex can't be placed,
+/// search the whole raster instead of bounding the polygon by only its surviving vertices.
 pub fn polygon_samples(r: &Raster, bands: &[usize], rings: &[Vec<Coord>], max: usize) -> Vec<Vec<f32>> {
     let mut out = Vec::new();
     let tr = r.transformer();
     // The pixel window under the outline (its vertices, projected into the raster).
     let (mut c0, mut r0, mut c1, mut r1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for v in rings.iter().flatten().take(1_000_000) {
-        let Some(w) = tr.from_lonlat(*v) else { continue };
+        let Some(w) = tr.from_lonlat(*v) else {
+            (c0, r0, c1, r1) = (0.0, 0.0, f64::from(r.width), f64::from(r.height));
+            break;
+        };
         let (c, rw) = r.transform.to_pixel(w);
         if c.is_finite() && rw.is_finite() {
             (c0, r0, c1, r1) = (c0.min(c), r0.min(rw), c1.max(c), r1.max(rw));
@@ -155,6 +189,9 @@ pub fn polygon_samples(r: &Raster, bands: &[usize], rings: &[Vec<Coord>], max: u
         out.clear();
         let mut row = r0;
         'scan: while row < r1 {
+            if crate::control::cancelled() {
+                return out;
+            }
             let mut col = c0;
             while col < c1 {
                 if out.len() >= max {
@@ -184,8 +221,34 @@ pub struct Trained {
     pub model: Mlp,
     pub accuracy: f64,
     pub samples: usize,
-    /// The epochs run (fewer than asked when the work would pass [`MAX_WORK`]).
+    /// The epochs run (fewer than asked when the work would pass [`MAX_WORK`] in a run that can't
+    /// be cancelled).
     pub epochs: usize,
+    /// The epochs asked (within 1 to [`MAX_EPOCHS`]).
+    pub epochs_asked: usize,
+    /// The training samples fitted each epoch (fewer than [`Trained::training`] when they would
+    /// pass [`MAX_WORK`] in a run that can't be cancelled: a random subset).
+    pub fitted: usize,
+    /// The samples kept for training (the rest are held back to measure the accuracy).
+    pub training: usize,
+}
+
+impl Trained {
+    /// What a run that can't be cancelled left out to stay within its work limit, to be said: `None`
+    /// when it fitted every training sample for every epoch asked.
+    pub fn limited(&self) -> Option<String> {
+        if self.fitted >= self.training && self.epochs >= self.epochs_asked {
+            return None;
+        }
+        Some(format!(
+            "trained on {} of {} training samples for {} of {} epochs, the work limit of a run that can't be cancelled{}",
+            self.fitted,
+            self.training,
+            self.epochs,
+            self.epochs_asked,
+            crate::parallel::UNCAPPED_HINT
+        ))
+    }
 }
 
 /// Trains a classifier. `samples` are (band values, class index); `hidden` the units per hidden
@@ -252,25 +315,33 @@ pub fn train(
     let inputs: Vec<Vec<f32>> = samples.iter().map(|(x, _)| scaled(x)).collect();
     // Mini-batch gradient descent with momentum.
     // Each sample costs about three passes over the weights (forward, backward, update).
-    // Too many samples for even one epoch: a random subset (they're shuffled) is fitted.
+    // Too many samples for even one epoch: a random subset (they're shuffled) is fitted. A run
+    // that can be cancelled fits them all, for every epoch asked.
     let per_sample = 3.0 * layers.iter().map(|l| l.w.len() + l.b.len()).sum::<usize>() as f64;
+    let max_work = if crate::control::uncapped() { f64::INFINITY } else { MAX_WORK };
     let mut fit = fit;
-    fit.truncate(((MAX_WORK / per_sample) as usize).max(1));
+    let training = fit.len();
+    fit.truncate(((max_work / per_sample).min(usize::MAX as f64) as usize).max(1));
     let per_epoch = per_sample * fit.len().max(1) as f64;
-    let epochs = epochs.clamp(1, MAX_EPOCHS).min(((MAX_WORK / per_epoch) as usize).max(1));
+    if !(1..=MAX_EPOCHS).contains(&epochs) {
+        return Err(format!("epochs is 1 to {MAX_EPOCHS}, not {epochs}"));
+    }
+    let epochs_asked = epochs;
+    let epochs = epochs_asked.min(((max_work / per_epoch).min(usize::MAX as f64) as usize).max(1));
     let (lr, momentum, batch) = (0.05f32, 0.9f32, 32usize);
     let mut vel: Vec<(Vec<f32>, Vec<f32>)> = layers.iter().map(|l| (vec![0.0; l.w.len()], vec![0.0; l.b.len()])).collect();
     crate::control::begin(epochs);
-    for epoch in 0..epochs {
-        if crate::control::cancelled() {
-            break;
-        }
+    'epochs: for epoch in 0..epochs {
         crate::control::reached(epoch);
         for i in (1..fit.len()).rev() {
             let j = rng.below(i + 1);
             fit.swap(i, j);
         }
         for chunk in fit.chunks(batch) {
+            // An epoch of every sample takes long without a cap: Cancel is looked at each batch.
+            if crate::control::cancelled() {
+                break 'epochs;
+            }
             let mut grads: Vec<(Vec<f32>, Vec<f32>)> = layers.iter().map(|l| (vec![0.0; l.w.len()], vec![0.0; l.b.len()])).collect();
             for &si in chunk {
                 let (Some(x), Some((_, class))) = (inputs.get(si), samples.get(si)) else { continue };
@@ -337,59 +408,154 @@ pub fn train(
             }
         }
     }
+    // A cancelled run makes no model: the accuracy check on held-back samples can take long too.
+    crate::control::check()?;
     if !layers.iter().all(|l| l.w.iter().chain(&l.b).all(|v| v.is_finite())) {
         return Err("training diverged; try fewer epochs or smaller layers".into());
     }
     let model = Mlp { bands: bands.to_vec(), mean, std, layers, classes };
     let correct = test.iter().filter(|&&i| samples.get(i).is_some_and(|(x, c)| model.predict(x).0 == *c)).count();
     let accuracy = if test.is_empty() { 1.0 } else { correct as f64 / test.len() as f64 };
-    Ok(Trained { model, accuracy, samples: samples.len(), epochs })
+    Ok(Trained { model, accuracy, samples: samples.len(), epochs, epochs_asked, fitted: fit.len(), training })
 }
 
 /// Classifies every pixel: class numbers (1-based, `nodata` where a band has no data) and each
-/// pixel's probability of that class.
+/// pixel's probability of that class. Rows go on several threads when the work is large, except in
+/// the browser, which uses one (#1252).
 pub fn classify(r: &Raster, model: &Mlp, nodata: f32) -> Result<(Vec<f32>, Vec<f32>), String> {
+    classify_on(r, model, nodata, None)
+}
+
+/// [`classify`] on `threads` threads (none: as many as pay off).
+fn classify_on(r: &Raster, model: &Mlp, nodata: f32, threads: Option<usize>) -> Result<(Vec<f32>, Vec<f32>), String> {
     model.validate()?;
-    // A large model on a large raster is refused rather than run for minutes.
+    // A large model on a large raster is refused rather than run for minutes, unless the run can
+    // be cancelled.
     let weights: usize = model.layers.iter().map(|l| l.w.len() + l.b.len()).sum();
-    if f64::from(r.width) * f64::from(r.height) * weights as f64 > 4.0 * MAX_WORK {
-        return Err("that model is too large for this raster; use a smaller model or clip the raster first".into());
+    if !crate::control::uncapped() && f64::from(r.width) * f64::from(r.height) * weights as f64 > 4.0 * MAX_WORK {
+        return Err(format!(
+            "that model is too large for this raster; use a smaller model or clip the raster first{}",
+            crate::parallel::UNCAPPED_HINT
+        ));
     }
     if let Some(b) = model.bands.iter().find(|b| **b >= r.bands.len()) {
         return Err(format!("{} has no band {}", r.name, b + 1));
     }
-    let (w, h) = (r.width as i64, r.height as i64);
-    let (mut class, mut prob) = (crate::rasterops::grid(w as usize, h as usize)?, crate::rasterops::grid(w as usize, h as usize)?);
-    let mut x = vec![0.0f32; model.bands.len()];
-    crate::control::begin(h as usize);
-    for row in 0..h {
-        crate::control::check()?;
-        crate::control::reached(row as usize);
-        for col in 0..w {
-            // A non-finite value is treated as no data.
-            let ok = model.bands.iter().zip(x.iter_mut()).all(|(b, xv)| match r.value(*b, col, row).filter(|v| v.is_finite()) {
-                Some(v) => {
-                    *xv = v;
-                    true
+    let (w, h) = (r.width as usize, r.height as usize);
+    let (mut class, mut prob) = (crate::rasterops::new_band(w, h, nodata)?, crate::rasterops::new_band(w, h, nodata)?);
+    // In [`crate::parallel::MIN_ROW_WORK`]'s units (about 30 ns each): a weight of a pixel costs
+    // about 1 ns.
+    let work = w.saturating_mul(h).saturating_mul(weights) / 30;
+    let threads = threads.unwrap_or_else(|| crate::parallel::threads_for_rows(h, work, model.bands.len() * 4));
+    crate::control::begin(h);
+    // Each row writes only its own pixels of both bands; each thread reads into its own buffer.
+    crate::parallel::for_each_row(
+        class.chunks_mut(w.max(1)).zip(prob.chunks_mut(w.max(1))),
+        threads,
+        || (vec![0.0f32; model.bands.len()], crate::control::Pace::default()),
+        |(x, pace): &mut (Vec<f32>, crate::control::Pace), row, (class, prob): (&mut [f32], &mut [f32])| {
+            for (col, (c_out, p_out)) in class.iter_mut().zip(prob.iter_mut()).enumerate() {
+                // A large model on a wide row takes long without a cap: Cancel is looked at
+                // within it.
+                if pace.stop(weights) {
+                    return;
                 }
-                None => false,
-            });
-            if ok {
-                let (c, p) = model.predict(&x);
-                class.push((c + 1) as f32);
-                prob.push(p);
-            } else {
-                class.push(nodata);
-                prob.push(nodata);
+                // A non-finite value is treated as no data.
+                let ok = model.bands.iter().zip(x.iter_mut()).all(|(b, xv)| {
+                    match r.value(*b, col as i64, row as i64).filter(|v| v.is_finite()) {
+                        Some(v) => {
+                            *xv = v;
+                            true
+                        }
+                        None => false,
+                    }
+                });
+                if ok {
+                    let (c, p) = model.predict(x);
+                    (*c_out, *p_out) = ((c + 1) as f32, p);
+                }
             }
-        }
-    }
+        },
+    )?;
     Ok((class, prob))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused outline vertex cannot narrow the search past a valid pixel inside the polygon.
+    #[test]
+    fn polygon_samples_keep_a_pixel_when_outline_vertices_are_refused() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform};
+        let crs = Crs::from_epsg(32617).unwrap();
+        let t = crs.transformer().unwrap();
+        let at = Coord::new(-169.0, 10.5);
+        let native = t.from_lonlat(at).unwrap();
+        let gt = GeoTransform { origin_x: native.x - 0.5, origin_y: native.y + 0.5, pixel_width: 1.0, pixel_height: -1.0 };
+        let r = Raster::new("pixel", 1, 1, vec![vec![42.0]], gt, crs, None, ColorHint::Gray, "Float32").unwrap();
+        let ring = vec![Coord::new(-170.0, 0.0), Coord::new(10.0, 0.0), Coord::new(10.0, 50.0), Coord::new(-170.0, 50.0)];
+        assert!(t.from_lonlat(ring[0]).is_none());
+        assert!(rustgis_data::geometry::polygon_contains(std::slice::from_ref(&ring), at));
+        assert_eq!(polygon_samples(&r, &[0], &[ring], 10), [vec![42.0]]);
+    }
+
+    /// Rows classified on several threads give the same classes and probabilities, bit for bit,
+    /// as one thread (#1252), no-data pixels included.
+    #[test]
+    fn classify_on_several_threads_is_classify_on_one() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform};
+        let mut samples = Vec::new();
+        let mut rng = Rng(11);
+        for _ in 0..600 {
+            let (x, y) = (rng.sym() * 2.0, rng.sym() * 2.0);
+            samples.push((vec![x * 100.0 + 500.0, y * 50.0], usize::from((x * x + y * y).sqrt() < 1.0)));
+        }
+        let model = train(&[0, 1], vec!["out".into(), "in".into()], &samples, &[8], 40).unwrap().model;
+        let (w, h) = (90u32, 70u32);
+        let band = |f: &dyn Fn(f32, f32) -> f32| {
+            (0..w * h).map(|i| f((i % w) as f32 / w as f32 * 4.0 - 2.0, (i / w) as f32 / h as f32 * 4.0 - 2.0)).collect()
+        };
+        let a: Vec<f32> = band(&|x, _| x * 100.0 + 500.0);
+        let mut b: Vec<f32> = band(&|_, y| y * 50.0);
+        for v in b.iter_mut().step_by(53) {
+            *v = f32::NAN;
+        }
+        let transform = GeoTransform { origin_x: 0.0, origin_y: 45.0, pixel_width: 0.001, pixel_height: -0.001 };
+        let r = Raster::new("img", w, h, vec![a, b], transform, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let (c1, p1) = classify_on(&r, &model, -1.0, Some(1)).unwrap();
+        assert!(c1.contains(&1.0) && c1.contains(&2.0) && c1.contains(&-1.0), "both classes and no data");
+        // A classified pixel has its class's probability; one with no data has none.
+        assert!(c1.iter().zip(&p1).all(|(c, p)| if *c == -1.0 { *p == -1.0 } else { (0.0..=1.0).contains(p) && *p >= 0.5 }));
+        for threads in [2, 7, 16] {
+            let (c, p) = classify_on(&r, &model, -1.0, Some(threads)).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!((bits(&c), bits(&p)), (bits(&c1), bits(&p1)), "{threads} threads");
+        }
+        // As many threads as pay off, which `classify` picks, give the same.
+        let (c, p) = classify(&r, &model, -1.0).unwrap();
+        assert_eq!((c, p), (c1, p1));
+    }
+
+    /// A model too large for a raster is refused where nothing can stop the run, and taken on by
+    /// a run that can be cancelled (#1291 step 2).
+    #[test]
+    fn a_large_model_on_a_large_raster_runs_only_when_it_can_be_cancelled() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform};
+        let samples: Vec<(Vec<f32>, usize)> = (0..40).map(|i| (vec![i as f32], usize::from(i >= 20))).collect();
+        // About 5,500 weights on 2000 × 2000 pixels: past four times MAX_WORK.
+        let model = train(&[0], vec!["a".into(), "b".into()], &samples, &[80, 64], 1).unwrap().model;
+        let (w, h) = (2000u32, 2000u32);
+        let transform = GeoTransform { origin_x: 0.0, origin_y: 45.0, pixel_width: 0.001, pixel_height: -0.001 };
+        let r =
+            Raster::new("img", w, h, vec![vec![1.0; (w * h) as usize]], transform, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let e = classify_on(&r, &model, -1.0, Some(1)).unwrap_err();
+        assert!(e.starts_with("that model is too large for this raster"), "{e}");
+        let run = crate::control::Control::stoppable();
+        run.cancel();
+        let _installed = crate::control::install(Some(run));
+        assert_eq!(classify_on(&r, &model, -1.0, Some(1)).unwrap_err(), crate::control::CANCELLED);
+    }
 
     #[test]
     fn learns_a_nonlinear_boundary_and_validates() {
@@ -417,6 +583,21 @@ mod tests {
         // The largest network for every epoch would pass the work cap: fewer epochs run.
         let big = train(&[0, 1], vec!["out".into(), "in".into()], &samples, &[MAX_UNITS; MAX_LAYERS], MAX_EPOCHS).unwrap();
         assert!(big.epochs < MAX_EPOCHS, "{} epochs", big.epochs);
+        // ...and it says so, with what it ran of what was asked.
+        let said = big.limited().expect("a capped run says what it left out");
+        assert!(said.contains(&format!("for {} of {MAX_EPOCHS} epochs", big.epochs)), "{said}");
+        assert_eq!(t.limited(), None, "a run within the limit says nothing");
+        // Too many samples for even one epoch of the largest network: a random subset is fitted,
+        // and said with its count.
+        let many: Vec<(Vec<f32>, usize)> = (0..12_000).map(|i| (vec![(i % 97) as f32, (i % 89) as f32], i % 2)).collect();
+        let cut = train(&[0, 1], vec!["a".into(), "b".into()], &many, &[MAX_UNITS; MAX_LAYERS], 1).unwrap();
+        assert!(cut.fitted < cut.training && cut.epochs == 1, "{} of {}", cut.fitted, cut.training);
+        let said = cut.limited().expect("a cut sample set is said");
+        assert!(said.contains(&format!("on {} of {} training samples for 1 of 1 epochs", cut.fitted, cut.training)), "{said}");
+        // Run so it can be cancelled, it fits every sample for every epoch and says nothing.
+        let control = crate::control::Control::stoppable();
+        let whole = crate::run_under("Train", &control, || train(&[0, 1], vec!["out".into(), "in".into()], &samples, &[8], 3)).unwrap();
+        assert_eq!((whole.fitted, whole.epochs, whole.limited()), (whole.training, 3, None));
         assert!(train(&[0, 1], vec!["a".into(), "b".into()], &samples[..2], &[4], 1).is_err(), "too few");
     }
 }

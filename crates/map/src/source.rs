@@ -12,7 +12,7 @@
 //! when its bytes have.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use rustgis_data::source::{Batch, FeatureSource, Request, SourceInfo};
 use rustgis_geom::Extent;
@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 mod render_lod;
 mod window;
+pub(crate) use window::Query;
 
 /// Retained streamed rows and geometry caches per map; excludes scratch and render/export copies.
 pub const VIEW_BYTES: usize = if cfg!(target_arch = "wasm32") { 48 * 1024 * 1024 } else { 128 * 1024 * 1024 };
@@ -32,6 +33,38 @@ pub const VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 100_000 } else {
 
 /// The most features a view reads from a file by its web address (each one is fetched).
 pub const REMOTE_VIEW_LIMIT: usize = if cfg!(target_arch = "wasm32") { 30_000 } else { 60_000 };
+
+/// Repair advice shared by render errors and the session's translated read-failure notice.
+pub const REPAIR_SOURCE: &str = "if the file was moved or deleted, restore it or use Repair Data Source to point to its new location";
+
+const RECONNECT_REQUIRED: &str = "this database source came from a peer; reconnect explicitly before reading it";
+
+/// Ambiguous polygon areas among decoded features, including rows an area query could not keep.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AmbiguousAreas {
+    pub rings: usize,
+    pub features: usize,
+}
+
+impl AmbiguousAreas {
+    /// Count each affected feature once and all of its ambiguous rings.
+    pub fn from_features(features: &[rustgis_data::Feature]) -> Self {
+        let mut counts = Self::default();
+        for geometry in features.iter().filter_map(|feature| feature.geometry.as_ref()) {
+            let rings = geometry.ambiguous_area_rings();
+            if rings > 0 {
+                counts.rings = counts.rings.saturating_add(rings);
+                counts.features = counts.features.saturating_add(1);
+            }
+        }
+        counts
+    }
+
+    pub(crate) fn include(&mut self, other: Self) {
+        self.rings = self.rings.saturating_add(other.rings);
+        self.features = self.features.saturating_add(other.features);
+    }
+}
 
 /// A streamed layer's source.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -53,6 +86,31 @@ pub struct SourceLayer {
     pub embedded: Option<Arc<Vec<u8>>>,
     #[serde(skip)]
     handle: Option<Arc<dyn FeatureSource>>,
+    /// Runtime metadata from a fresh provenance conversion, including its loader diagnostics.
+    #[serde(skip)]
+    conversion_info: Option<SourceInfo>,
+    /// A successful saved-conversion fallback, consumed once when the project opens.
+    #[serde(skip)]
+    conversion_fallback: Option<String>,
+    /// Losses from a conversion actually performed while opening, consumed once by its caller.
+    #[serde(skip)]
+    conversion_notes_unsaid: Vec<String>,
+    /// Values in date fields a view read found weren't dates ([`Batch::unread_dates`]), until
+    /// said by [`SourceLayer::take_unread_dates`]; once said, later reads aren't counted again.
+    #[serde(skip)]
+    unread_dates: Option<Vec<usize>>,
+    /// Date-times a view read rounded to the microsecond ([`Batch::rounded_dates`]), likewise.
+    #[serde(skip)]
+    rounded_dates: Option<Vec<usize>>,
+    #[serde(skip)]
+    unread_dates_said: bool,
+    #[serde(skip)]
+    rounded_dates_said: bool,
+    /// Text values `<Null>` a view read read as null ([`Batch::null_text`]), likewise.
+    #[serde(skip)]
+    null_text: Option<Vec<usize>>,
+    #[serde(skip)]
+    null_text_said: bool,
     #[serde(skip)]
     window: Option<Window>,
     /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
@@ -78,23 +136,45 @@ pub struct SourceLayer {
     /// explicit source reset discards them. Display-only resets preserve them in `sync_sources`.
     #[serde(skip)]
     pub(crate) saved_selection: Vec<u64>,
+    /// The datum grids this window was read with ([`rustgis_data::raster::crs::grid_generation`]):
+    /// a window read before a grid arrived is read again, as after a change of projection.
+    #[serde(skip)]
+    pub(crate) grids: Option<u64>,
     #[serde(skip)]
     pub(crate) window_fields: Option<usize>,
+    /// The layer's definition query, applied while a view is read rather than to the rows read.
+    #[serde(skip)]
+    pub(crate) query: Option<Query>,
     /// A source by its web address being opened (its header or footer being fetched).
     #[serde(skip)]
     opening: Option<Opening>,
     /// Why the source couldn't be opened or read.
     #[serde(skip)]
     pub error: Option<String>,
+    /// Last read failure reported by the session, independent of disposable render copies.
+    #[serde(skip)]
+    error_said: Option<String>,
     /// The last open failed because the server refused the login (no password given this session, or a wrong one).
     #[serde(skip)]
     pub login: bool,
+    /// Runtime-only: imported source selection awaits an explicit reconnect or exact peer retention.
+    #[serde(skip)]
+    reconnect_required: bool,
     /// The most features a view reads (0 = [`VIEW_LIMIT`]).
     #[serde(skip)]
     pub limit: usize,
     /// Reads installed so far: the features changing with it came from the source, not an edit.
     #[serde(skip)]
     pub reads: u64,
+    /// Last installed window examined by the session's display diagnostics.
+    #[serde(skip)]
+    display_read_said: u64,
+    /// Counts computed on the read worker, including unavailable rows removed by its query.
+    #[serde(skip)]
+    pub(crate) area_counts: AmbiguousAreas,
+    /// A public dataset mutation invalidates these counts just as it invalidates view caches.
+    #[serde(skip)]
+    pub(crate) area_features: Option<Weak<Vec<rustgis_data::Feature>>>,
     /// For a layer read through GDAL: the original file, converted again into the cache when the
     /// converted copy is gone (desktop only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,24 +264,48 @@ pub struct GpkgEdit {
     pub versions: Versions,
 }
 
+/// FNV-1a's starting value.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a over `bytes`, from `h`.
+fn fnv1a(h: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(h, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+}
+
 /// How a loaded row is told apart from the same row edited: a hash of its geometry and
-/// attributes (FNV-1a over their JSON, the same in every build).
+/// attributes (FNV-1a over their JSON, the same in every build). Non-finite attributes also
+/// contribute their position and native bits, since output JSON substitutes Null for them.
 pub fn row_hash(f: &rustgis_data::Feature) -> u64 {
     /// FNV-1a over the bytes written to it, kept as they come (no buffer per row).
     struct Fnv(u64);
+    impl Fnv {
+        /// Feeds bytes without buffering; also used for values JSON cannot distinguish.
+        fn bytes(&mut self, buf: &[u8]) {
+            self.0 = fnv1a(self.0, buf);
+        }
+    }
     impl std::io::Write for Fnv {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 = buf.iter().fold(self.0, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+            self.bytes(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+    let mut h = Fnv(FNV_OFFSET);
     // As before, a row that can't be written hashes as no bytes.
     if serde_json::to_writer(&mut h, &(&f.geometry, &f.attrs)).is_err() {
-        return 0xcbf2_9ce4_8422_2325;
+        return FNV_OFFSET;
+    }
+    for (index, value) in f.attrs.iter().enumerate() {
+        if let rustgis_data::Value::Float(number) = value
+            && !number.is_finite()
+        {
+            h.bytes(b"\xffnon-finite:");
+            h.bytes(&(index as u64).to_le_bytes());
+            h.bytes(&number.to_bits().to_le_bytes());
+        }
     }
     h.0
 }
@@ -403,6 +507,19 @@ impl std::fmt::Debug for SourceLayer {
     }
 }
 
+/// Ordinary conversions live directly in the provider's reusable cache. Other linked copies
+/// (including reader-owned workspaces) must not borrow another source's artifact lifetime.
+#[cfg(not(target_arch = "wasm32"))]
+fn persistent_conversion(path: &std::path::Path, cache: Option<std::path::PathBuf>) -> bool {
+    if rustgis_data::source::gdal::ReloadWorkspace::contains_file(path) {
+        return false;
+    }
+    path.parent()
+        .and_then(|p| p.canonicalize().ok())
+        .zip(cache.and_then(|p| p.canonicalize().ok()))
+        .is_some_and(|(parent, cache)| parent == cache)
+}
+
 /// Converts a DuckDB layer's table again: the result's part of the layer's geometry family.
 /// A query is never run again here: a project file is hostile input, and a query can read any file
 /// and send it to any address. Its user runs it again.
@@ -455,7 +572,10 @@ fn open_postgis(pg: &PostgisOrigin) -> rustgis_data::Result<Box<dyn FeatureSourc
     {
         use rustgis_data::source::{duckdb::Database, postgis};
         let Database::Postgres(dsn) = Database::parse(&pg.database) else {
-            return Err(rustgis_data::DataError::Format(format!("{}: not a PostgreSQL connection", pg.database)));
+            return Err(rustgis_data::DataError::Format(rustgis_data::diagnostics::message_with_address(
+                &pg.database,
+                "not a PostgreSQL connection",
+            )));
         };
         let conn = postgis::connect(&dsn, false).map_err(database_open_error)?;
         let table = postgis::find_table(&conn, &pg.table)?;
@@ -475,7 +595,10 @@ fn open_mysql(my: &MysqlOrigin) -> rustgis_data::Result<Box<dyn FeatureSource>> 
     {
         use rustgis_data::source::{duckdb::Database, mysql};
         let Database::Mysql(address) = Database::parse(&my.database) else {
-            return Err(rustgis_data::DataError::Format(format!("{}: not a MySQL or MariaDB connection", my.database)));
+            return Err(rustgis_data::DataError::Format(rustgis_data::diagnostics::message_with_address(
+                &my.database,
+                "not a MySQL or MariaDB connection",
+            )));
         };
         let conn = mysql::connect(&address, false).map_err(database_open_error)?;
         let table = mysql::find_table(&conn, &my.table)?;
@@ -495,7 +618,10 @@ fn open_sqlserver(ms: &SqlServerOrigin) -> rustgis_data::Result<Box<dyn FeatureS
     {
         use rustgis_data::source::{duckdb::Database, sqlserver};
         let Database::Sqlserver(address) = Database::parse(&ms.database) else {
-            return Err(rustgis_data::DataError::Format(format!("{}: not a SQL Server connection", ms.database)));
+            return Err(rustgis_data::DataError::Format(rustgis_data::diagnostics::message_with_address(
+                &ms.database,
+                "not a SQL Server connection",
+            )));
         };
         let conn = sqlserver::connect(&address, false).map_err(database_open_error)?;
         let table = sqlserver::find_table(&conn, &ms.table)?;
@@ -514,20 +640,69 @@ pub struct Window {
     pub matched: u64,
     /// How many were read.
     pub kept: usize,
+    /// The read kept the definition query's matches: `matched` counts them.
+    pub filtered: bool,
 }
 
 /// A read in flight.
 struct Pending {
     extent: Extent,
     result: Mutex<Option<Result<(Batch, window::Cache), String>>>,
+    still: Option<rustgis_data::source::remote::Still>,
 }
 
 /// A source being opened off the frame.
-type Opening = Arc<Mutex<Option<Result<Arc<dyn FeatureSource>, String>>>>;
+type Opening = Arc<OpeningState>;
+struct OpeningState {
+    result: Mutex<Option<Result<Arc<dyn FeatureSource>, String>>>,
+    still: Option<rustgis_data::source::remote::Still>,
+    #[cfg(not(target_arch = "wasm32"))]
+    progress: Option<Arc<OpeningProgress>>,
+}
+impl OpeningState {
+    /// Owns the initiating carrier before an asynchronous source open can leave this thread.
+    fn new() -> Opening {
+        Arc::new(Self {
+            result: Mutex::new(None),
+            still: rustgis_data::source::remote::current_still(),
+            #[cfg(not(target_arch = "wasm32"))]
+            progress: None,
+        })
+    }
+    /// Retains the existing completion-slot locking behavior; authority stays outside its payload.
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Option<Result<Arc<dyn FeatureSource>, String>>>> {
+        self.result.lock()
+    }
+}
 
-/// Tells the app something landed (a read, or a source opened by its address).
-pub(crate) fn landed() {
-    GENERATION.fetch_add(1, Ordering::Relaxed);
+/// Progress and cancellation for a local schema scan. A worker never keeps its owner alive:
+/// dropping the last source copy stops the scan at its next progress check.
+#[cfg(not(target_arch = "wasm32"))]
+struct OpeningProgress {
+    owner: Weak<OpeningState>,
+    cancelled: std::sync::atomic::AtomicBool,
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl rustgis_data::progress::Probe for OpeningProgress {
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+            || self.owner.upgrade().is_none_or(|owner| rustgis_data::source::remote::check_still(&owner.still).is_err())
+    }
+    fn begin(&self, total: u64) {
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+    fn advance(&self, n: u64) {
+        self.done.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Asks the app for a frame (the waker) with nothing new to draw: what landed while the map drew
+/// is said a frame after (see [`wake`] for something new to draw).
+pub(crate) fn another_frame() {
     if let Some(w) = waker().lock().ok().and_then(|w| w.clone()) {
         w();
     }
@@ -546,6 +721,65 @@ pub enum Polled {
 }
 
 impl SourceLayer {
+    /// Counts for the installed read, or `None` if its features have since been changed.
+    pub fn unavailable_areas(&self, features: &rustgis_data::Features) -> Option<AmbiguousAreas> {
+        self.area_features.as_ref().filter(|key| Weak::ptr_eq(key, &features.allocation_key())).map(|_| self.area_counts)
+    }
+    /// Keeps what view reads found of values in date fields that weren't dates, until
+    /// [`SourceLayer::take_unread_dates`] says it. Once said, later reads aren't counted: they
+    /// read the same features again, and the notice says Load All Features counts them all.
+    /// Each kind is counted until its own notice is said, so saying one doesn't silence the other.
+    pub fn saw_unread_dates(&mut self, unread: &[usize], rounded: &[usize]) {
+        if !self.unread_dates_said && unread.iter().any(|n| *n > 0) {
+            rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), unread);
+        }
+        if !self.rounded_dates_said && rounded.iter().any(|n| *n > 0) {
+            rustgis_data::source::add_unread_dates(self.rounded_dates.get_or_insert_with(Vec::new), rounded);
+        }
+    }
+
+    /// What view reads found of values in date fields that weren't dates
+    /// ([`rustgis_data::source::unread_dates_note`]) and of date-times rounded to the microsecond
+    /// ([`rustgis_data::source::rounded_dates_note`]), once for the source.
+    pub fn take_unread_dates(&mut self) -> (Option<String>, Option<String>) {
+        let Some(fields) = self.info().map(|i| i.fields.clone()) else { return (None, None) };
+        let (unread, rounded) = (self.unread_dates.take(), self.rounded_dates.take());
+        if unread.is_none() && rounded.is_none() {
+            return (None, None);
+        }
+        self.unread_dates_said |= unread.is_some();
+        self.rounded_dates_said |= rounded.is_some();
+        (
+            unread.and_then(|c| rustgis_data::source::unread_dates_note(&fields, &c)),
+            rounded.and_then(|c| rustgis_data::source::rounded_dates_note(&fields, &c)),
+        )
+    }
+
+    /// Keeps what view reads found of text values `<Null>` read as null, until
+    /// [`SourceLayer::take_null_text`] says it, as [`SourceLayer::saw_unread_dates`] does for dates.
+    pub fn saw_null_text(&mut self, counts: &[usize]) {
+        if !self.null_text_said && counts.iter().any(|n| *n > 0) {
+            rustgis_data::source::add_unread_dates(self.null_text.get_or_insert_with(Vec::new), counts);
+        }
+    }
+
+    /// What view reads found of text values `<Null>` read as null
+    /// ([`rustgis_data::source::null_text_note`]), once for the source.
+    pub fn take_null_text(&mut self) -> Option<String> {
+        let fields = self.info().map(|i| i.fields.clone())?;
+        let counts = self.null_text.take()?;
+        self.null_text_said = true;
+        rustgis_data::source::null_text_note(&fields, &counts)
+    }
+
+    /// Whether another installed window needs its retained display expressions checked.
+    pub fn take_display_window(&mut self) -> bool {
+        if self.reads == self.display_read_said {
+            return false;
+        }
+        self.display_read_said = self.reads;
+        true
+    }
     /// The original local file, excluding embedded data, databases and query results.
     pub fn linked_file(&self) -> Option<&str> {
         if self.embedded.is_some() || self.postgis.is_some() || self.mysql.is_some() || self.sqlserver.is_some() {
@@ -561,6 +795,33 @@ impl SourceLayer {
         p.filter(|p| crate::paths::is_local(p))
     }
 
+    /// A read failure with the linked file and the repair action, when it has a local source.
+    /// The caller supplies the layer's current name, which can differ from the file's name.
+    pub fn read_error(&self) -> Option<String> {
+        let error = self.error.as_ref()?;
+        Some(match self.linked_file() {
+            Some(path) => format!("could not read {path}: {error}; {REPAIR_SOURCE}"),
+            None => error.clone(),
+        })
+    }
+
+    /// Clears a recovered failure and its notice marker, even between notice passes.
+    pub fn clear_error(&mut self) {
+        self.error = None;
+        self.error_said = None;
+    }
+
+    /// Takes each persistent read failure once, so redraws do not repeat its notice. A successful
+    /// read, or an explicit reopen/repair, allows a later failure to be reported.
+    pub fn error_unsaid(&mut self) -> Option<String> {
+        if self.error == self.error_said {
+            return None;
+        }
+        let error = self.error.clone();
+        self.error_said.clone_from(&error);
+        error
+    }
+
     /// Opens a replacement with fresh handles, windows, caches and selection.
     pub fn relinked(&self, path: &str, table: Option<&str>) -> Result<SourceLayer, String> {
         if self.embedded.is_some() || self.postgis.is_some() || self.mysql.is_some() || self.sqlserver.is_some() {
@@ -568,6 +829,9 @@ impl SourceLayer {
         }
         let mut new =
             SourceLayer { shapefile_crs: self.shapefile_crs, limit: self.limit, byte_budget: self.byte_budget, ..Default::default() };
+        let mut conversion_notes = Vec::new();
+        let declared_empty;
+        let conversion_zm_dropped;
         if let Some(g) = &self.gdal {
             #[cfg(target_arch = "wasm32")]
             {
@@ -577,10 +841,20 @@ impl SourceLayer {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let layer = table.unwrap_or(&g.layer);
-                let fresh = rustgis_data::source::gdal::convert_one(std::path::Path::new(path), layer, g.family, g.crs.as_deref())
-                    .map_err(|e| format!("{path}: {e}"))?
-                    .ok_or_else(|| format!("{path}: {layer} has no features"))?;
-                new.path = Some(fresh.display().to_string());
+                let fresh = rustgis_data::source::gdal::convert_one_fresh(std::path::Path::new(path), layer, g.family, g.crs.as_deref())
+                    .map_err(|e| format!("{path}: {e}"))?;
+                conversion_notes = fresh.notes;
+                declared_empty = fresh.empty;
+                conversion_zm_dropped = fresh.zm_dropped;
+                new.path = Some(fresh.path.display().to_string());
+                let handle = rustgis_data::source::fgb::FgbSource::open_converted_path(
+                    &fresh.path,
+                    layer,
+                    std::path::Path::new(path),
+                    Some(fresh.workspace),
+                )
+                .map_err(|e| format!("{path}: {e}"))?;
+                new.handle = Some(Arc::new(handle));
                 new.gdal = Some(GdalOrigin { path: path.into(), layer: layer.into(), ..g.clone() });
             }
         } else if let Some(d) = &self.duckdb {
@@ -593,10 +867,36 @@ impl SourceLayer {
             {
                 let d =
                     DuckdbOrigin { database: Some(path.into()), table: table.map(String::from).or_else(|| d.table.clone()), ..d.clone() };
-                new.path = Some(rerun(&d).map_err(|e| format!("{path}: {e}"))?.display().to_string());
+                use rustgis_data::source::duckdb;
+                let database = duckdb::Database::File(path.into());
+                let name = d.table.as_deref().ok_or_else(|| format!("{path}: the DuckDB layer has no table"))?;
+                let table = duckdb::find_table_of(&database, name).map_err(|e| format!("{path}: {e}"))?;
+                let fresh = duckdb::convert_table_fresh(std::path::Path::new(path), &table, d.family, d.crs.as_deref())
+                    .map_err(|e| format!("{path}: {e}"))?;
+                let out = fresh.output;
+                if out.skipped > 0 {
+                    conversion_notes.push(format!("DuckDB: {} rows without a geometry were left out", out.skipped));
+                }
+                if out.other_family > 0 {
+                    conversion_notes.push(format!("DuckDB: {} rows of another geometry type were left out", out.other_family));
+                }
+                let part = out.parts.first().ok_or_else(|| format!("{path}: the table returns no {}", d.family.label()))?;
+                declared_empty = part.count == 0;
+                new.path = Some(part.path.display().to_string());
+                let handle = rustgis_data::source::parquet::ParquetSource::open_converted_path(
+                    &part.path,
+                    name,
+                    Some(std::path::Path::new(path)),
+                    Some(fresh.workspace),
+                )
+                .map_err(|e| format!("{path}: {e}"))?;
+                new.handle = Some(Arc::new(handle));
+                conversion_zm_dropped = false;
                 new.duckdb = Some(d);
             }
         } else {
+            declared_empty = false;
+            conversion_zm_dropped = false;
             new.path = Some(path.into());
             new.table = table.map(String::from).or_else(|| self.table.clone());
             if path.to_ascii_lowercase().ends_with(".gpkg")
@@ -613,7 +913,52 @@ impl SourceLayer {
                 }
             }
         }
-        new.open().map_err(|e| format!("{path}: {e}"))?;
+        let named = |e: &str| rustgis_data::diagnostics::message_with_address(path, e);
+        if new.handle.is_none() {
+            if path.to_ascii_lowercase().ends_with(".fgb") {
+                // Repair/reload prepare and probe a complete candidate on the caller's worker.
+                // A project-restored source instead uses open()'s asynchronous classification.
+                new.handle = Some(Arc::from(
+                    rustgis_data::source::open_path(std::path::Path::new(path), new.table.as_deref()).map_err(|e| named(&e.to_string()))?,
+                ));
+            } else {
+                new.open().map_err(|e| named(&e))?;
+            }
+        }
+        // Opening a header alone doesn't establish that its payload is readable. Probe the
+        // candidate, never the live source, before the caller commits the replacement.
+        let handle = new.handle.as_deref().ok_or_else(|| named("the replacement source didn't open"))?;
+        let probe = handle.read(&Request { extent: None, limit: 1 }).map_err(|e| named(&e.to_string()))?;
+        if probe.features.is_empty() && probe.skipped > 0 {
+            return Err(named(&format!(
+                "no readable features found while checking the replacement ({} rows could not be read)",
+                probe.skipped
+            )));
+        }
+        if probe.skipped > 0 {
+            conversion_notes.push(format!("{} rows could not be read while checking the replacement", probe.skipped));
+        }
+        if let Some(info) = new.info() {
+            let mut info = info.clone();
+            info.notes.extend(conversion_notes);
+            info.zm_dropped |= conversion_zm_dropped;
+            if declared_empty && probe.complete && probe.features.is_empty() && probe.skipped == 0 {
+                info.count = Some(0);
+            }
+            // Empty GeoParquet has no observed geometry_types. Only an actual, complete zero-row
+            // conversion may inherit its selected family's declaration.
+            if info.count == Some(0)
+                && info.geometry_type == rustgis_data::GeometryType::None
+                && let Some(d) = &new.duckdb
+            {
+                info.geometry_type = match d.family {
+                    rustgis_data::source::Family::Points => rustgis_data::GeometryType::Point,
+                    rustgis_data::source::Family::Lines => rustgis_data::GeometryType::Polyline,
+                    rustgis_data::source::Family::Polygons => rustgis_data::GeometryType::Polygon,
+                };
+            }
+            new.conversion_info = Some(info);
+        }
         Ok(new)
     }
 
@@ -679,12 +1024,58 @@ impl SourceLayer {
         }
     }
 
-    /// Opens the source again (after a project loads). A source by its web address is opened off
-    /// the frame: `Ok` while it is (see [`SourceLayer::is_pending`]), open once it has landed.
+    /// Installs only a successfully opened provenance conversion, preserving this layer's
+    /// settings and read generation while discarding state belonging to its previous reader.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn restored_conversion(&mut self, candidate: Result<SourceLayer, String>) -> Result<(), String> {
+        match candidate {
+            Ok(new) => {
+                self.path = new.path;
+                self.handle = new.handle;
+                self.conversion_info = new.conversion_info;
+                self.conversion_notes_unsaid = self.conversion_info.as_ref().map(|info| info.notes.clone()).unwrap_or_default();
+                self.opening = None;
+                self.reset();
+                self.clear_error();
+                self.login = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.error = Some(e.clone());
+                self.login = false;
+                Err(e)
+            }
+        }
+    }
+
+    /// Opens the source again (after a project loads). Web addresses and native FlatGeobuf date
+    /// scans open off the frame: `Ok` while pending, open once a later call installs the result.
     pub fn open(&mut self) -> Result<(), String> {
+        rustgis_data::source::remote::check_still(&rustgis_data::source::remote::current_still())?;
+        if self.reconnect_required {
+            self.error = Some(RECONNECT_REQUIRED.into());
+            return Err(RECONNECT_REQUIRED.into());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(slot) = self.opening.clone().filter(|slot| slot.progress.is_some()) {
+            let cancelled = slot.progress.as_ref().is_some_and(|p| rustgis_data::progress::Probe::cancelled(p.as_ref()));
+            let done =
+                if cancelled { Some(Err("opening the layer was cancelled".into())) } else { slot.lock().ok().and_then(|r| r.clone()) };
+            return match done {
+                Some(result) => {
+                    self.opening = None;
+                    self.opened(result)
+                }
+                None => Ok(()),
+            };
+        }
+        self.conversion_fallback = None;
+        self.conversion_notes_unsaid.clear();
         if let Some(url) = self.path.clone().filter(|p| rustgis_data::source::is_remote_name(p)) {
             return self.open_remote(&url);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut saved_conversion_note = None;
         let src = if let Some(pg) = &self.postgis {
             open_postgis(pg)
         } else if let Some(my) = &self.mysql {
@@ -693,13 +1084,70 @@ impl SourceLayer {
             open_sqlserver(ms)
         } else if let Some(bytes) = &self.embedded {
             let name = self.file_name.as_deref().unwrap_or("layer.parquet");
+            #[cfg(not(target_arch = "wasm32"))]
+            if name.to_ascii_lowercase().ends_with(".fgb") {
+                let name = std::path::Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                let prepared = rustgis_data::source::fgb::FgbSource::prepare_shared(rustgis_data::source::Shared(bytes.clone()), name);
+                return self.open_fgb(prepared);
+            }
             rustgis_data::source::open_shared(name, bytes.clone(), self.table.as_deref())
         } else if let Some(p) = &self.path {
             #[cfg(not(target_arch = "wasm32"))]
+            {
+                let path = std::path::Path::new(p);
+                if let Some(g) = &self.gdal
+                    && (!path.exists() || !persistent_conversion(path, rustgis_data::source::gdal::cache_dir()))
+                {
+                    let candidate = self.relinked(&g.path, None);
+                    if candidate.is_ok() || !path.exists() || rustgis_data::source::gdal::ReloadWorkspace::contains_file(path) {
+                        return self.restored_conversion(candidate);
+                    }
+                    if let Err(error) = candidate {
+                        saved_conversion_note = Some(format!("re-reading {} failed ({error}); showing the saved conversion", g.path));
+                    }
+                }
+                if let Some(d) = &self.duckdb
+                    && d.sql.is_none()
+                    && d.table.is_some()
+                    && let Some(database) = &d.database
+                    && matches!(rustgis_data::source::duckdb::Database::parse(database), rustgis_data::source::duckdb::Database::File(_))
+                    && (!path.exists() || !persistent_conversion(path, rustgis_data::source::duckdb::cache_dir()))
+                {
+                    let candidate = self.relinked(database, None);
+                    if candidate.is_ok() || !path.exists() || rustgis_data::source::duckdb::ReloadWorkspace::contains_file(path) {
+                        return self.restored_conversion(candidate);
+                    }
+                    if let Err(error) = candidate {
+                        saved_conversion_note = Some(format!("re-reading {database} failed ({error}); showing the saved conversion"));
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             let overridden = self.shapefile_crs.filter(|_| p.to_ascii_lowercase().ends_with(".shp"));
+            #[cfg(not(target_arch = "wasm32"))]
+            if p.to_ascii_lowercase().ends_with(".fgb") {
+                let path = std::path::Path::new(p);
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                let prepared = match &self.gdal {
+                    Some(g) => rustgis_data::source::fgb::FgbSource::prepare_converted_path(path, name, std::path::Path::new(&g.path)),
+                    None => rustgis_data::source::fgb::FgbSource::prepare_path(path, name),
+                };
+                self.conversion_fallback = saved_conversion_note;
+                return self.open_fgb(prepared);
+            }
             let opened = {
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(crs) = overridden {
+                if let Some(d) = &self.duckdb {
+                    use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                    let database = d.database.as_deref().map(Database::parse);
+                    let original = match &database {
+                        Some(Database::File(path)) => Some(path.as_path()),
+                        _ => None,
+                    };
+                    let path = std::path::Path::new(p);
+                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                    ParquetSource::open_converted_path(path, name, original, None).map(|src| Box::new(src) as Box<dyn FeatureSource>)
+                } else if let Some(crs) = overridden {
                     let name = std::path::Path::new(p).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
                     rustgis_data::source::shp::ShpSource::open_path_in(std::path::Path::new(p), name, Some(crs))
                         .map(|src| Box::new(src) as Box<dyn FeatureSource>)
@@ -709,46 +1157,42 @@ impl SourceLayer {
                 #[cfg(target_arch = "wasm32")]
                 rustgis_data::source::open_path(std::path::Path::new(p), self.table.as_deref())
             };
-            match (opened, &self.gdal) {
-                // The converted copy is gone (a cleared cache, another machine): convert again.
+            match (opened, &self.duckdb) {
+                // Queries and server origins retain their existing restoration restrictions.
                 #[cfg(not(target_arch = "wasm32"))]
-                // (Only when it is missing: a copy that's there but unreadable is reported as is.)
-                (Err(_), Some(g)) if !std::path::Path::new(p).exists() => {
-                    match rustgis_data::source::gdal::convert_one(std::path::Path::new(&g.path), &g.layer, g.family, g.crs.as_deref()) {
-                        Ok(Some(fresh)) => {
-                            let r = rustgis_data::source::open_path(&fresh, None);
-                            if r.is_ok() {
-                                self.path = Some(fresh.display().to_string());
-                            }
-                            r
+                (Err(_), Some(d)) if !std::path::Path::new(p).exists() => match rerun(d) {
+                    Ok(fresh) => {
+                        use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                        let database = d.database.as_deref().map(Database::parse);
+                        let original = match &database {
+                            Some(Database::File(path)) => Some(path.as_path()),
+                            _ => None,
+                        };
+                        let name = fresh.file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
+                        let r = ParquetSource::open_converted_path(&fresh, name, original, None)
+                            .map(|src| Box::new(src) as Box<dyn FeatureSource>);
+                        if r.is_ok() {
+                            self.path = Some(fresh.display().to_string());
                         }
-                        Ok(None) => Err(rustgis_data::DataError::Format(format!("{}: the layer has no features", g.path))),
-                        Err(e) => Err(e),
+                        r
                     }
-                }
-                (r, _) => match (r, &self.duckdb) {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    (Err(_), Some(d)) if !std::path::Path::new(p).exists() => match rerun(d) {
-                        Ok(fresh) => {
-                            let r = rustgis_data::source::open_path(&fresh, None);
-                            if r.is_ok() {
-                                self.path = Some(fresh.display().to_string());
-                            }
-                            r
-                        }
-                        Err(e) => Err(e),
-                    },
-                    (r, _) => r,
+                    Err(e) => Err(e),
                 },
+                (r, _) => r,
             }
         } else {
             return Err("the layer has no source".into());
         };
         match src {
             Ok(s) => {
+                self.conversion_info = None;
                 self.handle = Some(Arc::from(s));
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.conversion_fallback = saved_conversion_note;
+                }
                 self.window = None;
-                self.error = None;
+                self.clear_error();
                 self.login = false;
                 Ok(())
             }
@@ -761,10 +1205,98 @@ impl SourceLayer {
         }
     }
 
+    /// Keeps header-only opens synchronous and sends only full native date scans to a worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_fgb(&mut self, prepared: rustgis_data::Result<rustgis_data::source::fgb::FgbOpen>) -> Result<(), String> {
+        self.conversion_info = None;
+        self.login = false;
+        let prepared = match prepared {
+            Ok(p) => p,
+            Err(e) => return self.opened(Err(e.to_string())),
+        };
+        if prepared.needs_scan() {
+            self.open_local(move || prepared.finish().map(|source| Box::new(source) as Box<dyn FeatureSource>))
+        } else {
+            self.opened(prepared.finish().map(|source| Arc::new(source) as Arc<dyn FeatureSource>).map_err(|e| e.to_string()))
+        }
+    }
+
+    /// Opens a local FlatGeobuf off the frame: date classification scans the complete file.
+    /// Copies share its result and Cancel; the initiating authority is checked during the scan.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_local(&mut self, work: impl FnOnce() -> rustgis_data::Result<Box<dyn FeatureSource>> + Send + 'static) -> Result<(), String> {
+        let slot = Arc::new_cyclic(|owner| OpeningState {
+            result: Mutex::new(None),
+            still: rustgis_data::source::remote::current_still(),
+            progress: Some(Arc::new(OpeningProgress {
+                owner: owner.clone(),
+                cancelled: Default::default(),
+                done: AtomicU64::new(0),
+                total: AtomicU64::new(0),
+            })),
+        });
+        let land = Arc::downgrade(&slot);
+        let progress = slot.progress.clone();
+        let still = slot.still.clone();
+        let capture = rustgis_data::diagnostics::Capture::current();
+        let job = move || {
+            let _diagnostics = capture.enter();
+            let _progress = rustgis_data::progress::install(progress.map(|p| p as Arc<dyn rustgis_data::progress::Probe>));
+            let result = rustgis_data::source::remote::with_optional_still(still, || {
+                rustgis_data::progress::check()?;
+                let source = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                    .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("opening the layer failed unexpectedly".into())))?;
+                rustgis_data::progress::check()?;
+                Ok(Arc::from(source))
+            });
+            if let Some(slot) = land.upgrade()
+                && let Ok(mut out) = slot.lock()
+            {
+                *out = Some(result.map_err(|e: rustgis_data::DataError| e.to_string()));
+            }
+            wake();
+        };
+        self.handle = None;
+        self.clear_error();
+        self.reset();
+        if let Err(e) = std::thread::Builder::new().name("rustgis-source-open".into()).spawn(job) {
+            return self.opened(Err(format!("couldn't start opening the layer: {e}")));
+        }
+        self.conversion_info = None;
+        self.login = false;
+        self.opening = Some(slot);
+        Ok(())
+    }
+
+    /// A local date-classification scan still running: rows read, known total and Cancel state.
+    /// Completed hidden layers need no polling or status row until they are displayed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn opening_progress(&self) -> Option<(u64, u64, bool)> {
+        let slot = self.opening.as_ref()?;
+        let progress = slot.progress.as_ref()?;
+        if slot.lock().ok()?.is_some() {
+            return None;
+        }
+        Some((progress.done.load(Ordering::Relaxed), progress.total.load(Ordering::Relaxed), progress.cancelled.load(Ordering::Relaxed)))
+    }
+
+    /// Cancels a local source's schema scan, including source copies sharing that open.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn cancel_opening(&self) {
+        if let Some(progress) = self.opening.as_ref().and_then(|slot| slot.progress.as_ref()) {
+            progress.cancelled.store(true, Ordering::Relaxed);
+            wake();
+        }
+    }
+
     /// Opens a source by its web address: from what is fetched of it, else fetching its header
     /// (or footer) off the frame, taken by a later call when it has landed.
     fn open_remote(&mut self, url: &str) -> Result<(), String> {
         if let Some(slot) = self.opening.clone() {
+            if let Err(e) = rustgis_data::source::remote::check_still(&slot.still) {
+                self.opening = None;
+                return self.opened(Err(e));
+            }
             // A file that can't be read in place is downloaded whole into the same slot, by the
             // first copy to see it; the others wait on that download rather than start their own.
             let claimed = slot.lock().ok().is_some_and(|mut s| {
@@ -789,9 +1321,9 @@ impl SourceLayer {
         }
         match rustgis_data::source::open_url_now(url) {
             Ok(s) => self.opened(Ok(Arc::from(s))),
-            Err(e) if e.to_string().contains(rustgis_data::source::remote::READ_WHOLE) => self.open_whole(url, Arc::new(Mutex::new(None))),
+            Err(e) if e.to_string().contains(rustgis_data::source::remote::READ_WHOLE) => self.open_whole(url, OpeningState::new()),
             Err(e) if e.to_string().contains(rustgis_data::source::remote::NEED) => {
-                let slot: Opening = Arc::new(Mutex::new(None));
+                let slot = OpeningState::new();
                 let land = slot.clone();
                 self.opening = Some(slot);
                 rustgis_data::source::open_url(
@@ -800,7 +1332,7 @@ impl SourceLayer {
                         if let Ok(mut s) = land.lock() {
                             *s = Some(r.map(Arc::from).map_err(|e| e.to_string()));
                         }
-                        landed();
+                        wake();
                     }),
                 );
                 Ok(())
@@ -820,22 +1352,27 @@ impl SourceLayer {
         let name = url.split(['?', '#']).next().unwrap_or(url).rsplit('/').next().unwrap_or("layer").to_string();
         let table = self.table.clone();
         let url = url.to_string();
-        rustgis_data::source::remote::fetch_whole(
-            &url.clone(),
-            Box::new(move |r| {
-                let r = match r {
-                    Ok(bytes) => rustgis_data::source::open_shared(&name, Arc::new(bytes), table.as_deref())
-                        .map(Arc::from)
-                        .map_err(|e| format!("{url}: {e}")),
-                    Err(rustgis_data::source::remote::Failed::Other(e)) => Err(format!("{url}: {e}")),
-                    Err(e) => Err(format!("{url}: couldn't be downloaded ({e:?})")),
-                };
-                if let Ok(mut s) = land.lock() {
-                    *s = Some(r);
-                }
-                landed();
-            }),
-        );
+        let still = land.still.clone();
+        rustgis_data::source::remote::with_optional_still(still, || {
+            rustgis_data::source::remote::fetch_whole(
+                &url.clone(),
+                Box::new(move |r| {
+                    let r = match r {
+                        Ok(bytes) => rustgis_data::source::open_shared(&name, Arc::new(bytes), table.as_deref())
+                            .map(Arc::from)
+                            .map_err(|e| rustgis_data::diagnostics::message_with_address(&url, &e.to_string())),
+                        Err(rustgis_data::source::remote::Failed::Other(e)) => {
+                            Err(rustgis_data::diagnostics::message_with_address(&url, &e))
+                        }
+                        Err(e) => Err(rustgis_data::diagnostics::message_with_address(&url, &format!("couldn't be downloaded ({e:?})"))),
+                    };
+                    if let Ok(mut s) = land.lock() {
+                        *s = Some(r);
+                    }
+                    wake();
+                }),
+            );
+        });
         Ok(())
     }
 
@@ -844,7 +1381,7 @@ impl SourceLayer {
             Ok(s) => {
                 self.handle = Some(s);
                 self.window = None;
-                self.error = None;
+                self.clear_error();
                 Ok(())
             }
             Err(e) => {
@@ -854,7 +1391,7 @@ impl SourceLayer {
         }
     }
 
-    /// Waits (up to `timeout`) for a source by its web address to open: exports, which draw
+    /// Waits (up to `timeout`) for an asynchronous source open: exports, which draw
     /// what is there. Native only (in the browser nothing may wait).
     pub fn wait_open(&mut self, timeout: std::time::Duration) {
         #[cfg(not(target_arch = "wasm32"))]
@@ -873,8 +1410,37 @@ impl SourceLayer {
         self.handle.is_some()
     }
 
+    /// When `query` (on a layer of `fields`) can filter only a sample of a view, the source's
+    /// feature count (`None` when it doesn't say) and the most a view reads. That is when the view
+    /// isn't walked with it (a database, GeoJSON or LiDAR read in place, a file by its web address,
+    /// or a query using a row number), and the source holds more features than a view reads,
+    /// doesn't say how many, or the view read now is already a sample (of more bytes than a view
+    /// holds). `None` until open.
+    pub fn query_sample(&self, query: &str, fields: &[rustgis_data::Field]) -> Option<(Option<u64>, usize)> {
+        let h = self.handle.as_ref()?;
+        let most = match self.limit {
+            0 if h.remote().is_some() => REMOTE_VIEW_LIMIT,
+            0 => VIEW_LIMIT,
+            n => n,
+        };
+        let count = h.info().count;
+        let query = Query { text: query.to_string(), fields: fields.to_vec(), env: Default::default() };
+        let crowded = count.is_none_or(|c| c > most as u64) || self.sampled().is_some();
+        (window::walked(h.as_ref(), &query).is_none() && crowded).then_some((count, most))
+    }
+
     pub fn info(&self) -> Option<&SourceInfo> {
-        self.handle.as_deref().map(|h| h.info())
+        self.conversion_info.as_ref().or_else(|| self.handle.as_deref().map(|h| h.info()))
+    }
+
+    /// Takes the original-read failure once, only when a saved conversion opened instead.
+    pub fn take_conversion_fallback(&mut self) -> Option<String> {
+        self.conversion_fallback.take()
+    }
+
+    /// Takes diagnostics only from a fresh conversion performed by [`Self::open`].
+    pub fn take_conversion_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.conversion_notes_unsaid)
     }
 
     /// Every feature of the source, up to the read limit (a source by its web address fetching
@@ -902,6 +1468,25 @@ impl SourceLayer {
         self.pending.is_some() || self.opening.is_some()
     }
 
+    /// Suspends automatic reads without changing the serialized source definition or any password.
+    pub fn require_reconnect(&mut self) {
+        self.reconnect_required = true;
+        self.handle = None;
+        self.opening = None;
+        self.pending = None;
+        self.error = Some(RECONNECT_REQUIRED.into());
+    }
+
+    /// Whether the source still needs its owner to authorize a reconnect.
+    pub fn reconnect_required(&self) -> bool {
+        self.reconnect_required
+    }
+
+    /// Releases a source after its owner explicitly reconnects or validates exact peer retention.
+    pub fn allow_reconnect(&mut self) {
+        self.reconnect_required = false;
+    }
+
     /// Opens the source afresh, forgetting a failed or never-started open (and the window read
     /// from the old one): a source by its web address read again once what signs it has changed
     /// (its address, or the login behind it). Its symbology and place in the project stay.
@@ -909,16 +1494,76 @@ impl SourceLayer {
         self.handle = None;
         self.opening = None;
         self.pending = None;
-        self.error = None;
+        self.clear_error();
         self.login = false;
+        // A new opening may hold other values: what was said of the last one doesn't hold.
+        self.unread_dates = None;
+        self.rounded_dates = None;
+        self.unread_dates_said = false;
+        self.rounded_dates_said = false;
+        self.null_text = None;
+        self.null_text_said = false;
         self.reset();
         self.open()
+    }
+
+    /// Leaves a read under way to the layer this one was copied from, which takes it when it
+    /// lands: a copy drawn elsewhere (an export on a thread of its own) reads what it needs for
+    /// itself. The two would otherwise share the read, and the one that didn't take it would wait
+    /// for it forever. The copy decides its thinning by itself too, so the map's redraws never
+    /// wait for the export's.
+    pub fn detach_read(&mut self) {
+        self.pending = None;
+        self.render_lod = Default::default();
+    }
+
+    /// Whether `other` (a copy of this one) reads the same source the same way: the same file and
+    /// table, opened by the same open. One opened afresh since (`reopen`, a table replaced) is
+    /// another, whatever its path.
+    pub fn same_opening(&self, other: &SourceLayer) -> bool {
+        let handles = match (&self.handle, &other.handle) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        // A source by its web address still opening: the same open shares its slot.
+        let openings = match (&self.opening, &other.opening) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        handles && openings && self.path == other.path && self.table == other.table
     }
 
     /// Forgets the window, so the next view reads again (after the source changes).
     pub fn reset(&mut self) {
         self.render_lod = Default::default();
         self.reset_window();
+    }
+
+    /// Reads the view again, keeping the selection parked for the next read.
+    pub(crate) fn reread(&mut self) {
+        let selected = std::mem::take(&mut self.saved_selection);
+        self.reset_window();
+        self.saved_selection = selected;
+    }
+
+    /// Applies the layer's definition query (`fields` are the layer's) as views are read; a
+    /// different one reads the view again.
+    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field], env: &rustgis_data::query::Env) {
+        let text = text.map(str::trim).filter(|t| !t.is_empty());
+        let page = env.page.as_ref().filter(|_| text.is_some_and(rustgis_data::query::reads_series_page));
+        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice(), q.env.page.as_ref())) != text.map(|t| (t, fields, page)) {
+            self.query = text.map(|t| Query {
+                text: t.to_string(),
+                fields: fields.to_vec(),
+                env: rustgis_data::query::Env { page: page.cloned(), ..Default::default() },
+            });
+            // A source that can't be walked reads the same rows whatever the query.
+            if self.handle.as_ref().is_some_and(|h| h.visits_chunks()) {
+                self.reread();
+            }
+        }
     }
 
     /// Drops disposable view rows while retaining decisions about the unchanged full source.
@@ -968,7 +1613,9 @@ impl SourceLayer {
         let estimate = self.estimated_row_bytes;
         let full_read = self.full_read;
         let fields = self.window_fields;
-        let pending = Arc::new(Pending { extent, result: Mutex::new(None) });
+        let query = self.query.clone();
+        let still = rustgis_data::source::remote::current_still();
+        let pending = Arc::new(Pending { extent, result: Mutex::new(None), still: still.clone() });
         let p = pending.clone();
         // A source by its web address: the read runs as its bytes land (on the desktop and in
         // the browser alike), fetching what it needs in rounds.
@@ -976,7 +1623,7 @@ impl SourceLayer {
             let (h2, p2) = (h.clone(), p.clone());
             let work = Arc::new(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields)
+                    window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
                 }))
                 .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
             });
@@ -987,7 +1634,7 @@ impl SourceLayer {
                     if let Ok(mut slot) = p2.result.lock() {
                         *slot = Some(r.map_err(|e| e.to_string()));
                     }
-                    landed();
+                    wake();
                 }),
             );
             self.pending = Some(pending);
@@ -995,14 +1642,20 @@ impl SourceLayer {
             return;
         }
         let job = move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields)
-            }))
-            .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
-            .map_err(|e| e.to_string());
-            if let Ok(mut slot) = p.result.lock() {
-                *slot = Some(r);
-            }
+            rustgis_data::source::remote::with_optional_still(still.clone(), || {
+                let r = rustgis_data::source::remote::check_still(&still)
+                    .and_then(|()| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
+                        }))
+                        .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
+                        .map_err(|e| e.to_string())
+                    })
+                    .and_then(|r| rustgis_data::source::remote::check_still(&still).map(|()| r));
+                if let Ok(mut slot) = p.result.lock() {
+                    *slot = Some(r);
+                }
+            })
         };
         #[cfg(not(target_arch = "wasm32"))]
         if !block {
@@ -1023,7 +1676,7 @@ impl SourceLayer {
                 Err(e) => {
                     self.saved_selection.clear();
                     self.error = Some(format!("couldn't start reading the layer: {e}"));
-                    self.window = Some(Window { extent, complete: true, matched: 0, kept: 0 });
+                    self.window = Some(Window { extent, complete: true, matched: 0, kept: 0, filtered: false });
                 }
             }
             return;
@@ -1038,15 +1691,16 @@ impl SourceLayer {
         let Some(p) = self.pending.clone() else { return Polled::Idle };
         let start = web_time::Instant::now();
         loop {
-            let done = p.result.lock().ok().and_then(|mut r| r.take());
+            let done = p.result.lock().ok().and_then(|mut r| r.take()).map(|r| rustgis_data::source::remote::check_still(&p.still).and(r));
             match done {
                 Some(Ok((b, cache))) => {
                     self.pending = None;
                     self.estimated_row_bytes = cache.mean_bytes;
+                    let filtered = cache.filtered;
                     self.ready_cache = Some(cache);
-                    let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len() };
+                    let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len(), filtered };
                     self.window = Some(w);
-                    self.error = None;
+                    self.clear_error();
                     return Polled::Done(w, b);
                 }
                 Some(Err(e)) => {
@@ -1055,7 +1709,7 @@ impl SourceLayer {
                     self.saved_selection.clear();
                     self.error = Some(e.clone());
                     // Not read again until the view moves past it.
-                    self.window = Some(Window { extent: p.extent, complete: true, matched: 0, kept: 0 });
+                    self.window = Some(Window { extent: p.extent, complete: true, matched: 0, kept: 0, filtered: false });
                     return Polled::Failed(e);
                 }
                 None if block && cfg!(not(target_arch = "wasm32")) && start.elapsed() < web_time::Duration::from_secs(60) => {
@@ -1077,6 +1731,12 @@ impl SourceLayer {
     /// (features read, features matching) when the window is a sample of the view.
     pub fn sampled(&self) -> Option<(usize, u64)> {
         self.window.as_ref().filter(|w| !w.complete).map(|w| (w.kept, w.matched))
+    }
+
+    /// Whether the view read kept the definition query's matches, so [`SourceLayer::sampled`]
+    /// counts matches rather than every feature in view.
+    pub fn sampled_matches(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.filtered)
     }
 }
 
@@ -1108,6 +1768,16 @@ fn waker() -> &'static Mutex<Option<Arc<dyn Fn() + Send + Sync>>> {
     W.get_or_init(|| Mutex::new(None))
 }
 
+/// Something read in the background (a feature read, a source opened by its address, a raster's
+/// pixels read in place; outside this module, a Zarr step) has landed: the map redraws
+/// ([`generation`]) and the UI is woken.
+pub fn wake() {
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    if let Some(w) = waker().lock().ok().and_then(|w| w.clone()) {
+        w();
+    }
+}
+
 /// Called whenever a background read finishes (the UI asks for a repaint).
 pub fn set_waker(f: impl Fn() + Send + Sync + 'static) {
     if let Ok(mut w) = waker().lock() {
@@ -1120,8 +1790,307 @@ pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
+impl SourceLayer {
+    /// Persisted source address and local driver paths; handles and embedded data are opaque.
+    pub(crate) fn output_slots(&self) -> Vec<(crate::LayerRole, &str, bool, bool)> {
+        let SourceLayer {
+            path,
+            file_name: _,
+            table: _,
+            shapefile_crs: _,
+            embedded,
+            handle: _,
+            window: _,
+            render_lod: _,
+            pending: _,
+            projection: _,
+            ready_cache: _,
+            byte_budget: _,
+            estimated_row_bytes: _,
+            full_read: _,
+            saved_selection: _,
+            grids: _,
+            window_fields: _,
+            query: _,
+            opening: _,
+            error: _,
+            error_said: _,
+            login: _,
+            reconnect_required: _,
+            limit: _,
+            reads: _,
+            display_read_said: _,
+            area_counts: _,
+            area_features: _,
+            conversion_info: _,
+            conversion_fallback: _,
+            conversion_notes_unsaid: _,
+            unread_dates: _,
+            rounded_dates: _,
+            unread_dates_said: _,
+            rounded_dates_said: _,
+            null_text: _,
+            null_text_said: _,
+            gdal,
+            duckdb,
+            postgis,
+            mysql,
+            sqlserver,
+        } = self;
+        use crate::{LayerRole as R, paths};
+        let mut out = Vec::new();
+        if let Some(p) = path {
+            out.push((
+                R::Streamed,
+                p.as_str(),
+                true,
+                embedded.is_none()
+                    && gdal.is_none()
+                    && duckdb.is_none()
+                    && postgis.is_none()
+                    && mysql.is_none()
+                    && sqlserver.is_none()
+                    && paths::is_local(p),
+            ));
+        }
+        if let Some(g) = gdal {
+            out.push((R::GdalPath, g.path.as_str(), false, paths::is_local(&g.path)));
+        }
+        if let Some(d) = duckdb {
+            if let Some(p) = &d.database {
+                out.push((R::DuckDbDatabase, p.as_str(), true, paths::is_local(p)));
+            }
+            if let Some(sql) = &d.sql {
+                out.push((R::DuckDbSql, sql.as_str(), true, false));
+            }
+        }
+        if let Some(pg) = postgis {
+            out.push((R::PostgisDatabase, pg.database.as_str(), true, false));
+        }
+        if let Some(my) = mysql {
+            out.push((R::MysqlDatabase, my.database.as_str(), true, false));
+        }
+        if let Some(ms) = sqlserver {
+            out.push((R::SqlServerDatabase, ms.database.as_str(), true, false));
+        }
+        out
+    }
+
+    /// Resolves a prepared field without examining its written contents.
+    pub(crate) fn output_slot_mut(&mut self, role: crate::LayerRole) -> Option<&mut String> {
+        match role {
+            crate::LayerRole::Streamed => self.path.as_mut(),
+            crate::LayerRole::GdalPath => Some(&mut self.gdal.as_mut()?.path),
+            crate::LayerRole::DuckDbDatabase => self.duckdb.as_mut()?.database.as_mut(),
+            crate::LayerRole::DuckDbSql => self.duckdb.as_mut()?.sql.as_mut(),
+            crate::LayerRole::PostgisDatabase => Some(&mut self.postgis.as_mut()?.database),
+            crate::LayerRole::MysqlDatabase => Some(&mut self.mysql.as_mut()?.database),
+            crate::LayerRole::SqlServerDatabase => Some(&mut self.sqlserver.as_mut()?.database),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_layer_report_keeps_effective_conversion_notes_and_dimensions() {
+        use rustgis_data::{Dataset, GeometryType};
+        let mut original = Dataset::new("converted", GeometryType::Point, Vec::new());
+        original.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(1.0, 2.0))), Vec::new());
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&original).unwrap());
+        let handle = rustgis_data::source::open_shared("converted.fgb", bytes.clone(), None).unwrap();
+        let mut source = super::SourceLayer::from_bytes("converted.fgb", bytes, None, handle);
+        let mut info = source.info().unwrap().clone();
+        info.notes.push("conversion left out 2 source features".into());
+        info.zm_dropped = true;
+        source.conversion_info = Some(info);
+        let mut layer = crate::Layer::new(1, Dataset::new("layer", GeometryType::Point, Vec::new()));
+        layer.source = Some(source);
+        let (dataset, report) = layer.load_all_reported().unwrap();
+        assert!(dataset.zm_dropped);
+        assert_eq!(report.messages.iter().filter(|n| n.contains("conversion left out 2 source features")).count(), 1);
+        assert_eq!(dataset.features.len(), 1);
+        let (_, counted) = layer.load_all_counted().unwrap();
+        assert_eq!(counted.messages.iter().filter(|n| n.contains("conversion left out 2 source features")).count(), 1);
+        assert!(!counted.zm_noted, "a flag with no Z/M diagnostic cannot suppress the export warning");
+    }
+
+    /// Project-restored disk and embedded date sources schedule their classification, share
+    /// the pending open across copies, and expose typed dates only after it lands.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn restored_flatgeobuf_dates_open_off_the_frame_and_share_the_result() {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
+        let mut ds = Dataset::new("dates", GeometryType::Point, vec![Field::new("issued", FieldType::Date)]);
+        ds.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![Value::parse("2026-03-05", FieldType::Date)]);
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&ds).unwrap());
+        let path = std::env::temp_dir().join(format!("rustgis-date-open-{}.fgb", std::process::id()));
+        std::fs::write(&path, bytes.as_slice()).unwrap();
+        for mut source in [
+            super::SourceLayer { path: Some(path.display().to_string()), ..Default::default() },
+            super::SourceLayer { file_name: Some("dates.fgb".into()), embedded: Some(bytes), ..Default::default() },
+        ] {
+            source.open().unwrap();
+            assert!(!source.is_open() && source.is_pending());
+            let mut copy = source.clone();
+            source.wait_open(std::time::Duration::from_secs(5));
+            copy.wait_open(std::time::Duration::from_secs(5));
+            assert!(source.is_open(), "{:?}", source.error);
+            assert_eq!(source.info().unwrap().fields[0].ty, FieldType::Date);
+            assert!(source.same_opening(&copy));
+            // A direct reopen also discards the previous handle while its new scan runs.
+            source.open().unwrap();
+            assert!(!source.is_open() && source.is_pending());
+            source.wait_open(std::time::Duration::from_secs(5));
+            assert!(source.is_open(), "{:?}", source.error);
+            assert!(!source.same_opening(&copy));
+        }
+        // Repair and Reload need a finished, probed candidate before changing the layer.
+        let old = super::SourceLayer { path: Some("missing.fgb".into()), ..Default::default() };
+        let repaired = old.relinked(path.to_str().unwrap(), None).unwrap();
+        assert!(repaired.is_open() && !repaired.is_pending());
+        assert_eq!(repaired.info().unwrap().fields[0].ty, FieldType::Date);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Unread dates and rounded date-times are each said once, and saying one doesn't silence the
+    /// other, whichever a view read finds first.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn unread_and_rounded_date_notices_are_said_independently() {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
+        let mut ds = Dataset::new("dates", GeometryType::Point, vec![Field::new("at", FieldType::DateTime)]);
+        ds.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![Value::Null]);
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&ds).unwrap());
+        for unread_first in [true, false] {
+            let mut source =
+                super::SourceLayer { file_name: Some("dates.fgb".into()), embedded: Some(bytes.clone()), ..Default::default() };
+            source.open().unwrap();
+            source.wait_open(std::time::Duration::from_secs(5));
+            assert!(source.is_open(), "{:?}", source.error);
+            let (first, second): (&[usize], &[usize]) = if unread_first { (&[1], &[]) } else { (&[], &[1]) };
+            source.saw_unread_dates(first, second);
+            let said = source.take_unread_dates();
+            assert_eq!((said.0.is_some(), said.1.is_some()), (unread_first, !unread_first));
+            // The other kind, found by a later read, is still said; the said kind isn't again.
+            source.saw_unread_dates(&[2], &[2]);
+            let said = source.take_unread_dates();
+            assert_eq!((said.0.is_some(), said.1.is_some()), (!unread_first, unread_first), "unread first: {unread_first}");
+            assert_eq!(source.take_unread_dates(), (None, None));
+        }
+    }
+
+    /// A paused schema worker reports real progress; Cancel wins for every source copy and
+    /// prevents publishing its handle. Channels keep the cancellation boundary deterministic.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn local_schema_open_progress_and_cancel_are_shared() {
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut source = super::SourceLayer::default();
+        source
+            .open_local(move || {
+                rustgis_data::progress::begin(2);
+                rustgis_data::progress::step(1)?;
+                started.send(()).map_err(|_| rustgis_data::DataError::Cancelled)?;
+                wait.recv().map_err(|_| rustgis_data::DataError::Cancelled)?;
+                rustgis_data::progress::step(1)?;
+                Err(rustgis_data::DataError::Format("cancel must stop before this result".into()))
+            })
+            .unwrap();
+        ready.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let mut copy = source.clone();
+        assert_eq!(source.opening_progress(), Some((1, 2, false)));
+        copy.cancel_opening();
+        release.send(()).unwrap();
+        source.wait_open(std::time::Duration::from_secs(5));
+        copy.wait_open(std::time::Duration::from_secs(5));
+        for source in [&source, &copy] {
+            assert!(!source.is_open() && !source.is_pending());
+            assert!(source.error.as_deref().unwrap().contains("cancelled"));
+        }
+    }
+
+    #[test]
+    fn conversion_fallback_is_runtime_only_and_taken_once() {
+        let note = "re-reading original failed (missing); showing the saved conversion";
+        let mut source = super::SourceLayer { conversion_fallback: Some(note.into()), ..Default::default() };
+        let saved = serde_json::to_value(&source).unwrap();
+        assert!(saved.get("conversion_fallback").is_none());
+        let mut restored: super::SourceLayer = serde_json::from_value(saved).unwrap();
+        assert!(restored.take_conversion_fallback().is_none());
+        assert_eq!(source.take_conversion_fallback().as_deref(), Some(note));
+        assert!(source.take_conversion_fallback().is_none());
+    }
+
+    #[test]
+    fn opening_conversion_notes_are_runtime_only_and_taken_once() {
+        let note = "GDAL: 2 features of another geometry type were left out";
+        let mut source = super::SourceLayer { conversion_notes_unsaid: vec![note.into()], ..Default::default() };
+        let saved = serde_json::to_value(&source).unwrap();
+        assert!(saved.get("conversion_notes_unsaid").is_none());
+        let mut restored: super::SourceLayer = serde_json::from_value(saved).unwrap();
+        assert!(restored.take_conversion_notes().is_empty());
+        assert_eq!(source.take_conversion_notes(), vec![note]);
+        assert!(source.take_conversion_notes().is_empty());
+    }
+
+    /// A later frame's whole-file fallback owns the opening's carrier through send and landing.
+    #[test]
+    fn permission_policy_opening_fallback_retains_owner_outside_ambient_context() {
+        use rustgis_data::source::remote;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        for (owned, revoke) in [(true, false), (true, true), (false, false)] {
+            let live = Arc::new(AtomicBool::new(true));
+            let check = live.clone();
+            let still = owned.then(|| Arc::new(move || check.load(Ordering::SeqCst)) as remote::Still);
+            let held = Arc::new(Mutex::new(None));
+            let hold = held.clone();
+            let sends = Arc::new(AtomicUsize::new(0));
+            let count = sends.clone();
+            let ranges = Arc::new(AtomicUsize::new(0));
+            let range_count = ranges.clone();
+            let url = format!("https://opening-fallback.invalid/{owned}-{revoke}.fgb");
+            remote::forget_file(&url);
+            remote::set_fetcher(move |_, want, done| match want {
+                remote::Want::Whole => {
+                    let context = remote::current_still();
+                    assert_eq!(context.is_some(), owned, "the actual later-frame fallback must re-enter its saved carrier");
+                    *hold.lock().unwrap() = Some((context, done));
+                }
+                _ => {
+                    range_count.fetch_add(1, Ordering::SeqCst);
+                    done(Err(remote::Failed::NoRanges));
+                }
+            });
+            let mut source = super::SourceLayer { path: Some(url.clone()), ..Default::default() };
+            remote::with_optional_still(still, || source.open()).unwrap();
+            assert_eq!(ranges.load(Ordering::SeqCst), 1, "actual opening tried a range");
+            assert!(source.opening.is_some());
+            assert!(remote::current_still().is_none());
+            // The next frame starts outside the original synchronous scope.
+            source.open().unwrap();
+            let (context, done) = held.lock().unwrap().take().unwrap();
+            live.store(!revoke, Ordering::SeqCst);
+            let mut ds = rustgis_data::Dataset::new("fallback", rustgis_data::GeometryType::Point, vec![]);
+            ds.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0., 0.))), vec![]);
+            let result = remote::check_still(&context).map_err(remote::Failed::Other).map(|()| {
+                count.fetch_add(1, Ordering::SeqCst);
+                rustgis_data::source::fgb::write(&ds).unwrap()
+            });
+            done(result);
+            assert_eq!(source.open().is_err(), revoke);
+            assert_eq!(source.is_open(), !revoke, "a revoked landing must never install the source");
+            assert_eq!(sends.load(Ordering::SeqCst), usize::from(!revoke));
+            assert!(remote::current_still().is_none());
+            remote::forget_file(&url);
+        }
+    }
+
     /// Reopening this same layer must invalidate populated decisions even without `reset`.
     #[test]
     fn reopening_a_populated_thinning_cache_uses_the_new_handle() {
@@ -1176,6 +2145,21 @@ mod tests {
         assert_eq!(super::row_hash(&f), fnv);
         // And the value itself: a change in how rows are written would show every saved row edited.
         assert_eq!(super::row_hash(&f), 8_547_063_913_914_077_080);
+    }
+
+    /// Clearing a non-finite source cell is a write-back update even though output JSON uses Null.
+    #[test]
+    fn clearing_nonfinite_source_values_is_a_row_update() {
+        use rustgis_data::{Feature, Value};
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let loaded = Feature { id: 1, geometry: None, attrs: vec![Value::Float(number)] };
+            let versions: super::Versions = [(1, super::RowVersion { version: 7, hash: super::row_hash(&loaded) })].into_iter().collect();
+            assert!(versions.changes(std::slice::from_ref(&loaded)).is_empty());
+            let cleared = Feature { attrs: vec![Value::Null], ..loaded };
+            let changes = versions.changes(std::slice::from_ref(&cleared));
+            assert_eq!(changes.updates.iter().map(|(feature, version)| (feature.id, *version)).collect::<Vec<_>>(), [(1, 7)]);
+            assert_eq!(changes.updates[0].0.attrs, [Value::Null]);
+        }
     }
 
     #[test]

@@ -11,23 +11,23 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("map.zoomFull", "Full Extent", "Home › Navigate", zoom_full).view(),
-        C::new("map.zoomIn", "Fixed Zoom In", "Home › Navigate", |s, _| zoom(s, 2.0)).view().key("Mod+="),
-        C::new("map.zoomOut", "Fixed Zoom Out", "Home › Navigate", |s, _| zoom(s, 0.5)).view().key("Mod+-"),
+        C::new("map.zoomFull", "Full Extent", "Home › Navigate", zoom_full).roles(&[]).effects(crate::policy::Effects::NONE).view(),
+        C::new("map.zoomIn", "Fixed Zoom In", "Home › Navigate", |s, _| zoom(s, 2.0)).roles(&[]).effects(crate::policy::Effects::NONE).view().key("Mod+="),
+        C::new("map.zoomOut", "Fixed Zoom Out", "Home › Navigate", |s, _| zoom(s, 0.5)).roles(&[]).effects(crate::policy::Effects::NONE).view().key("Mod+-"),
         C::new("map.prevExtent", "Previous Extent", "Home › Navigate", |s, _| {
             if s.extent_back() { Ok(Value::Null) } else { Err("no previous extent".into()) }
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()
         .when(|s| if s.can_extent_back() { None } else { Some("no previous extent") }),
         C::new("map.nextExtent", "Next Extent", "Home › Navigate", |s, _| {
             if s.extent_forward() { Ok(Value::Null) } else { Err("no next extent".into()) }
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()
         .when(|s| if s.can_extent_forward() { None } else { Some("no next extent") }),
         C::new("map.zoomWorld", "Zoom To World", "Home › Navigate", |s, _| {
             s.zoom_to(&Extent::new(-170.0, -58.0, 180.0, 78.0));
             Ok(Value::Null)
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         C::new("map.extent", "View Extent", "Home › Navigate", |s, _| {
             let e = if s.map().projection.is_globe() { Extent::new(-180.0, -90.0, 180.0, 90.0) } else { super::workspace::view_extent(s) };
@@ -35,26 +35,29 @@ pub fn commands() -> Vec<C> {
                 return Err("the view shows no part of the Earth".into());
             }
             Ok(json!({"extent": [e.min_x, e.min_y, e.max_x, e.max_y]}))
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
-        C::new("map.zoomToExtent", "Zoom To Extent", "Home › Navigate", zoom_to_extent)
+        C::new("map.zoomToExtent", "Zoom To Extent", "Home › Navigate", zoom_to_extent).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .params(r#"{"extent": [minLon, minLat, maxLon, maxLat]}"#),
-        C::new("map.goToXY", "By Coordinates…", "Home › Navigate › Locate", go_to_xy)
+        C::new("map.goToXY", "By Coordinates…", "Home › Navigate › Locate", go_to_xy).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
-            .params(r#"{"lon" | "x": number, "lat" | "y": number, "scale"?: number, "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85)}"#),
-        C::new("map.goToLink", "Go To Map Link", "Home › Navigate", go_to_link)
+            .params(r#"{"lon" | "x": degrees (-74.006, or text such as 74°0′22″W), "lat" | "y": degrees (40.7128, or text such as 40°42′46″N), "position"?: text in place of lon and lat, as the search box reads it, latitude first (40.7128, -74.006; 18north 583959 4507351; 18TWL8395907350), "scale"?: number, "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85)}"#),
+        C::new("map.convertPosition", "Convert Position", "Home › Navigate › Locate", convert_position).roles(&[]).effects(crate::policy::Effects::NONE)
+            .view()
+            .params(r#"{"lon" | "x": degrees (-74.006, or text such as 74°0′22″W), "lat" | "y": degrees (40.7128, or text such as 40°42′46″N), "position"?: text in place of lon and lat, as the search box reads it, latitude first (40.7128, -74.006; 18north 583959 4507351; 18TWL8395907350; Z AC 77146 62481), "digits"?: MGRS digits per axis, 0 (100 km) to 5 (1 m, the default)}"#),
+        C::new("map.goToLink", "Go To Map Link", "Home › Navigate", go_to_link).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"url": a map link ending in #zoom/lat/lon[/bearing[/pitch]] (as MapLibre writes them; also #map=…), or just zoom/lat/lon[/bearing[/pitch]]}"#),
         C::new("map.link", "Map Link", "Home › Navigate", |s, _| {
             let hash = link_of(s.map()).ok_or("the view shows no part of the Earth")?;
             Ok(json!({"hash": hash}))
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
-        C::new("map.setBearing", "Rotate Map", "Home › Navigate", set_bearing)
+        C::new("map.setBearing", "Rotate Map", "Home › Navigate", set_bearing).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .params(r#"{"bearing": degrees clockwise from north (the direction the top of the view faces) | "by": degrees to turn it further}"#),
-        C::new("map.setPitch", "Tilt Map", "Home › Navigate", set_pitch)
+        C::new("map.setPitch", "Tilt Map", "Home › Navigate", set_pitch).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .params(r#"{"pitch": degrees of tilt from looking straight down (0 to 85) | "by": degrees to tilt it further}"#),
         C::new("map.resetNorth", "Reset North", "Home › Navigate", |s, _| {
@@ -63,29 +66,25 @@ pub fn commands() -> Vec<C> {
             m.camera.set_pitch(0.0);
             s.record_extent();
             Ok(Value::Null)
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         C::new("map.setScale", "Set Scale", "Status Bar", |s, p| {
             let sc = f(p, "scale").ok_or("scale is required")?;
             s.map_mut().set_scale(sc);
             s.record_extent();
             Ok(Value::Null)
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()
         .params(r#"{"scale": number}"#),
-        C::new("map.basemap", "Basemap", "Home › Add", basemap)
+        C::new("map.basemap", "Basemap", "Home › Add", basemap).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"name": "paper"|"midnight"|"ocean"|"atlas"|"blank", "keepTiles"?: bool (keeps the web tile basemaps over it)}"#),
-        C::new("map.graticule", "Graticule", "View › Display", |s, p| {
-            let m = s.map_mut();
-            m.graticule = super::b(p, "on").unwrap_or(!m.graticule);
-            Ok(Value::Null)
-        })
-        .params(r#"{"on"?: bool (toggles when omitted)}"#),
+        C::new("map.graticule", "Graticule", "View › Display", graticule).roles(&[]).effects(crate::policy::Effects::NONE)
+        .params(r#"{"on"?: bool (toggles when omitted, on when a type or crs is given), "type"?: "degrees"|"measured"|"utm", "crs"?: a projected system for the measured grid (EPSG:2056, WKT or a PROJ string; "" or null: the map's own when projected, else the UTM zone at the view's centre)}"#),
         C::new("map.reloadWebLayers", "Reload Web Layers", "View › Display", |_, _| {
             // The map view draws again when the tile cache's generation moves.
             crate::render::rustgis_tiles::cache::clear();
             Ok(json!({"generation": crate::render::rustgis_tiles::cache::generation()}))
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         C::new("map.projection", "Globe", "View › View", |s, p| {
             // A preset's parameters, over those of `type` or of the map's own preset.
@@ -111,18 +110,18 @@ pub fn commands() -> Vec<C> {
                 super::workspace::fill_cache(s);
             }
             Ok(out)
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"type"?: "mercator"|"globe"|preset id (with parameters: "robinson +lon_0=150")|"EPSG:<code>"|"ESRI:<code>" (toggles the globe when omitted), "lon_0"?: degrees (a preset's central meridian), "lat_1"?, "lat_2"?: degrees (a conic preset's standard parallels; these apply to the map's own preset when type is omitted)}"#),
         C::new("map.projections", "Projections", "View › View", |_, _| {
             let mut v = vec![json!({"id": "mercator", "label": "Web Mercator"}), json!({"id": "globe", "label": "Globe"})];
             v.extend(rustgis_map::projection::PRESETS.iter().map(|(id, label, _)| json!({"id": id, "label": label})));
             Ok(Value::Array(v))
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
-        C::new("bookmark.add", "New Bookmark", "Home › Navigate › Bookmarks", add_bookmark).params(
+        C::new("bookmark.add", "New Bookmark", "Home › Navigate › Bookmarks", add_bookmark).inputs(map_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"name"?: string (a number is added when another bookmark has it), "description"?: string, "map"?: name (default: the active map; its current view)}"#,
         ),
-        C::new("bookmark.go", "Go To Bookmark", "Home › Navigate › Bookmarks", go_bookmark)
+        C::new("bookmark.go", "Go To Bookmark", "Home › Navigate › Bookmarks", go_bookmark).inputs(bookmark_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .params(r#"{"name": string, "map"?: name (the bookmark's map), "pan"?: bool (keep the current scale)}"#),
         C::new("bookmark.remove", "Remove Bookmark", "Home › Navigate › Bookmarks", |s, p| {
@@ -131,17 +130,18 @@ pub fn commands() -> Vec<C> {
                 m.bookmarks.remove(bi);
             }
             Ok(Value::Null)
-        })
+        }).inputs(bookmark_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string, "map"?: name (default: the active map)}"#),
         C::new("bookmark.rename", "Rename Bookmark", "Bookmarks", |s, p| {
             let new = ps(p, "newName").map(str::trim).filter(|n| !n.is_empty()).ok_or("newName is required")?;
+            let new = super::within("newName", "a bookmark's name", new, MAX_BOOKMARK_NAME)?;
             let (mi, bi) = bookmark_at(s, p)?;
-            let name = unique_bookmark_name(s, mi, Some(bi), new);
+            let name = unique_bookmark_name(s, mi, Some(bi), &new);
             if let Some(b) = s.project.maps.get_mut(mi).and_then(|m| m.bookmarks.get_mut(bi)) {
                 b.name = name.clone();
             }
             Ok(json!({"name": name}))
-        })
+        }).inputs(bookmark_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string, "newName": string (a number is added when another bookmark has it), "map"?: name}"#),
         C::new("bookmark.update", "Update Bookmark", "Bookmarks", |s, p| {
             let (mi, bi) = bookmark_at(s, p)?;
@@ -156,16 +156,16 @@ pub fn commands() -> Vec<C> {
                 }
             }
             Ok(Value::Null)
-        })
+        }).inputs(bookmark_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string (it takes the current view; its map must be in view), "map"?: name}"#),
         C::new("bookmark.describe", "Bookmark Description", "Bookmarks", |s, p| {
-            let text: String = ps(p, "description").ok_or("description is required")?.trim().chars().take(MAX_DESCRIPTION).collect();
+            let text = super::within("description", "a bookmark's description", ps(p, "description").ok_or("description is required")?.trim(), MAX_DESCRIPTION)?;
             let (mi, bi) = bookmark_at(s, p)?;
             if let Some(b) = s.project.maps.get_mut(mi).and_then(|m| m.bookmarks.get_mut(bi)) {
                 b.description = text;
             }
             Ok(Value::Null)
-        })
+        }).inputs(bookmark_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string, "description": string (empty clears it), "map"?: name}"#),
         C::new("bookmark.move", "Move Bookmark", "Bookmarks", |s, p| {
             let to = super::uint(p, "to").ok_or("to is required (an index)")?;
@@ -176,48 +176,42 @@ pub fn commands() -> Vec<C> {
                 m.bookmarks.insert(to, b);
             }
             Ok(Value::Null)
-        })
+        }).inputs(bookmark_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string, "to": index (0: first; past the end: last), "map"?: name}"#),
-        C::new("bookmark.save", "Export Bookmarks", "Home › Navigate › Bookmarks", |s, p| super::items::save_item(s, "bookmarks", p))
+        C::new("bookmark.save", "Export Bookmarks", "Home › Navigate › Bookmarks", |s, p| super::items::save_item(s, "bookmarks", p)).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"path": "*.rgisbookmarks"}"#),
-        C::new("bookmark.import", "Import Bookmarks", "Home › Navigate › Bookmarks", import_bookmarks)
+        C::new("bookmark.import", "Import Bookmarks", "Home › Navigate › Bookmarks", import_bookmarks).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .params(r#"{"path"?: "*.rgisbookmarks", "text"?: bookmarks JSON, "data"?: base64 file}"#),
-        C::new("map.new", "New Map", "Home › Project", new_map).params(r#"{"name"?: string}"#),
+        C::new("map.new", "New Map", "Home › Project", new_map).transition(unmodelled_transition).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name"?: string}"#),
         C::new("map.activate", "Activate Map", "Browser", |s, p| {
-            let n = s_name(p)?;
-            let i = s.project.maps.iter().position(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no map '{n}'"))?;
-            s.project.active_map = i;
-            s.active_layer = s.map().layers.first().map(|l| l.id);
+            let choice = activation(&super::InputSource::input_context(&*s), p)?;
+            let choice = choice.ok_or("no activation choice")?;
+            s.project.active_map = choice.map;
+            s.active_layer = choice.layer;
             s.table_layer = None;
             Ok(Value::Null)
-        })
+        }).inputs(required_map_inputs).transition(activation).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string}"#)
         .view(),
         C::new("map.rename", "Rename Map", "Layers", |s, p| {
-            let n = s_name(p)?.trim();
-            if n.is_empty() {
-                return Err("name is required".into());
-            }
-            let i = map_at(s, p)?;
+            let (i, name) = rename_choice(&super::InputSource::input_context(&*s), p)?;
             let old = s.project.maps.get(i).map(|m| m.name.clone()).ok_or("no map")?;
-            // Unique among the other maps, so a name finds one map (tabs, Browser, map frames).
-            let name = super::numbered(n, |n| s.project.maps.iter().enumerate().any(|(j, m)| j != i && m.name.eq_ignore_ascii_case(n)));
+            super::workspace::bind_offline_map_before_rename(&mut s.project, i)?;
             if let Some(m) = s.project.maps.get_mut(i) {
                 m.name = name.clone();
             }
             follow_renamed_map(s, &old, &name);
             Ok(json!({"name": name}))
-        })
+        }).transition(rename_transition).inputs(map_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string (the new name; a number is added when another map has it), "map"?: name (default: the active map)}"#),
-        C::new("map.duplicate", "Duplicate Map", "Browser", duplicate_map)
+        C::new("map.duplicate", "Duplicate Map", "Browser", duplicate_map).transition(unmodelled_transition).inputs(duplicate_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"map"?: name (default: the active map), "name"?: string (default: "<map> copy"; a number is added when another map has it)}"#),
         C::new("map.remove", "Delete Map", "Browser", |s, p| {
             if s.project.maps.len() < 2 {
                 return Err("a project keeps at least one map".into());
             }
-            let n = s_name(p)?;
-            let i = s.project.maps.iter().position(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no map '{n}'"))?;
+            let i = required_map_at(s,p)?;
             s.project.maps.remove(i);
             // Deleting another map keeps the one in view (a map tab's close button).
             let active = s.project.active_map;
@@ -229,7 +223,7 @@ pub fn commands() -> Vec<C> {
                 s.table_layer = None;
             }
             Ok(Value::Null)
-        })
+        }).transition(unmodelled_transition).inputs(required_map_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name": string}"#),
     ]
 }
@@ -254,9 +248,11 @@ fn s_name(p: &Value) -> Result<&str, String> {
 
 /// The map `map` names (default: the active one). A `map` that isn't a name is an error, never
 /// the active map.
-pub(crate) fn map_at(s: &Session, p: &Value) -> Result<usize, String> {
+pub(crate) fn map_at(input: &impl super::InputSource, p: &Value) -> Result<usize, String> {
+    let context = input.input_context();
+    let s = &context;
     match p.get("map") {
-        None | Some(Value::Null) => Ok(s.project.active_map),
+        None | Some(Value::Null) => Ok(s.active_map),
         Some(Value::String(m)) => s.project.maps.iter().position(|x| x.name.eq_ignore_ascii_case(m)).ok_or_else(|| format!("no map '{m}'")),
         Some(_) => Err("map must be a map's name".into()),
     }
@@ -268,7 +264,9 @@ fn duplicate_map(s: &mut Session, p: &Value) -> CmdResult {
     let i = map_at(s, p)?;
     let mut m = s.project.maps.get(i).ok_or("no map")?.clone();
     m.name = super::copy_name(ps(p, "name"), &m.name, |n| s.project.maps.iter().any(|x| x.name.eq_ignore_ascii_case(n)));
+    m.offline_area_id = None;
     m.label_lock = None;
+    m.label_lock_line_anchors.clear();
     m.renew_instance_id();
     for l in &mut m.layers {
         l.renew_instance_id();
@@ -288,7 +286,7 @@ fn duplicate_map(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Points layout map frames, presentation map pages and offline areas at a renamed map (#287),
 /// so they keep finding it.
-fn follow_renamed_map(s: &mut Session, old: &str, new: &str) {
+pub(crate) fn follow_renamed_map(s: &mut Session, old: &str, new: &str) {
     let renamed = |m: &mut String| {
         if m.eq_ignore_ascii_case(old) {
             *m = new.to_string();
@@ -337,12 +335,340 @@ fn zoom(s: &mut Session, factor: f64) -> CmdResult {
     Ok(Value::Null)
 }
 
-pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
-    let lon = f(p, "lon").or_else(|| f(p, "x")).ok_or("lon is required")?;
-    let lat = f(p, "lat").or_else(|| f(p, "y")).ok_or("lat is required")?;
+/// A place typed as the search box reads one: latitude, then longitude, in decimal degrees,
+/// degrees and minutes or degrees, minutes and seconds (`40.7128, -74.006`,
+/// `40°42'46"N 74°0'22"W`), or on the Earth's map a UTM position or an MGRS reference
+/// (`18north 583959 4507351`, `18TWL8395907350`). A reference that names no place says why, as
+/// the search box does. What the reading assumed comes with the place, for a notice
+/// ([`PositionRead`]).
+pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, PositionRead), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("the position is empty".into());
+    }
+    if text.chars().nth(super::search::MAX_CHARS).is_some() {
+        return Err(format!("the position is longer than {} characters", super::search::MAX_CHARS));
+    }
+    if let Some(c) = super::search::parse_lat_lon(text) {
+        // Without N, S, E or W the order is the reader's assumption, so it is said.
+        let lettered = text.chars().any(|c| matches!(c.to_ascii_uppercase(), 'N' | 'S' | 'E' | 'W'));
+        return Ok((c, if lettered { PositionRead::AsWritten } else { PositionRead::Ordered }));
+    }
+    // Two plain decimal numbers (`40.7, 200`) that aren't a latitude and a longitude: out of
+    // range, not misspelled.
+    let plain = |w: &&str| {
+        let digits = w.strip_prefix(['-', '+']).unwrap_or(w);
+        digits.chars().any(|c| c.is_ascii_digit())
+            && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && digits.chars().filter(|&c| c == '.').count() <= 1
+    };
+    let words: Vec<&str> = text.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()).collect();
+    if words.len() == 2 && words.iter().all(plain) {
+        return Err("latitude must be within ±90 and longitude within ±180".into());
+    }
+    let degrees = "write a position as latitude, then longitude (40.7128, -74.006 or 40°42'46\"N 74°0'22\"W)";
+    if !map.body().is_earth() {
+        // A grid reference is told why; anything else how a place is written here.
+        return Err(match super::search::read_grid_reference(text) {
+            Err(rustgis_geom::GridError::Syntax) => degrees.into(),
+            _ => "UTM and MGRS are the Earth's grids and name no place on this map; write a position as latitude, then longitude".into(),
+        });
+    }
+    match super::search::read_grid_reference(text) {
+        Ok(c) => Ok((
+            c,
+            rustgis_geom::parse_mgrs(text)
+                .ok()
+                .filter(|m| m.digits < 5)
+                .map_or(PositionRead::AsWritten, |m| PositionRead::Square(m.precision_m())),
+        )),
+        Err(rustgis_geom::GridError::Syntax) => Err(format!("{degrees}, UTM (18north 583959 4507351) or MGRS (18TWL8395907350)")),
+        Err(e) => Err(format!("no place at this grid reference: {e}")),
+    }
+}
+
+/// What reading a typed position assumed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PositionRead {
+    /// Nothing: hemisphere letters, a UTM position or an MGRS reference to the meter.
+    AsWritten,
+    /// Two numbers without N, S, E or W, taken as latitude, then longitude (or the other way
+    /// round when the first can only be a longitude): the order is said, so `2.35, 48.85` typed
+    /// as x, y shows where it went.
+    Ordered,
+    /// An MGRS reference coarser than a meter, which names a square of this side in meters: the
+    /// place is its center.
+    Square(f64),
+}
+
+/// One axis typed on its own, as By Coordinates' Longitude (X) and Latitude (Y) boxes take it:
+/// decimal degrees (`-74.006`), or degrees, minutes and seconds with or without marks and a
+/// hemisphere letter before or after (`74°0′22″W`, `W 74 0 22`, `40 42 46.1 N`). A letter of the
+/// other axis (N in the longitude) is refused rather than taken as the other axis.
+pub(crate) fn read_axis(text: &str, latitude: bool) -> Result<f64, String> {
+    let name = if latitude { "latitude" } else { "longitude" };
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(format!("the {name} is empty"));
+    }
+    if text.chars().nth(64).is_some() {
+        return Err(format!("the {name} is longer than 64 characters"));
+    }
+    let (own, other) = if latitude { (['N', 'S'], ['E', 'W']) } else { (['E', 'W'], ['N', 'S']) };
+    // A letter at either end is a hemisphere only in text that is otherwise a number: a word
+    // ending in N, S, E or W (`Paris`, `Lisbon`) gets the usage message, not a refusal as the
+    // other axis.
+    let hemispheres_only = text.chars().all(|c| !c.is_ascii_alphabetic() || matches!(c.to_ascii_uppercase(), 'N' | 'S' | 'E' | 'W'));
+    let mut hemisphere = None;
+    let mut rest = text;
+    for at_end in [false, true] {
+        let c = if at_end { rest.chars().next_back() } else { rest.chars().next() };
+        if let Some(c) = c.map(|c| c.to_ascii_uppercase())
+            && hemispheres_only
+            && (own.contains(&c) || other.contains(&c))
+        {
+            if other.contains(&c) {
+                return Err(format!("{c} belongs to the {}; write the {name} here", if latitude { "longitude" } else { "latitude" }));
+            }
+            if hemisphere.replace(c).is_some() {
+                return Err(format!("the {name} has two hemisphere letters"));
+            }
+            // The letter is ASCII, one byte.
+            rest = if at_end { rest.get(..rest.len().saturating_sub(1)) } else { rest.get(1..) }.unwrap_or("").trim();
+        }
+    }
+    // One value a box: a comma is a decimal comma or a second value, neither of which is read here.
+    if rest.contains(',') {
+        return Err(format!("the {name} box takes one value, with a point for decimals (-74.006, not -74,006 or two numbers)"));
+    }
+    let usage = || format!("write the {name} in degrees (-74.006) or degrees, minutes and seconds (74°0′22″W)");
+    // Each number goes where its mark says (° degrees, ′ minutes, ″ seconds), so `40°30″` is 40°
+    // and 30 seconds, not 30 minutes; a number without a mark takes the place after the last.
+    let mark = |c: char| match c {
+        '°' | 'º' => Some(0),
+        '\'' | '′' | '’' => Some(1),
+        '"' | '″' | '”' => Some(2),
+        _ => None,
+    };
+    let mut places: [Option<f64>; 3] = [None; 3];
+    let mut next = 0usize;
+    let mut number = String::new();
+    let mut last: Option<usize> = None;
+    // A number, once read, waits for a mark that may follow it; it is placed when the next number
+    // starts or the text ends.
+    let mut pending: Option<f64> = None;
+    let mut place = |v: f64, at: Option<usize>, next: &mut usize, last: &mut Option<usize>| -> Result<(), String> {
+        let at = at.unwrap_or(*next);
+        let slot = places.get_mut(at).ok_or_else(usage)?;
+        if slot.is_some() || last.is_some_and(|l| at <= l) {
+            return Err(format!("the {name}'s degrees, minutes and seconds are out of order"));
+        }
+        *slot = Some(v);
+        *last = Some(at);
+        *next = at + 1;
+        Ok(())
+    };
+    let finish = |number: &mut String| -> Result<Option<f64>, String> {
+        if number.is_empty() {
+            return Ok(None);
+        }
+        let v: f64 = number.replace('−', "-").parse().map_err(|_| usage())?;
+        number.clear();
+        if !v.is_finite() {
+            return Err(usage());
+        }
+        Ok(Some(v))
+    };
+    for c in rest.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | '−') {
+            number.push(c);
+            continue;
+        }
+        if let Some(v) = finish(&mut number)? {
+            if let Some(p) = pending.take() {
+                place(p, None, &mut next, &mut last)?;
+            }
+            pending = Some(v);
+        }
+        if let Some(at) = mark(c) {
+            let v = pending.take().ok_or_else(usage)?;
+            place(v, Some(at), &mut next, &mut last)?;
+        } else if !c.is_whitespace() {
+            return Err(usage());
+        }
+    }
+    if let Some(p) = pending.take() {
+        place(p, None, &mut next, &mut last)?;
+    }
+    // Degrees come first; a place skipped before a later one is zero (`40°30″` is 40° 0′ 30″).
+    let filled = last.ok_or_else(usage)? + 1;
+    if places.first().is_none_or(Option::is_none) {
+        return Err(usage());
+    }
+    let nums: Vec<f64> = places.iter().take(filled).map(|v| v.unwrap_or(0.0)).collect();
+    // Minutes follow whole degrees and seconds whole minutes (`48.85 2.35` is two values, not
+    // degrees and minutes).
+    if nums.iter().rev().skip(1).any(|v| v.fract() != 0.0) {
+        return Err(usage());
+    }
+    if hemisphere.is_some() && nums.first().is_some_and(|d| d.is_sign_negative()) {
+        return Err(format!("the {name} has both a minus sign and a hemisphere letter"));
+    }
+    // The degrees, minutes and seconds as the search box sums them.
+    let mut v = super::search::axis(&nums).ok_or_else(|| format!("the {name}'s minutes and seconds must be from 0 to under 60"))?;
+    if matches!(hemisphere, Some('S' | 'W')) {
+        v = -v;
+    }
+    let limit = if latitude { 90.0 } else { 180.0 };
+    if v.abs() > limit {
+        return Err(format!("the {name} must be within ±{limit}"));
+    }
+    Ok(v)
+}
+
+/// A number of degrees as typed back to the user: six decimals at most, no trailing zeros.
+fn degrees_text(v: f64) -> String {
+    let v = (v * 1e6).round() / 1e6;
+    if v == 0.0 { "0".into() } else { format!("{v}") }
+}
+
+/// The place a command's parameters give, as `map.goToXY` and `map.convertPosition` take it: a
+/// `position` written as the search box reads one, or `lon` and `lat` (or `x` and `y`), each a
+/// number or text in degrees, minutes and seconds. With it, what the reading assumed, for a
+/// notice: two bare numbers taken in an order, or an MGRS square taken at its center (`moving`
+/// says whether the map goes there, which the notice's wording follows).
+fn typed_place(map: &Map, p: &Value, moving: bool) -> Result<(Coord, Option<crate::notice_text::NoticeText>), String> {
+    let position = match p.get("position") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(_) => return Err("position must be text, such as \"40.7128, -74.006\" or \"18TWL8395907350\"".into()),
+    };
+    let given = |k: &str| !matches!(p.get(k), None | Some(Value::Null));
+    let (lon, lat, notice) = if let Some(text) = position {
+        if ["lon", "lat", "x", "y"].iter().any(|k| given(k)) {
+            return Err("give a position or lon and lat, not both".into());
+        }
+        let (c, read) = read_position(map, text)?;
+        let reference = || text.trim().to_string().into();
+        let said = match read {
+            PositionRead::AsWritten => None,
+            PositionRead::Ordered => Some(crate::notice_text::NoticeText::format(
+                "Read {position} as latitude {lat}, longitude {lon}",
+                [("position", reference()), ("lat", degrees_text(c.y).into()), ("lon", degrees_text(c.x).into())],
+            )),
+            PositionRead::Square(side) => {
+                let side = if side >= 1000.0 { format!("{} km", side / 1000.0) } else { format!("{side} m") };
+                // Both whole, as the translation catalogs take them.
+                let template = if moving {
+                    "{reference} names a {side} square, not a point: went to its center"
+                } else {
+                    "{reference} names a {side} square, not a point: gave its center"
+                };
+                Some(crate::notice_text::NoticeText::format(template, [("reference", reference()), ("side", side.into())]))
+            }
+        };
+        (c.x, c.y, said)
+    } else {
+        // A number, or text in degrees or degrees, minutes and seconds (`74°0′22″W`).
+        let axis = |keys: [&str; 2], latitude: bool| -> Result<f64, String> {
+            let key = keys.iter().find(|k| given(k)).ok_or_else(|| format!("{} is required (or a position)", keys[0]))?;
+            match p.get(*key) {
+                Some(Value::String(t)) => t.trim().parse::<f64>().ok().filter(|v| v.is_finite()).map_or_else(|| read_axis(t, latitude), Ok),
+                _ => f(p, key).ok_or_else(|| format!("{key} must be a number of degrees, or text such as \"74°0′22″W\"")),
+            }
+        };
+        (axis(["lon", "x"], false)?, axis(["lat", "y"], true)?, None)
+    };
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
         return Err("longitude must be within ±180 and latitude within ±90".into());
     }
+    Ok((Coord::new(lon, lat), notice))
+}
+
+/// A place in every form RustGIS writes one (#1042): longitude and latitude, in decimal degrees
+/// and in degrees, minutes and seconds as the status bar shows them; UTM, or UPS from 84° N
+/// and south of 80° S, with the easting and northing (`grid` says which: `utm` and `ups` each hold
+/// only their own); and MGRS spaced as the readout writes it and in one word, to `digits` digits
+/// (5 by default: 1 m). The place is read as `map.goToXY` reads it, and what the reading assumed
+/// is said the same way. The map doesn't move. Every key is always there, `null` where it has no
+/// value; on another body's map the Earth's grids are `null` and `note` says why.
+fn convert_position(s: &mut Session, p: &Value) -> CmdResult {
+    let digits = match p.get("digits") {
+        None | Some(Value::Null) => 5,
+        // A whole number sent as 2.0 (as Python or JavaScript may) is as good as 2.
+        Some(v) => v
+            .as_f64()
+            .filter(|d| d.fract() == 0.0 && (0.0..=5.0).contains(d))
+            .ok_or("digits must be a whole number from 0 (100 km) to 5 (1 m)")? as u8,
+    };
+    let (c, notice) = typed_place(s.map(), p, false)?;
+    // Degrees to 1e-9 (under a millimeter), so text in degrees, minutes and seconds doesn't come
+    // back as -74.00600000000001; adding 0.0 turns a -0.0 from a tiny negative into 0. Every form
+    // below is made from this one place, so they all agree on its hemisphere.
+    let nano = |v: f64| (v * 1e9).round() / 1e9 + 0.0;
+    let c = Coord::new(nano(c.x), nano(c.y));
+    // Grid meters truncated to the millimeter, as MGRS truncates: rounding could lift a southern
+    // northing a hair short of the equator to 10,000,000 m, the equator itself.
+    let mm = |v: f64| (v * 1000.0).floor() / 1000.0;
+    let mut out = json!({
+        "lon": c.x,
+        "lat": c.y,
+        "decimal": rustgis_geom::format_lonlat(c),
+        "dms": rustgis_geom::format_dms(c),
+        "grid": null,
+        "utm": null,
+        "ups": null,
+        "zone": null,
+        "band": null,
+        "hemisphere": null,
+        "easting": null,
+        "northing": null,
+        "mgrs": null,
+        "mgrsCompact": null,
+        "note": null,
+    });
+    if !s.map().body().is_earth() {
+        out["note"] = json!("UTM, UPS and MGRS are the Earth's grids and name no place on this map");
+    } else {
+        if let Some(u) = rustgis_geom::to_utm(c) {
+            out["grid"] = json!("utm");
+            out["utm"] = json!(u.to_string());
+            out["zone"] = json!(u.zone);
+            out["band"] = json!(u.band.to_string());
+            out["hemisphere"] = json!(u.hemisphere());
+            out["easting"] = json!(mm(u.easting));
+            out["northing"] = json!(mm(u.northing));
+        } else if let Some(u) = rustgis_geom::to_ups(c) {
+            out["grid"] = json!("ups");
+            out["ups"] = json!(u.to_string());
+            out["hemisphere"] = json!(u.hemisphere());
+            out["easting"] = json!(mm(u.easting));
+            out["northing"] = json!(mm(u.northing));
+        }
+        match rustgis_geom::to_mgrs(c, digits) {
+            Some(m) => {
+                out["mgrs"] = json!(m.to_string());
+                out["mgrsCompact"] = json!(m.compact());
+            }
+            // Not reached by any place on the Earth today, but said rather than left a bare null.
+            None => out["note"] = json!("no MGRS reference names this place"),
+        }
+    }
+    if let Some(said) = notice {
+        s.notify_text(said, false);
+    }
+    Ok(out)
+}
+
+pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
+    // What the reading assumed is said once the map has moved there, not before a refusal.
+    let (c, notice) = typed_place(s.map(), p, true)?;
+    let (lon, lat) = (c.x, c.y);
+    // A scale that can't be used is refused, not dropped.
+    let scale = match p.get("scale") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(f(p, "scale").filter(|s| *s > 0.0).ok_or("scale must be a positive number, such as 50000 for 1:50,000")?),
+    };
     let bearing = match p.get("bearing") {
         None | Some(Value::Null) => None,
         Some(_) => Some(f(p, "bearing").ok_or("bearing must be a number of degrees")?),
@@ -353,7 +679,7 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
     };
     let m = s.map_mut();
     m.camera.center = m.to_map(Coord::new(lon, lat)).ok_or("that point is outside the map's projection")?;
-    if let Some(sc) = f(p, "scale") {
+    if let Some(sc) = scale {
         m.set_scale(sc);
     }
     if let Some(b) = bearing {
@@ -364,6 +690,9 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
     }
     m.camera.clamp();
     s.record_extent();
+    if let Some(said) = notice {
+        s.notify_text(said, false);
+    }
     Ok(Value::Null)
 }
 
@@ -537,6 +866,62 @@ fn set_bearing(s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
+/// Shows or hides the map's graticule, and sets what it draws: a type or a coordinate system
+/// given shows it too. A coordinate system is for the measured grid, and refused (naming it) when
+/// it can't be read or isn't projected.
+fn graticule(s: &mut Session, p: &Value) -> CmdResult {
+    use rustgis_map::graticule::GraticuleType;
+    let kind = match p.get("type") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) => Some(GraticuleType::from_name(t).ok_or_else(|| {
+            let names: Vec<&str> = GraticuleType::ALL.iter().map(|t| t.code()).collect();
+            format!("type must be one of {}, not \"{t}\"", names.join(", "))
+        })?),
+        Some(other) => {
+            let names: Vec<String> = GraticuleType::ALL.iter().map(|t| format!("\"{}\"", t.code())).collect();
+            return Err(format!("type must be one of {}, not {other}", names.join(", ")));
+        }
+    };
+    let crs = match p.get("crs") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(c)) if c.trim().is_empty() => Some(None),
+        Some(Value::String(c)) if c.trim().chars().count() > rustgis_map::layout::MAX_GRID_CRS => {
+            return Err(format!("crs: at most {} characters", rustgis_map::layout::MAX_GRID_CRS));
+        }
+        Some(Value::String(c)) => {
+            let read = rustgis_data::raster::Crs::parse(c.trim()).map_err(|e| format!("crs: {e}"))?;
+            if read.is_geographic() {
+                return Err(format!(
+                    "crs: {} is geographic; a measured grid needs a projected system (\"degrees\" draws latitudes and longitudes)",
+                    c.trim()
+                ));
+            }
+            if read.is_geocentric() {
+                return Err(format!("crs: {} is geocentric; a measured grid needs a projected system", c.trim()));
+            }
+            // (As the project checks it when it opens: one this version can't project to draws no grid.)
+            if let Err(e) = read.transformer() {
+                return Err(format!("crs: {} can't be used here: {e}", c.trim()));
+            }
+            Some(Some(c.trim().to_string()))
+        }
+        Some(other) => return Err(format!("crs must be a coordinate system (EPSG:2056, WKT or a PROJ string), or \"\", not {other}")),
+    };
+    let m = s.map_mut();
+    let kind_after = kind.unwrap_or(m.graticule_type);
+    if matches!(crs, Some(Some(_))) && kind_after != GraticuleType::Measured {
+        return Err(format!("crs is the measured grid's; the graticule is \"{}\" (give \"type\": \"measured\")", kind_after.code()));
+    }
+    let set = kind.is_some() || crs.is_some();
+    m.graticule = super::b(p, "on").unwrap_or(if set { true } else { !m.graticule });
+    m.graticule_type = kind_after;
+    if let Some(c) = crs {
+        m.graticule_crs = c;
+    }
+    Ok(json!({"on": m.graticule, "type": m.graticule_type.code(), "crs": m.graticule_crs}))
+}
+
 fn basemap(s: &mut Session, p: &Value) -> CmdResult {
     let n = s_name(p)?;
     let m = s.map_mut();
@@ -553,14 +938,15 @@ fn add_bookmark(s: &mut Session, p: &Value) -> CmdResult {
     if s.project.maps.get(mi).is_some_and(|m| m.bookmarks.len() >= MAX_BOOKMARKS) {
         return Err(format!("a map keeps at most {MAX_BOOKMARKS} bookmarks"));
     }
+    let description =
+        super::within("description", "a bookmark's description", ps(p, "description").unwrap_or_default().trim(), MAX_DESCRIPTION)?;
     let given = ps(p, "name").map(str::trim).filter(|n| !n.is_empty());
     let base = match given {
-        Some(n) => n.to_string(),
+        Some(n) => super::within("name", "a bookmark's name", n, MAX_BOOKMARK_NAME)?,
         None => s.project.maps.get(mi).map_or_else(|| "Bookmark 1".into(), new_bookmark_name),
     };
     // A taken name is numbered, never replacing the bookmark that has it (#351).
     let name = unique_bookmark_name(s, mi, None, &base);
-    let description: String = ps(p, "description").unwrap_or_default().trim().chars().take(MAX_DESCRIPTION).collect();
     let m = s.project.maps.get_mut(mi).ok_or("no map")?;
     m.bookmarks.push(Bookmark { description, ..Bookmark::new(name.clone(), m.camera) });
     Ok(json!({"name": name}))
@@ -618,8 +1004,10 @@ fn place_at(map: &Map, lonlat: Coord, ground: f64) -> Option<rustgis_map::Camera
 }
 
 /// The map (`map`, default the active one) and the index of its bookmark `name` (any case).
-fn bookmark_at(s: &Session, p: &Value) -> Result<(usize, usize), String> {
-    let mi = map_at(s, p)?;
+fn bookmark_at(input: &impl super::InputSource, p: &Value) -> Result<(usize, usize), String> {
+    let context = input.input_context();
+    let s = &context;
+    let mi = map_at(input, p)?;
     let n = s_name(p)?;
     let bi = s.project.maps.get(mi).and_then(|m| m.bookmarks.iter().position(|b| b.name.eq_ignore_ascii_case(n)));
     Ok((mi, bi.ok_or_else(|| format!("no bookmark '{n}'"))?))
@@ -651,11 +1039,11 @@ pub fn new_bookmark_name(map: &Map) -> String {
 }
 
 /// The longest bookmark name and description kept.
-const MAX_BOOKMARK_NAME: usize = 120;
+pub(crate) const MAX_BOOKMARK_NAME: usize = 120;
 const MAX_DESCRIPTION: usize = 2_000;
 
 /// Most bookmarks a map keeps.
-const MAX_BOOKMARKS: usize = 10_000;
+pub(crate) const MAX_BOOKMARKS: usize = 10_000;
 
 /// The map's bookmarks as a bookmarks file. Places are lon/lat and metres per pixel, so they
 /// open in the same place on a map in any projection.
@@ -695,42 +1083,90 @@ fn import_bookmarks(s: &mut Session, p: &Value) -> CmdResult {
     let list = v.get("bookmarks").and_then(Value::as_array).ok_or("not a RustGIS bookmarks file: no bookmarks")?;
     let m = s.map_mut();
     let mut names = Vec::new();
-    for b in list.iter().take(MAX_BOOKMARKS) {
-        if m.bookmarks.len() >= MAX_BOOKMARKS {
-            break;
-        }
-        let name: String = match super::ps(b, "name").map(str::trim).filter(|n| !n.is_empty()) {
-            Some(n) => n.chars().take(MAX_BOOKMARK_NAME).collect(),
-            None => continue,
+    // The map's bookmarks by name (the first of any that differ only in case, as found before),
+    // and the names this file added or replaced: a file of many entries is read in one pass.
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, b) in m.bookmarks.iter().enumerate() {
+        at.entry(b.name.to_ascii_lowercase()).or_insert(i);
+    }
+    let mut taken = std::collections::HashSet::new();
+    // What the file has that isn't taken, counted to be said (#1896).
+    let (mut no_name, mut no_place, mut past, mut cut_names, mut cut_descriptions) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for b in list {
+        // A cut name is counted once the bookmark is kept, below.
+        let (name, name_cut): (String, bool) = match super::ps(b, "name").map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => (n.chars().take(MAX_BOOKMARK_NAME).collect(), n.chars().nth(MAX_BOOKMARK_NAME).is_some()),
+            None => {
+                no_name += 1;
+                continue;
+            }
         };
-        let (Some(lon), Some(lat), Some(ground)) = (f(b, "lon"), f(b, "lat"), f(b, "metresPerPixel")) else { continue };
+        let (Some(lon), Some(lat), Some(ground)) = (f(b, "lon"), f(b, "lat"), f(b, "metresPerPixel")) else {
+            no_place += 1;
+            continue;
+        };
         if !(lon.is_finite() && lat.is_finite() && (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat)) {
+            no_place += 1;
             continue;
         }
-        let Some(mut camera) = place_at(m, Coord::new(lon, lat), ground) else { continue };
+        let Some(mut camera) = place_at(m, Coord::new(lon, lat), ground) else {
+            no_place += 1;
+            continue;
+        };
+        // A new bookmark past the map's limit is left out; one replacing a bookmark by its name
+        // is taken, as it adds none.
+        let key = name.to_ascii_lowercase();
+        let existing = at.get(&key).copied();
+        if existing.is_none() && m.bookmarks.len() >= MAX_BOOKMARKS {
+            past += 1;
+            continue;
+        }
+        cut_names += usize::from(name_cut);
         // A file from before bearings faces north.
         camera.set_bearing(f(b, "bearing").unwrap_or(0.0));
         camera.set_pitch(f(b, "pitch").unwrap_or(0.0));
         // Absent (a file from before descriptions, or written by hand) isn't empty: a bookmark
         // it replaces keeps its own.
-        let description: Option<String> = super::ps(b, "description").map(|d| d.trim().chars().take(MAX_DESCRIPTION).collect());
+        let description: Option<String> = super::ps(b, "description").map(|d| {
+            cut_descriptions += usize::from(d.trim().chars().nth(MAX_DESCRIPTION).is_some());
+            d.trim().chars().take(MAX_DESCRIPTION).collect()
+        });
         // A bookmark by the same name is replaced where it is in the list (importing a file
         // again updates its bookmarks).
-        match m.bookmarks.iter_mut().find(|b| b.name.eq_ignore_ascii_case(&name)) {
+        match existing.and_then(|i| m.bookmarks.get_mut(i)) {
             Some(b) => {
                 b.camera = camera;
                 if let Some(d) = description {
                     b.description = d;
                 }
             }
-            None => m.bookmarks.push(Bookmark { description: description.unwrap_or_default(), ..Bookmark::new(name.clone(), camera) }),
+            None => {
+                at.insert(key.clone(), m.bookmarks.len());
+                m.bookmarks.push(Bookmark { description: description.unwrap_or_default(), ..Bookmark::new(name.clone(), camera) });
+            }
         }
-        if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(&name)) {
+        if taken.insert(key) {
             names.push(name);
         }
     }
+    let left: Vec<String> = [
+        (no_name, "without a name left out".to_string()),
+        (no_place, "without a place this map can show left out".to_string()),
+        (past, format!("past the map's {MAX_BOOKMARKS} left out")),
+        (cut_names, format!("with a name cut to {MAX_BOOKMARK_NAME} characters")),
+        (cut_descriptions, format!("with a description cut to {MAX_DESCRIPTION} characters")),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} bookmark(s) {what}"))
+    .collect();
+    // Nothing taken is an error, which gives what was left out and why.
     if names.is_empty() {
-        return Err("the file has no bookmarks this map can show".into());
+        let none = "the file has no bookmarks this map can show";
+        return Err(if left.is_empty() { none.to_string() } else { format!("{none}: {}", left.join(", ")) });
+    }
+    for what in left {
+        s.notify(format!("Import Bookmarks: {what}"), false);
     }
     Ok(json!({"added": names}))
 }
@@ -750,4 +1186,76 @@ fn new_map(s: &mut Session, p: &Value) -> CmdResult {
     s.active_layer = None;
     s.table_layer = None;
     Ok(json!({"name": name}))
+}
+
+/// Uses the strict map selector for operations that accept map names or null.
+fn map_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let map = s.project.maps.get(map_at(input, p)?).ok_or("no map")?;
+    let mut inputs = super::Inputs::layers(std::iter::empty());
+    inputs.maps.push(map.instance_id());
+    Ok(inputs)
+}
+
+/// Activation and removal require a string name, unlike optional map selectors.
+fn required_map_at(input: &impl super::InputSource, p: &Value) -> Result<usize, String> {
+    let context = input.input_context();
+    let s = &context;
+    let n = s_name(p)?;
+    s.project.maps.iter().position(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no map '{n}'"))
+}
+/// Binds the required map and its existing layers before activation/removal.
+fn required_map_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let map = s.project.maps.get(required_map_at(input, p)?).ok_or("no map")?;
+    let mut inputs = super::Inputs::layers(map.layers.iter().map(|l| (map, l)));
+    inputs.maps.push(map.instance_id());
+    Ok(inputs)
+}
+/// Binds the map and layer incarnations that duplication will clone.
+fn duplicate_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let map = s.project.maps.get(map_at(input, p)?).ok_or("no map")?;
+    let mut inputs = super::Inputs::layers(map.layers.iter().map(|l| (map, l)));
+    inputs.maps.push(map.instance_id());
+    Ok(inputs)
+}
+/// Binds the bookmark's source map and the active destination map without freezing camera data.
+fn bookmark_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let (mi, bi) = bookmark_at(input, p)?;
+    let map = s.project.maps.get(mi).ok_or("no map")?;
+    let mut inputs = super::Inputs::layers(std::iter::empty());
+    inputs.maps.extend([map.instance_id(), s.map().instance_id()]);
+    inputs.state = json!({"bookmark":bi,"name":map.bookmarks.get(bi).map(|b|&b.name)});
+    Ok(inputs)
+}
+
+/// The actual activation choice, shared with ordered approval; raw selection bookkeeping survives.
+fn activation(s: &super::InputContext<'_>, p: &Value) -> Result<Option<super::Selection>, String> {
+    let map = required_map_at(s, p)?;
+    let layer = s.project.maps.get(map).and_then(|m| m.layers.first()).map(|l| l.id);
+    Ok(Some(super::Selection { map, layer, names_changed: false }))
+}
+/// Validates the actual rename selector and uniqueness rule without changing project data.
+fn rename_choice(s: &super::InputContext<'_>, p: &Value) -> Result<(usize, String), String> {
+    let n = s_name(p)?.trim();
+    if n.is_empty() {
+        return Err("name is required".into());
+    }
+    let i = map_at(s, p)?;
+    let n = super::within("name", "a map's name", n, super::MAX_NAME)?;
+    let name = super::numbered(&n, |n| s.project.maps.iter().enumerate().any(|(j, m)| j != i && m.name.eq_ignore_ascii_case(n)));
+    Ok((i, name))
+}
+/// Renaming preserves defaults on the same incarnation; it does not model a later map namespace.
+fn rename_transition(s: &super::InputContext<'_>, p: &Value) -> Result<Option<super::Selection>, String> {
+    let _ = rename_choice(s, p)?;
+    let mut selection = s.selection();
+    selection.names_changed = true;
+    Ok(Some(selection))
+}
+/// These namespace changes cannot be predicted by a scalar borrowed view, so exact Ask refuses.
+fn unmodelled_transition(_: &super::InputContext<'_>, _: &Value) -> Result<Option<super::Selection>, String> {
+    Ok(None)
 }

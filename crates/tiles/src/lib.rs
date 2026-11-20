@@ -9,9 +9,11 @@
 
 pub mod address;
 pub mod arcgis_auth;
+pub mod arcgis_token;
 pub mod boundaries;
 pub mod cache;
 pub mod cog;
+pub mod copernicus;
 pub mod cubes;
 mod dem;
 pub mod draw;
@@ -19,6 +21,8 @@ pub mod earthdata;
 pub mod embeddings;
 pub mod failure;
 pub mod geocode;
+pub mod jaxa;
+pub mod logins;
 pub mod mbtiles;
 pub mod mvt;
 pub mod nldi;
@@ -40,6 +44,7 @@ pub mod style;
 pub mod symbols;
 pub mod template;
 pub mod usgis;
+pub mod vantor;
 pub mod vector_export;
 pub mod warp;
 

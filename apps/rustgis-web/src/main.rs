@@ -16,12 +16,16 @@
 // Pure logic, tested natively; only the browser build uses it.
 #[cfg(target_arch = "wasm32")]
 mod arcgis;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(target_arch = "wasm32")]
+mod copernicus;
+#[cfg_attr(not(target_arch = "wasm32"), expect(dead_code, reason = "native builds only test it"))]
 mod embed;
 #[cfg(target_arch = "wasm32")]
 mod geolibre;
 #[cfg(target_arch = "wasm32")]
 mod parts;
+#[cfg(any(target_arch = "wasm32", test))]
+mod request;
 #[cfg(target_arch = "wasm32")]
 mod web;
 

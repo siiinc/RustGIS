@@ -46,13 +46,15 @@ Run the appropriate platform row, not every command:
 | Platform | Agent-runnable commands |
 | --- | --- |
 | Windows x64 | `winget install OpenGeos.RustGIS` |
-| macOS | `brew install --cask opengeos/rustgis/rustgis` then `brew install opengeos/rustgis/rustgis-cli` |
+| macOS | `brew install --cask rustgis` then `brew install opengeos/rustgis/rustgis-cli` |
+| Linux with Homebrew | `brew install --cask rustgis` (the AppImage) then `brew install opengeos/rustgis/rustgis-cli` |
 | Arch Linux with an AUR helper | `yay -S rustgis-bin` |
 | Fedora | `sudo dnf copr enable giswqs/rustgis && sudo dnf install rustgis` |
 
-On Homebrew 5.1 or later, first run `brew trust opengeos/rustgis` once.
-Homebrew's `rustgis-cli` formula also works on Linux but installs **only the
-CLI**, not the desktop app. winget's default is the per-user installer; use
+The `rustgis` cask needs no tap. The `rustgis-cli` formula comes from the
+opengeos/rustgis tap; installing it by that full name trusts just that formula,
+so don't run `brew trust` on the whole tap.
+winget's default is the per-user installer; use
 `--scope machine` only for an authorized all-user MSI installation.
 If elevation needs the user's password, leave that interaction to the user;
 the portable route below does not require system-wide installation.
@@ -230,7 +232,7 @@ warning; do not disable security controls to make installation unattended.
 
 Use source only when a matching release is unsuitable or the required MCP Relay
 is not present in the installed app/CLI. Use a checkout that includes the
-[documented open-app support](https://rustgis.app/mcp/), with stable Rust 1.90 or
+[documented open-app support](https://rustgis.app/mcp/), with stable Rust 1.92 or
 later. In a user-chosen source directory:
 
 ```sh

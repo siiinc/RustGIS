@@ -24,6 +24,10 @@ impl FeatureSource for Chunks {
             matched: self.ds.features.len() as u64,
             complete: false,
             skipped: 0,
+            unread_dates: Vec::new(),
+            rounded_dates: Vec::new(),
+            null_text: Vec::new(),
+            notes: Vec::new(),
         })
     }
     fn streams_chunks(&self) -> bool {
@@ -63,7 +67,7 @@ fn settle(map: &mut Map, view: &View) {
         if !pending {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(1)); // test-wait: legacy polling for streamed map reads
     }
     panic!("the background reads did not land");
 }
@@ -103,6 +107,10 @@ fn complete_chunks_preserve_painter_order_filters_transparency_labels_and_select
                 matched: self.0.ds.features.len() as u64,
                 complete: false,
                 skipped: 0,
+                unread_dates: Vec::new(),
+                rounded_dates: Vec::new(),
+                null_text: Vec::new(),
+                notes: Vec::new(),
             })
         }
         fn streams_chunks(&self) -> bool {
@@ -145,14 +153,7 @@ fn complete_chunks_preserve_painter_order_filters_transparency_labels_and_select
     l.renderer = Renderer::Single(Symbol { fill: Rgba::new(210, 60, 25, 120), ..Symbol::default_for(GeometryType::Polygon, l.id) });
     let view = View { width: 320.0, height: 240.0, pixels_per_point: 1.0, camera: m.camera, sky: false };
     for extrusion in [None, Some(true), Some(false)] {
-        m.layers[0].extrusion = extrusion.map(|shadows| rustgis_map::effects::Extrusion {
-            height: 1500.0,
-            field: None,
-            factor: 1.0,
-            face_culling: true,
-            lighting: true,
-            shadows,
-        });
+        m.layers[0].extrusion = extrusion.map(|shadows| rustgis_map::effects::Extrusion { height: 1500.0, shadows, ..Default::default() });
         let expected = render(&mut m.clone(), &view).unwrap();
         for size in [1, 3, 11, 100] {
             let mut actual = m.clone();
@@ -543,7 +544,17 @@ fn layout_export_keeps_all_drawn_legend_classes() {
     page.add(
         "legend",
         (90.0, 0.0, 45.0, 95.0),
-        ElementKind::Legend { frame, title: "classes".into(), all_classes: false, hide_other: false, exclude: vec![] },
+        ElementKind::Legend {
+            frame,
+            title: "classes".into(),
+            all_classes: false,
+            hide_other: false,
+            show_no_data: false,
+            exclude: vec![],
+            columns: 1,
+            labels: Default::default(),
+            color: None,
+        },
     );
     let expected = layout::render(&page, &mut [base.clone()], 96.0, &layout::PageInfo::default()).unwrap();
     for size in [1, 3, 20] {
@@ -554,7 +565,81 @@ fn layout_export_keeps_all_drawn_legend_classes() {
     }
     let mut failed = base.clone();
     failed.layers[0] = streamed(&base.layers[0], 0);
-    assert!(layout::render(&page, &mut [failed], 96.0, &layout::PageInfo::default()).is_none());
+    assert!(layout::render(&page, &mut [failed], 96.0, &layout::PageInfo::default()).is_err());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("classes.shp");
+        rustgis_data::io::write_path(&base.layers[0].dataset, &path).unwrap();
+        let source = SourceLayer::from_path(path.to_string_lossy(), None, rustgis_data::source::open_path(&path, None).unwrap());
+        // SVG records elements separately: visit the legend before the frame can fail instead.
+        page.elements.reverse();
+        for missing in [false, true] {
+            if missing {
+                std::fs::remove_file(&path).unwrap();
+            }
+            for format in ["png", "pdf", "svg"] {
+                let mut map = base.clone();
+                map.layers[0].name = "Survey classes".into();
+                map.layers[0].source = Some(source.clone());
+                let info = layout::PageInfo::default();
+                let maps = std::slice::from_mut(&mut map);
+                let result = match format {
+                    "png" => layout::render(&page, maps, 96.0, &info).map(|_| ()),
+                    "pdf" => layout::render_drawing(&page, maps, 96.0, &info).map(|_| ()),
+                    _ => crate::svg::layout_svg(&page, maps, 96.0, &info).map(|_| ()),
+                };
+                if missing {
+                    let error = result.unwrap_err();
+                    assert!(error.starts_with("Survey classes: "), "{format}: {error}");
+                    for detail in [path.to_str().unwrap(), "moved or deleted", "Repair Data Source"] {
+                        assert!(error.contains(detail), "{format}: missing {detail:?} in {error:?}");
+                    }
+                } else {
+                    assert!(result.is_ok(), "{format}: {result:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn legend_sizing_clears_recovered_source_errors_and_reports_a_later_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("classes.shp");
+    let moved = dir.path().join("moved.shp");
+    let mut ds = Dataset::new("classes", GeometryType::Point, vec![]);
+    ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![]);
+    rustgis_data::io::write_path(&ds, &path).unwrap();
+    let source = SourceLayer::from_path(path.to_string_lossy(), None, rustgis_data::source::open_path(&path, None).unwrap());
+    let mut map = Map::new("legend recovery");
+    let id = map.add_streamed("Survey classes", source);
+    let mut first_error = None;
+    for missing in [false, true, false, true] {
+        if missing {
+            std::fs::rename(&path, &moved).unwrap();
+        } else if moved.exists() {
+            std::fs::rename(&moved, &path).unwrap();
+        }
+        // Size the legend alone: no frame read, reopen or notice pass can clear the error.
+        let sizes = layout::legend_sizes_with_no_data_mm(&mut map, 300000.0, false, false, false, (&[], &Default::default()));
+        let source = map.layer_mut(id).unwrap().source.as_mut().unwrap();
+        if missing {
+            assert!(sizes.is_none());
+            let error = source.error_unsaid().expect("each failed traversal after recovery must be reportable");
+            assert!(source.error_unsaid().is_none());
+            if let Some(first) = &first_error {
+                assert_eq!(&error, first);
+            } else {
+                first_error = Some(error);
+            }
+        } else {
+            assert!(sizes.is_some());
+            assert!(source.error.is_none());
+        }
+    }
 }
 
 #[test]
@@ -654,6 +739,7 @@ fn extrusion_spool_failures_retain_the_actual_source_diagnostic() {
         face_culling: true,
         lighting: true,
         shadows: true,
+        ..Default::default()
     });
     let view = View { width: 120.0, height: 90.0, pixels_per_point: 1.0, camera: Camera::new(Coord::new(0.0, 0.0), 80.0), sky: false };
     for stage in ["create", "insert", "draw"] {
@@ -691,6 +777,67 @@ fn perspective_reports_shapefile_open_failure() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
+fn hidden_source_error_does_not_replace_an_unrelated_drawing_failure() {
+    let mut map = Map::new("hidden source");
+    let id = map.add_dataset(Dataset::new("broken", GeometryType::Point, vec![]));
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = SourceLayer::default();
+    source.path = Some(dir.path().join("missing.shp").display().to_string());
+    map.layer_mut(id).unwrap().source = Some(source);
+    let mut view = View { width: 120.0, height: 90.0, pixels_per_point: 1.0, camera: map.camera, sky: false };
+    assert!(render_png(&mut map, &view).unwrap_err().contains("missing.shp"));
+    map.layer_mut(id).unwrap().visible = false;
+    assert!(render_png(&mut map, &view).is_ok(), "the hidden source does not break a normal drawing");
+    // A non-finite width makes canvas allocation fail independently of the hidden source's
+    // retained read error. Report that drawing failure, rather than blaming the hidden layer.
+    view.width = f64::NAN;
+    assert_eq!(render_png(&mut map, &view).unwrap_err(), "could not draw the map");
+    assert_eq!(render_drawing(&mut map, &view).map(|_| ()).unwrap_err(), "could not draw the map");
+    assert_eq!(
+        layout::frame_map(&mut map, view.camera, view.width, view.height, view.pixels_per_point).unwrap_err(),
+        "could not draw the map frame"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn source_failure_names_the_layer_that_stopped_the_current_render() {
+    let mut data = Dataset::new("Current sites", GeometryType::Point, vec![]);
+    data.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![]);
+    let mut base = Map::new("source failures");
+    let current = base.add_dataset(data);
+    *base.layer_mut(current).unwrap() = streamed(base.layer(current).unwrap(), 0);
+    base.layer_mut(current).unwrap().source.as_mut().unwrap().path = Some("current.shp".into());
+    let old = base.add_dataset(Dataset::new("Earlier sites", GeometryType::Point, vec![]));
+    let mut source = SourceLayer::default();
+    source.path = Some("earlier.fgb".into());
+    source.error = Some("an earlier window read failed".into());
+    base.layer_mut(old).unwrap().source = Some(source);
+    // Earlier sites is first in map.layers, still visible, and retains its window read error.
+    // Current sites draws first in painter order and fails during this complete traversal.
+    assert_eq!(base.layers[0].id, old);
+    for (pitch, bearing) in [(0.0, 0.0), (0.0, 25.0), (35.0, 0.0)] {
+        let mut map = base.clone();
+        let mut view = View {
+            width: 120.0,
+            height: 90.0,
+            pixels_per_point: 1.0,
+            camera: Camera { pitch, bearing, ..Camera::new(Coord::new(0.0, 0.0), 80.0) },
+            sky: false,
+        };
+        let why = render_png(&mut map, &view).unwrap_err();
+        assert!(why.starts_with("Current sites: ") && why.contains("current.shp"), "{why}");
+        assert!(!why.contains("Earlier sites") && !why.contains("earlier.fgb"), "{why}");
+        assert!(map.layer(old).unwrap().source.as_ref().unwrap().error.is_some());
+        // A later allocation failure isn't a source failure, even while the old source is visible.
+        map.layer_mut(current).unwrap().visible = false;
+        view.width = f64::NAN;
+        assert_eq!(render_png(&mut map, &view).unwrap_err(), "could not draw the map");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
 fn pitched_mixed_sources_keep_windows_and_pending_on_the_owner() {
     use std::sync::{Arc, Condvar, Mutex};
     struct WindowSource {
@@ -712,6 +859,10 @@ fn pitched_mixed_sources_keep_windows_and_pending_on_the_owner() {
                 matched: self.chunks.ds.features.len() as u64,
                 complete: true,
                 skipped: 0,
+                unread_dates: Vec::new(),
+                rounded_dates: Vec::new(),
+                null_text: Vec::new(),
+                notes: Vec::new(),
             })
         }
     }
@@ -763,7 +914,7 @@ fn pitched_mixed_sources_keep_windows_and_pending_on_the_owner() {
         drop(release);
         // Wait for the same owning request, then verify the next frame retains its window.
         let bands = view.camera.tilt_bands(view.width, view.height);
-        sync_tilted(&mut map, &view, &bands, true);
+        sync_tilted(&mut map, &view, &bands, true, &Default::default());
         assert_eq!(map.layers[1].dataset.features.len(), 2);
         assert!(map.layers[1].source.as_ref().unwrap().reads > 0);
         let output = render_with_backend(&mut map, &view, true, backend).unwrap();
@@ -893,13 +1044,13 @@ fn masks_skip_undrawn_targets_and_reuse_one_complete_source_with_distinct_swipes
     };
     let flat = base.flat();
     let scale = base.ground_res_at(&view.camera) / rustgis_geom::PIXEL_M;
-    let expected = layer_masks(&mut base.clone(), &ctx, 120, 90, &flat, "test", scale).unwrap();
+    let expected = layer_masks(&mut base.clone(), &ctx, 120, 90, &flat, "test", scale, &mut None).unwrap();
     let info = streamed(base.layer(mask).unwrap(), 1).source.unwrap().info().unwrap().clone();
     let calls = Arc::new(AtomicUsize::new(0));
     let mut actual = base.clone();
     actual.layer_mut(mask).unwrap().source =
         Some(SourceLayer::from_path("mask.shp", None, Box::new(Counted { chunks: Chunks { info, ds, size: 1 }, calls: calls.clone() })));
-    let got = layer_masks(&mut actual, &ctx, 120, 90, &flat, "test", scale).unwrap();
+    let got = layer_masks(&mut actual, &ctx, 120, 90, &flat, "test", scale, &mut None).unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert_eq!(got.len(), 2);
     for ((id, got), (expected_id, expected)) in got.iter().zip(&expected) {
@@ -928,7 +1079,7 @@ fn masks_skip_undrawn_targets_and_reuse_one_complete_source_with_distinct_swipes
                 _ => {}
             }
         }
-        let got = layer_masks(&mut map, &ctx, 120, 90, &flat, "test", scale);
+        let got = layer_masks(&mut map, &ctx, 120, 90, &flat, "test", scale, &mut None);
         if mode == 4 {
             assert!(got.is_none(), "a failed required mask must still fail the frame");
         } else {
@@ -1001,7 +1152,7 @@ fn pitched_plain_chunks_bypass_depth_budget_alone_and_with_upright_markers() {
                 for layer in &mut failed.layers {
                     *layer = streamed(layer, if layer.id == ground { 0 } else { 1 });
                 }
-                let lock = Some(vec![((ground, 0, 0, 0), 0)]);
+                let lock = Some(vec![((ground, 0, 0, 0), rustgis_map::LockedPlace::default())]);
                 failed.label_lock = lock.clone();
                 assert!(render_with_backend(&mut failed, &view, true, backend).is_none());
                 assert_eq!(failed.label_lock, lock);
@@ -1157,15 +1308,27 @@ fn layout_export_rejects_unopened_local_shapefiles_and_required_masks() {
             let mut map = base.clone();
             let owner = if masked { mask } else { point };
             let mut source = SourceLayer::default();
-            source.path = Some(dir.path().join("missing.SHP").display().to_string());
+            let path = dir.path().join("missing.SHP").display().to_string();
+            source.path = Some(path.clone());
             map.layer_mut(owner).unwrap().source = Some(source);
             if masked {
                 map.layer_mut(point).unwrap().mask = Some("MASK".into());
             }
-            assert!(
-                layout::render(&page, std::slice::from_mut(&mut map), 96.0, &layout::PageInfo::default()).is_none(),
-                "missing complete source must fail the page: pitch {pitch}, masked {masked}"
-            );
+            for format in ["png", "pdf", "svg"] {
+                let maps = std::slice::from_mut(&mut map);
+                let info = layout::PageInfo::default();
+                let error = match format {
+                    "png" => layout::render(&page, maps, 96.0, &info).err(),
+                    "pdf" => layout::render_drawing(&page, maps, 96.0, &info).err(),
+                    _ => crate::svg::layout_svg(&page, maps, 96.0, &info).err(),
+                }
+                .unwrap_or_else(|| panic!("missing source must fail the page: pitch {pitch}, masked {masked}, format {format}"));
+                let layer = map.layer(owner).unwrap();
+                assert!(error.starts_with(&format!("{}: ", layer.name)), "{error}");
+                for detail in [layer.name.as_str(), path.as_str(), "moved or deleted", "Repair Data Source"] {
+                    assert!(error.contains(detail), "missing {detail:?} in {error:?}");
+                }
+            }
             assert!(map.layer(owner).unwrap().source.as_ref().unwrap().error.is_some());
         }
         let mut unused = base.clone();
@@ -1173,7 +1336,7 @@ fn layout_export_rejects_unopened_local_shapefiles_and_required_masks() {
         source.path = Some(dir.path().join("unused.shp").display().to_string());
         unused.layer_mut(mask).unwrap().source = Some(source);
         assert!(
-            layout::render(&page, &mut [unused], 96.0, &layout::PageInfo::default()).is_some(),
+            layout::render(&page, &mut [unused], 96.0, &layout::PageInfo::default()).is_ok(),
             "an unused hidden Shapefile must not fail export"
         );
 
@@ -1182,7 +1345,7 @@ fn layout_export_rejects_unopened_local_shapefiles_and_required_masks() {
         source.path = Some(dir.path().join("missing.gpkg").display().to_string());
         ordinary.layer_mut(point).unwrap().source = Some(source);
         assert!(
-            layout::render(&page, &mut [ordinary], 96.0, &layout::PageInfo::default()).is_some(),
+            layout::render(&page, &mut [ordinary], 96.0, &layout::PageInfo::default()).is_ok(),
             "ordinary sources retain upstream best-effort behavior"
         );
     }
@@ -1368,4 +1531,136 @@ fn streamed_lod_recovers_caching_after_an_escaped_source_panic() {
     assert!(failed.is_err());
     assert!(source.cached_thinning("mercator", 0, || Ok(true)).unwrap());
     assert!(source.cached_thinning("mercator", 0, || panic!("recovered decision must be cached")).unwrap());
+}
+
+/// A streamed extruded layer's charts go over its extrusions, which its spool draws once every
+/// chunk is read: none is covered by a roof (#1596).
+#[test]
+fn streamed_extrusions_keep_their_charts_on_top() {
+    let magenta = Rgba::rgb(255, 0, 255);
+    let mut ds = Dataset::new("blocks", GeometryType::Polygon, vec![Field::new("n", FieldType::Double)]);
+    for i in 0..12 {
+        let x = (i % 4) as f64 * 0.05 - 0.1;
+        let y = (i / 4) as f64 * 0.05 - 0.07;
+        ds.push(
+            Some(Geometry::Polygon(vec![vec![vec![
+                Coord::new(x, y),
+                Coord::new(x + 0.03, y),
+                Coord::new(x + 0.03, y + 0.03),
+                Coord::new(x, y + 0.03),
+                Coord::new(x, y),
+            ]]])),
+            vec![Value::Float(5.0)],
+        );
+    }
+    let mut m = Map::new("test");
+    m.basemap = rustgis_map::Basemap::Blank;
+    m.add_dataset(ds);
+    m.camera = Camera::new(rustgis_geom::lonlat_to_merc(Coord::new(-0.03, -0.02)), 60.0);
+    let l = &mut m.layers[0];
+    l.extrusion = Some(rustgis_map::effects::Extrusion {
+        height: 1500.0,
+        field: None,
+        factor: 1.0,
+        face_culling: true,
+        lighting: true,
+        shadows: false,
+        ..Default::default()
+    });
+    l.diagram = Some(rustgis_map::DiagramSettings {
+        kind: rustgis_map::DiagramKind::Pie,
+        categories: vec![rustgis_map::DiagramCategory { field: "n".into(), colour: magenta }],
+        size: rustgis_map::DiagramSize::Fixed(8.0),
+        start_angle: 0.0,
+        background: None,
+        stroke: rustgis_map::DiagramSettings::default_stroke(),
+        stroke_width: 0.75,
+        labels: rustgis_map::DiagramLabel::None,
+    });
+    let view = View { width: 320.0, height: 240.0, pixels_per_point: 1.0, camera: m.camera, sky: false };
+    let magentas =
+        |pm: &Pixmap| pm.pixels().iter().filter(|p| p.red() > 200 && p.green() < 60 && p.blue() > 200 && p.alpha() > 200).count();
+    let whole = magentas(&render(&mut m.clone(), &view).unwrap().pixmap);
+    assert!(whole > 100, "the resident layer's charts: {whole} px");
+    for size in [1, 5] {
+        let mut actual = m.clone();
+        actual.layers[0] = streamed(&m.layers[0], size);
+        let Some(RenderOutput::Cpu(got)) = render_with_backend(&mut actual, &view, true, Backend::Cpu) else {
+            panic!("complete frame");
+        };
+        let n = magentas(&got.pixmap);
+        assert!(n * 10 >= whole * 9, "chunks of {size}: {n} chart px, {whole} resident");
+    }
+}
+
+/// A frame stopped while a streamed layer is read reads no further chunk (#1750), and the stop
+/// isn't taken for a failure of the source.
+#[test]
+fn a_stopped_frame_reads_no_further_chunk_and_leaves_its_source_unfailed() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Chunks that set the frame's stop flag once the first is drawn.
+    struct StopAfterFirst {
+        chunks: Chunks,
+        stop: Arc<AtomicBool>,
+    }
+    impl FeatureSource for StopAfterFirst {
+        fn info(&self) -> &SourceInfo {
+            self.chunks.info()
+        }
+        fn read(&self, r: &Request) -> rustgis_data::Result<Batch> {
+            self.chunks.read(r)
+        }
+        fn streams_chunks(&self) -> bool {
+            true
+        }
+        fn visit_chunks(
+            &self,
+            e: Option<Extent>,
+            n: usize,
+            visit: &mut dyn FnMut(Vec<Feature>) -> rustgis_data::Result<()>,
+        ) -> rustgis_data::Result<Batch> {
+            self.chunks.visit_chunks(e, n, &mut |chunk| {
+                let r = visit(chunk);
+                self.stop.store(true, Ordering::Relaxed);
+                r
+            })
+        }
+    }
+    let mut m = Map::new("m");
+    if let Some(d) = world_dataset("Countries", sample_data::COUNTRIES) {
+        m.add_dataset(d);
+    }
+    let ds = m.layers[0].dataset.clone();
+    assert!(ds.features.len() > 100);
+    let info = SourceInfo {
+        name: ds.name.clone(),
+        format: "test",
+        geometry_type: ds.geometry_type,
+        fields: ds.fields.clone(),
+        extent: ds.extent(),
+        count: Some(ds.features.len() as u64),
+        crs: "EPSG:4326".into(),
+        indexed: true,
+        notes: Vec::new(),
+        zm_dropped: false,
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut layer = m.layers[0].clone();
+    layer.dataset.features = ds.features.iter().take(1).cloned().collect::<Vec<_>>().into();
+    layer.source = Some(SourceLayer::from_path(
+        "test.shp",
+        None,
+        Box::new(StopAfterFirst { chunks: Chunks { info, ds, size: 20 }, stop: stop.clone() }),
+    ));
+    m.layers[0] = layer;
+    let view = View { width: 64.0, height: 48.0, pixels_per_point: 1.0, camera: Camera::world(), sky: false };
+    settle(&mut m, &view);
+    stop.store(false, Ordering::Relaxed);
+    let _guard = crate::cancel::install(stop.clone());
+    crate::cancel::DRAWN.set(0);
+    assert!(render(&mut m, &view).is_none(), "a stopped frame is no frame");
+    let drawn = crate::cancel::DRAWN.get();
+    assert!(drawn <= 20, "{drawn} features drawn: the read went on past the first chunk");
+    assert!(m.layers[0].source.as_ref().is_some_and(|s| s.error.is_none()), "a stop isn't a source error");
 }

@@ -16,40 +16,51 @@ const MAX_PICTURE: usize = 16 << 20;
 /// Most vertices in one graphic.
 const MAX_POINTS: usize = 100_000;
 
+/// Keeps in-memory graphics available without file access; explicit picture paths add that reach.
 pub fn commands() -> Vec<C> {
     vec![
         C::new("graphics.newLayer", "Add Graphics Layer", "Home › Add", |s, p| {
             let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Graphics");
-            let id = new_layer(s, name);
+            let name = super::within("name", "a layer's name", name, 200)?;
+            let id = new_layer(s, &name);
             Ok(json!({"layer": id}))
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name"?: string}"#),
-        C::new("graphics.add", "Add Graphic", "Edit › Graphics", add).params(
+        C::new("graphics.add", "Add Graphic", "Edit › Graphics", add).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r##"{"shape": "point"|"text"|"line"|"curve"|"freehand"|"polygon"|"lasso"|"rectangle"|"circle"|"ellipse"|"picture", "points": [[lon, lat], …] (rectangle, ellipse, picture: two corners; circle: centre and a point on the edge), "layer"?: graphics layer, "text"?: string (dynamic tokens: {map} {scale} {date} {time} {crs} {layers} {center}), "fill"?: "#RRGGBBAA", "outline"?: "#RRGGBBAA", "width"?: number, "size"?: number, "fontSize"?: number, "bold"?: bool, "italic"?: bool, "align"?: "left"|"center"|"right" (a text's lines in their block, which stays centred on its point), "letterSpacing"?: points, -5 to 50, "image"?: base64 PNG/JPEG, "path"?: picture file}"##,
         ),
-        C::new("graphics.style", "Graphic Style", "Edit › Graphics", style)
+        C::new("graphics.style", "Graphic Style", "Edit › Graphics", style).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(super::need_selection)
             .params(r##"{"fill"?: "#RRGGBBAA", "outline"?: "#RRGGBBAA", "width"?: number, "size"?: number, "fontSize"?: number, "bold"?: bool, "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50, "text"?: string}"##),
-        C::new("graphics.edit", "Edit Graphic", "Edit › Graphics", edit).params(
+        C::new("graphics.edit", "Edit Graphic", "Edit › Graphics", edit).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r##"{"layer": graphics layer, "row": number, "points"?: [[lon, lat]] (a point or a text: where it sits), "text"?: string, "fontSize"?: number, "bold"?: bool, "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50, "fill"?: "#RRGGBBAA", "outline"?: "#RRGGBBAA", "width"?: number, "size"?: number}"##,
         ),
         C::new("graphics.keepTool", "Keep the last tool active", "Edit › Graphics", |s, p| {
             s.keep_tool = b(p, "on").unwrap_or(!s.keep_tool);
             Ok(json!({"keepTool": s.keep_tool}))
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()
         .params(r#"{"on"?: bool}"#),
     ]
 }
 
-/// Adds a graphics layer with a unique name and makes it active.
+/// Adds a graphics layer with a unique name and makes it active. The suffix that tells it apart
+/// fits within the name's 200 characters: the name given gives way to it, and that is said.
 fn new_layer(s: &mut Session, name: &str) -> u32 {
     let base: String = name.chars().take(200).collect();
     let mut name = base.clone();
     let mut i = 1;
     while s.map().layer_by_name(&name).is_some() {
         i += 1;
-        name = format!("{base} ({i})");
+        let suffix = format!(" ({i})");
+        name = base.chars().take(200 - suffix.chars().count()).chain(suffix.chars()).collect();
+    }
+    let kept = name.chars().count() - if i > 1 { format!(" ({i})").chars().count() } else { 0 };
+    if kept < base.chars().count() {
+        s.notify(
+            format!("Add Graphics Layer: a layer has that name already, so the name given is cut to {kept} characters to fit \" ({i})\""),
+            false,
+        );
     }
     let id = s.map_mut().add_graphics(&name);
     s.active_layer = Some(id);
@@ -260,12 +271,12 @@ pub(crate) fn picture(p: &Value) -> Result<String, String> {
             use std::io::Read;
             // Read at most one byte past the limit, so a huge or endless file is refused.
             let mut bytes = Vec::new();
-            std::fs::File::open(path)
-                .and_then(|f| f.take(MAX_PICTURE as u64 + 1).read_to_end(&mut bytes))
-                .map_err(|e| format!("{path}: {e}"))?;
+            let file = rustgis_data::provenance::open(path).map_err(|e| format!("{path}: {e}"))?;
+            (&file).take(MAX_PICTURE as u64 + 1).read_to_end(&mut bytes).map_err(|e| format!("{path}: {e}"))?;
             if bytes.len() > MAX_PICTURE {
                 return Err("the picture is too large".into());
             }
+            rustgis_data::provenance::buffer(std::path::Path::new(path), &file, &bytes);
             base64::engine::general_purpose::STANDARD.encode(bytes)
         }
         (None, None) => return Err("a picture needs an image or a path".into()),
@@ -285,7 +296,7 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         return Err(format!("unknown shape '{shape}'"));
     }
     let g = geometry(&shape, points(p)?)?;
-    let text = ps(p, "text").map(|t| t.chars().take(2000).collect::<String>());
+    let text = ps(p, "text").map(|t| super::within("text", "a graphic's text", t, 2000)).transpose()?;
     if shape == "text" && text.as_deref().is_none_or(|t| t.trim().is_empty()) {
         return Err("text is required".into());
     }
@@ -293,6 +304,8 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     let (fill, outline) = (color(p, "fill")?, color(p, "outline")?);
     let style = TextStyle::of(p)?;
     let id = target(s, p)?;
+    // A place snapped to a stored one stays as stored.
+    let held = super::design::held_places(s, id, &[], &[&g]);
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     let num = |k: &str, min: f64, max: f64| f(p, k).map(|v| Attr::Float(v.clamp(min, max))).unwrap_or(Attr::Null);
     let opt = |v: Option<String>| v.map(Attr::Text).unwrap_or(Attr::Null);
@@ -306,6 +319,8 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         num("fontSize", *graphics::FONT_SIZE.start(), *graphics::FONT_SIZE.end()),
         opt(image),
     ];
+    // Drawn in longitude/latitude, written in the layer's own coordinates.
+    let g = l.dataset.edit_from_lonlat(g, &held)?;
     l.dataset.push(Some(g), attrs);
     let row = l.dataset.features.len() - 1;
     // By name, as a layer made before the field lacks it.
@@ -360,7 +375,10 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
         None => None,
     };
     if let Some(g) = placed {
+        let held = super::design::held_places(s, id, &[], &[&g]);
         let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+        // Placed in longitude/latitude, written in the layer's own coordinates.
+        let g = l.dataset.edit_from_lonlat(g, &held)?;
         if let Some(ft) = l.dataset.features.get_mut(row) {
             ft.geometry = Some(g);
         }
@@ -379,7 +397,7 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
 /// Sets the style (and a text graphic's text) of one graphic, or else of the selected ones.
 fn restyle(s: &mut Session, p: &Value, one: Option<(u32, usize)>) -> CmdResult {
     let (fill, outline) = (color(p, "fill")?, color(p, "outline")?);
-    let text = ps(p, "text").map(|t| t.chars().take(2000).collect::<String>());
+    let text = ps(p, "text").map(|t| super::within("text", "a graphic's text", t, 2000)).transpose()?;
     // Font sizes are kept within the range they are drawn at (graphics::font_size).
     let fonts = &graphics::FONT_SIZE;
     let nums = [("width", "width", 0.0, 50.0), ("size", "size", 0.0, 200.0), ("font_size", "fontSize", *fonts.start(), *fonts.end())];

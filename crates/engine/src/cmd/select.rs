@@ -9,6 +9,7 @@ use rustgis_map::PopupMode;
 use serde_json::{Value, json};
 
 use super::{f, need_layer, need_layers, need_selection, ps};
+use crate::notice_text::NoticeText;
 use crate::{CmdResult, CommandSpec as C, Session};
 
 #[path = "select_info.rs"]
@@ -16,16 +17,16 @@ mod info;
 
 pub fn commands() -> Vec<C> {
     let mut commands = vec![
-        C::new("select.byAttributes", "Select By Attributes", "Home › Selection", by_attributes)
+        C::new("select.byAttributes", "Select By Attributes", "Home › Selection", by_attributes).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_layers)
-            .params(r#"{"layer"?, "where": "SQL clause", "mode"?: "new"|"add"|"remove"|"subset"}"#),
-        C::new("select.byRect", "Select (rectangle)", "Home › Selection", by_rect)
+            .params(r#"{"layer"?, "where": sql, "mode"?: "new"|"add"|"remove"|"subset"}"#),
+        C::new("select.byRect", "Select (rectangle)", "Home › Selection", by_rect).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"minLon", "minLat", "maxLon", "maxLat", "mode"?: "new"|"add"|"remove"}"#),
-        C::new("select.byPolygon", "Select by Polygon", "Home › Selection", by_polygon)
+        C::new("select.byPolygon", "Select by Polygon", "Home › Selection", by_polygon).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"points": [[lon,lat],...], "mode"?: "new"|"add"|"remove"}"#),
-        C::new("select.byRadius", "Select by Radius", "Home › Selection", by_radius)
+        C::new("select.byRadius", "Select by Radius", "Home › Selection", by_radius).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"lon", "lat", "radius": metres (0 < radius <= 5000000), "mode"?: "new"|"add"|"remove"}"#),
-        C::new("select.atPoint", "Select (click)", "Home › Selection", at_point).params(r#"{"lon", "lat", "tolerancePx"?, "mode"?}"#),
+        C::new("select.atPoint", "Select (click)", "Home › Selection", at_point).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"lon", "lat", "tolerancePx"?, "mode"?}"#),
         C::new("select.rows", "Select Rows", "Attribute Table", |s, p| {
             let id = s.layer_id(p)?;
             let rows: Vec<usize> = p
@@ -35,19 +36,19 @@ pub fn commands() -> Vec<C> {
                 .unwrap_or_default();
             set(s, id, rows, mode(p));
             Ok(Value::Null)
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"layer"?, "rows": [number], "mode"?}"#),
         C::new("select.clear", "Clear", "Home › Selection", |s, _| {
             s.map_mut().clear_selection();
             Ok(Value::Null)
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_selection),
         C::new("select.all", "Select All", "Data › Selection", |s, p| {
             let id = s.layer_id(p)?;
             let n = s.map().layer(id).map(|l| l.dataset.features.len()).unwrap_or(0);
             set(s, id, (0..n).collect(), Mode::New);
             Ok(Value::Null)
-        }).params(r#"{"layer"?: name|id (default: the active layer)}"#)
+        }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?: name|id (default: the active layer)}"#)
         .when(need_layer),
         C::new("select.switch", "Switch Selection", "Data › Selection", |s, p| {
             let id = s.layer_id(p)?;
@@ -55,7 +56,7 @@ pub fn commands() -> Vec<C> {
             let rows: Vec<usize> = (0..l.dataset.features.len()).filter(|r| !l.selection.contains(r)).collect();
             set(s, id, rows, Mode::New);
             Ok(Value::Null)
-        }).params(r#"{"layer"?: name|id (default: the active layer)}"#)
+        }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?: name|id (default: the active layer)}"#)
         .when(need_layer),
         C::new("select.zoomTo", "Zoom To Selection", "Home › Selection", |s, _| {
             let e = s.map().selection_extent();
@@ -64,7 +65,7 @@ pub fn commands() -> Vec<C> {
             }
             s.zoom_to(&e);
             Ok(Value::Null)
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()
         .when(need_selection),
         C::new("select.layerFromSelection", "Make Layer From Selected Features", "Data › Selection", |s, p| {
@@ -74,6 +75,8 @@ pub fn commands() -> Vec<C> {
                 return Err("nothing is selected in this layer".into());
             }
             let mut ds = rustgis_data::Dataset::new(format!("{} selection", l.name), l.geometry_type(), l.dataset.fields.clone());
+            // Its coordinates as they are, held in the layer's system.
+            ds.held_in = l.dataset.held_in;
             for r in &l.selection {
                 if let Some(f) = l.dataset.features.get(*r) {
                     ds.push(f.geometry.clone(), f.attrs.clone());
@@ -81,12 +84,12 @@ pub fn commands() -> Vec<C> {
             }
             let nid = super::layer::add_dataset(s, ds);
             Ok(json!({"layer": nid}))
-        }).params(r#"{"layer"?: name|id (default: the active layer, which need not be the layer last selected in)}"#)
+        }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?: name|id (default: the active layer, which need not be the layer last selected in)}"#)
         .when(need_selection),
-        C::new("identify", "Identify", "Home › Inspect", identify).view().params(
+        C::new("identify", "Identify", "Home › Inspect", identify).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
             r#"{"lon", "lat", "tolerancePx"?, "mode"?: "topmost"|"visible"|"selectable"|"selectedInContents"|"none" (the map's pop-up mode when omitted; the mode picks the layers, and every feature under the point in them, up to 100, is in "results"; topmost and visible take vector tile layers' features too, with "tileLayer" and "sourceLayer", from the tiles drawn there: one not loaded yet is asked for, and its features come on a later identify; and they list in "featureInfo" the WMS layers drawn there to ask, each {tileLayer, url} (its GetFeatureInfo request) or {tileLayer, capabilities} (its service's, when the layer doesn't know its request): identify.featureInfo reads what they answer; selectedInContents does both for the tile layer picked in the Layers pane (map.selectTiles) alone, whichever it is, a basemap or MapLibre style too)}"#,
         ),
-        C::new("map.popupMode", "Pop-up Mode", "Home › Navigate", popup_mode)
+        C::new("map.popupMode", "Pop-up Mode", "Home › Navigate", popup_mode).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"mode": "topmost"|"visible"|"selectable"|"selectedInContents"|"none"}"#),
     ];
     commands.extend(info::commands());
@@ -148,10 +151,26 @@ pub fn set(s: &mut Session, id: u32, rows: Vec<usize>, m: Mode) {
 fn by_attributes(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let w = ps(p, "where").ok_or("where is required")?;
-    let rows = rustgis_data::query::select(w, &s.map().layer(id).ok_or("no layer")?.dataset)?;
+    // As every selection tool, only the features drawn: the definition query, time window and
+    // display filters hide the rest (#1995).
+    let layer = s.map().layer(id).ok_or("no layer")?;
+    let drawn = layer.drawn_rows(s.scale());
+    let mut rows = rustgis_data::query::select(w, &layer.dataset)?;
+    let matched = rows.len();
+    rows.retain(|r| drawn.get(*r).is_none_or(|d| *d));
     let n = rows.len();
     set(s, id, rows, mode(p));
-    s.notify(format!("{n} features selected"), false);
+    // Templates, so a translated interface says them in its language (the CLI keeps English).
+    s.notify_text(NoticeText::format("{n} features selected", [("n", n.to_string().into())]), false);
+    if matched > n {
+        s.notify_text(
+            NoticeText::format(
+                "{n} more features match but aren't drawn (the layer's definition query, time window or display filters hide them), and aren't selected",
+                [("n", (matched - n).to_string().into())],
+            ),
+            false,
+        );
+    }
     Ok(json!({"selected": n}))
 }
 
@@ -168,7 +187,9 @@ fn by_rect(s: &mut Session, p: &Value) -> CmdResult {
     if !matches!(s.map().flat(), rustgis_map::projection::Flat::Mercator) {
         for (id, rows) in &mut hits {
             if let Some(l) = s.map().layer(*id) {
-                rows.retain(|r| l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| g.extent().intersects(&ll)));
+                // The rectangle in the layer's own coordinates, as its features' boxes are.
+                let own = l.dataset.extent_from_lonlat(&ll);
+                rows.retain(|r| l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| g.extent().intersects(&own)));
             }
         }
         hits.retain(|(_, rows)| !rows.is_empty());
@@ -239,15 +260,42 @@ fn by_radius(s: &mut Session, p: &Value) -> CmdResult {
     flat.validate_selection_path(&boundary)?;
     let scale = s.scale();
     let mut hits = Vec::new();
+    let mut bounded = Vec::new();
+    let mut invalid = Vec::new();
     for layer in s.map_mut().selectable_layers(scale) {
         let drawn = layer.drawn_rows(scale);
         let rows: Vec<usize> = drawn.iter().enumerate().filter_map(|(row, shown)| shown.then_some(row)).collect();
-        let rows: Vec<usize> = network::within(&layer.dataset, &rows, center, radius).into_iter().map(|(row, _)| row).collect();
+        let report = network::within_report(&layer.dataset, &rows, center, radius);
+        let (near, n) = (report.rows, report.bounded);
+        invalid.push((layer.name.clone(), report.invalid_latitudes, report.missing_coordinates));
+        if n > 0 {
+            bounded.push((layer.name.clone(), n));
+        }
+        let rows: Vec<usize> = near.into_iter().map(|(row, _)| row).collect();
         if !rows.is_empty() {
             hits.push((layer.id, rows));
         }
     }
+    warn_bounded(s, &bounded);
+    warn_radius_input(s, &invalid);
     apply_hits(s, hits, m)
+}
+
+/// One warning for the features of each layer a radius search ([`network::within_counted`])
+/// counted at a bound on their distance near a pole, with their counts (#1033); none when there are
+/// none.
+pub(crate) fn warn_bounded(s: &mut Session, bounded: &[(String, usize)]) {
+    if bounded.is_empty() {
+        return;
+    }
+    let total: usize = bounded.iter().map(|(_, n)| n).sum();
+    let layers: Vec<String> = bounded.iter().map(|(layer, n)| format!("{layer} {n}")).collect();
+    let steps = rustgis_map::graphics::thousands(network::REACH_STEPS_TOTAL as f64);
+    let longest = network::REACH_STEPS_MAX * network::REACH_STEP_DEG;
+    s.warn(format!(
+        "{total} feature(s) near a pole ({}) couldn't be measured in full (past a search's {steps} steps a layer, or along an edge over {longest}° long) and were counted at the least distance they could be: they may lie farther, even beyond the radius",
+        layers.join(", ")
+    ));
 }
 
 /// The hit count describes the query, regardless of whether its rows are added or removed.
@@ -458,12 +506,52 @@ fn feature_json(map: &rustgis_map::Map, id: u32, row: usize) -> Option<Value> {
     Some(json!({"layer": l.name, "layerId": id, "row": row, "fid": fid, "attributes": attrs}))
 }
 
+/// Reports invalid radius-search input once per kind, with counts for each layer.
+pub(crate) fn warn_radius_input(s: &mut Session, invalid: &[(String, usize, usize)]) {
+    for latitude in [true, false] {
+        let layers: Vec<String> = invalid
+            .iter()
+            .filter_map(|(name, bad, missing)| {
+                let n = if latitude { *bad } else { *missing };
+                (n > 0).then(|| format!("{name} {n}"))
+            })
+            .collect();
+        let total: usize = invalid.iter().map(|(_, bad, missing)| if latitude { *bad } else { *missing }).sum();
+        if total > 0 {
+            let why = if latitude {
+                "have a latitude past ±90° and were left out of the radius search"
+            } else {
+                "have missing or infinite coordinates; those vertices and their incident edges were left out of the radius measurement"
+            };
+            s.warn(format!("{total} feature(s) ({}) {why}", layers.join(", ")));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Project, Tool};
     use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as DataValue};
     use rustgis_geom::{lonlat_to_merc, merc_to_lonlat};
+
+    /// The pole warning states the search's limits from the constants that set them.
+    #[test]
+    fn bounded_warning_states_the_search_limits() {
+        let mut s = Session::new(Project::default());
+        let mark = s.notices_given();
+        warn_bounded(&mut s, &[("Cities".into(), 2)]);
+        let text = s.notices_since(mark).first().map(|n| n.text.as_str()).unwrap_or_default();
+        assert!(
+            text.contains("2 feature(s) near a pole (Cities 2)")
+                && text.contains(&format!(
+                    "past a search's {} steps a layer",
+                    rustgis_map::graphics::thousands(network::REACH_STEPS_TOTAL as f64)
+                ))
+                && text.contains(&format!("along an edge over {}° long", network::REACH_STEPS_MAX * network::REACH_STEP_DEG)),
+            "{text}"
+        );
+    }
 
     fn fixture() -> (Session, u32, u32) {
         let mut s = Session::new(Project::default());
